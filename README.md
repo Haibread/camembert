@@ -16,7 +16,8 @@ Named after the pie chart — *camembert* in French.
 > **Status**: early development. The parallel scan engine (work-stealing
 > `openat`/`getdents64`/`statx` traversal, streaming aggregation, hardlink
 > dedup, mount-boundary detection), the interactive browse-during-scan
-> TUI, and the ordered dump-format v1 writer (`--output`) are implemented.
+> TUI, guarded mark-then-confirm deletion, and the ordered dump-format v1
+> writer (`--output`) are implemented.
 > See [HANDOFF.md](HANDOFF.md) for the full design hypotheses and roadmap,
 > `docs/design/` for the settled decisions, and
 > [`docs/format/dump-v1.md`](docs/format/dump-v1.md) for the dump format.
@@ -92,6 +93,9 @@ directories still being scanned. Quitting mid-scan cancels the scan.
 | `e` | sort by subtree error count — jump straight to what could not be read |
 | *(active sort key again)* | reverse the sort direction |
 | `p` | show/hide the apparent-size column |
+| `Space` | mark/unmark the row under the cursor for deletion, then move down |
+| `u` | clear all marks |
+| `D` | delete the marked entries (confirmation dialog; `y` confirms) |
 | `q` / `Esc` / `Ctrl-C` | quit (cancels the scan if still running) |
 
 **Provisional totals (hardlinks)**: while the scan is running, a
@@ -104,6 +108,49 @@ hardlinks actually exist in the tree.
 Diagnostics (`tracing`) never touch the interactive screen: they are
 discarded by default, or written to a file with `--log-file scan.log`
 (env: `LOG_FILE`) when you need them while debugging.
+
+### Deleting
+
+Deletion is **mark-then-confirm** (like dua): `Space` marks rows —
+marking a directory implies its whole subtree, and marks persist while
+you navigate — the footer keeps a running "marked: N entries, size"
+total, and `D` opens a confirmation dialog listing the count, the
+cumulative on-disk size and the first few paths. Only an explicit `y`
+deletes; any other key cancels.
+
+Deleting from a disk-usage tool is exactly where you want guard rails,
+so camembert stacks several:
+
+- **Only after the scan.** During the scan the mark keys are inactive
+  (the footer says so): the tree is being written by the scan engine,
+  and deletion must account against a frozen, consistent tree.
+- **Never outside the scanned root.** Paths are rebuilt from the scanned
+  tree, never taken from anywhere else, and anything not strictly under
+  the scan root is refused.
+- **Mount points are refused at mark time** (and re-checked before
+  deletion): an excluded mount was never scanned, so deleting it would
+  act blind. Unreadable (error) directories stay markable — deleting a
+  directory you cannot read is legitimate cleanup.
+- **The filesystem is re-checked entry by entry** right before deletion:
+  the entry must still exist and its file type (and, for directories,
+  its device) must still match what was scanned. A file that changed
+  into something else since the scan is skipped with a note — never
+  deleted. Symlinks are removed themselves and never followed.
+- **Failures never abort the batch.** Permission errors, vanished
+  files, … are counted per entry ("deleted 10 (3.4 GiB freed), failed
+  2 — see log") and detailed in the log; everything else proceeds.
+- **Hardlinks are reported honestly**: deleting one link of an
+  `nlink > 1` inode frees space only when the *last* link goes, so the
+  dialog warns when the selection contains hardlinked files, and links
+  that were never counted free 0 in the totals.
+
+After a deletion the view rebuilds in place: totals in the header
+shrink accordingly, and if the directory you were viewing was itself
+deleted, the view climbs to the nearest surviving parent.
+
+Planned next (see `camembert-core/src/delete.rs`): a warning when a
+marked file is held open by a running process (`/proc/*/fd`), and an
+opt-in XDG-Trash mode instead of unlinking.
 
 ## Summary mode
 

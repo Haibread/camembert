@@ -19,25 +19,56 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Alignment, Constraint, Layout};
+use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row as TableRow, Table, TableState};
+use ratatui::widgets::{Block, Cell, Clear, Paragraph, Row as TableRow, Table, TableState};
 use ratatui::{DefaultTerminal, Frame};
 use tracing::{debug, error, info, warn};
 
+use camembert_core::delete;
 use camembert_core::dump::{self, DumpMeta};
 use camembert_core::scan::{LiveScan, ScanOutcome, Scanner};
 use camembert_core::size::HumanSize;
-use camembert_core::tree::DirId;
+use camembert_core::tree::{DirId, NodeId};
 use camembert_core::view::{self, RowState};
 
-use state::{SortKey, UiState, show_hardlink_note, show_updating_note};
+use state::{ConfirmState, MarkRefusal, SortKey, UiState, show_hardlink_note, show_updating_note};
 
 /// Frame budget: poll timeout of the render loop (~30 fps, D5).
 const FRAME: Duration = Duration::from_millis(33);
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// Footer hint while mark/delete keys are inactive during the scan.
+const DELETION_LOCKED: &str = "deletion available once the scan completes";
+
+/// Transient footer message (mark refusals, deletion summaries).
+struct Flash {
+    message: Option<(String, Instant)>,
+}
+
+impl Flash {
+    const TTL: Duration = Duration::from_secs(4);
+
+    fn new() -> Self {
+        Self { message: None }
+    }
+
+    fn set(&mut self, text: impl Into<String>) {
+        self.message = Some((text.into(), Instant::now() + Self::TTL));
+    }
+
+    /// The current message, dropping it once expired.
+    fn current(&mut self) -> Option<&str> {
+        if let Some((_, until)) = &self.message
+            && Instant::now() > *until
+        {
+            self.message = None;
+        }
+        self.message.as_ref().map(|(text, _)| text.as_str())
+    }
+}
 
 /// Where the rows come from.
 enum Phase {
@@ -96,6 +127,7 @@ fn event_loop(
     // Local generations continue past the last live one so the sort cache
     // invalidates on post-scan navigation.
     let mut local_generation: u64 = 0;
+    let mut flash = Flash::new();
 
     loop {
         // 1. Input (drain everything pending; block at most one frame).
@@ -105,7 +137,14 @@ fn event_loop(
             if let Event::Key(key) = event::read()?
                 && key.kind == KeyEventKind::Press
             {
-                match handle_key(key.code, key.modifiers, &mut ui, &phase) {
+                match handle_key(
+                    key.code,
+                    key.modifiers,
+                    &mut ui,
+                    &mut phase,
+                    &mut local_generation,
+                    &mut flash,
+                ) {
                     Action::Quit => {
                         if let Phase::Scanning(live) = phase {
                             info!("quit during scan: cancelling");
@@ -167,7 +206,10 @@ fn event_loop(
             None
         });
         let spinner = SPINNER[(started.elapsed().as_millis() / 80) as usize % SPINNER.len()];
-        terminal.draw(|frame| draw(frame, &ui, &mut table_state, spinner))?;
+        let flash_text = flash.current().map(str::to_owned);
+        terminal.draw(|frame| {
+            draw(frame, &ui, &mut table_state, spinner, flash_text.as_deref());
+        })?;
     }
 }
 
@@ -176,7 +218,27 @@ enum Action {
     Quit,
 }
 
-fn handle_key(code: KeyCode, modifiers: KeyModifiers, ui: &mut UiState, phase: &Phase) -> Action {
+fn handle_key(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    ui: &mut UiState,
+    phase: &mut Phase,
+    generation: &mut u64,
+    flash: &mut Flash,
+) -> Action {
+    // The confirmation modal captures every key: `y` confirms, anything
+    // else cancels (Ctrl-C keeps quitting — safety hatch).
+    if ui.confirm().is_some() {
+        if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
+            return Action::Quit;
+        }
+        if code == KeyCode::Char('y') {
+            execute_deletion(ui, phase, generation, flash);
+        } else {
+            ui.cancel_confirm();
+        }
+        return Action::Continue;
+    }
     match code {
         KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return Action::Quit,
@@ -201,9 +263,90 @@ fn handle_key(code: KeyCode, modifiers: KeyModifiers, ui: &mut UiState, phase: &
         KeyCode::Char('c') => ui.press_sort(SortKey::Items),
         KeyCode::Char('e') => ui.press_sort(SortKey::Errors),
         KeyCode::Char('p') => ui.show_apparent = !ui.show_apparent,
+        KeyCode::Char(' ') => try_toggle_mark(ui, phase, flash),
+        KeyCode::Char('u') => ui.unmark_all(),
+        KeyCode::Char('D') => open_delete_confirm(ui, phase, flash),
         _ => {}
     }
     Action::Continue
+}
+
+/// `Space`: mark/unmark the row under the cursor. Inactive during the
+/// scan (HANDOFF §5: deletion only works on the frozen post-scan arena).
+fn try_toggle_mark(ui: &mut UiState, phase: &Phase, flash: &mut Flash) {
+    if matches!(phase, Phase::Scanning(_)) {
+        flash.set(DELETION_LOCKED);
+        return;
+    }
+    match ui.toggle_mark() {
+        Ok(()) => {}
+        Err(MarkRefusal::ScanRunning) => flash.set(DELETION_LOCKED),
+        Err(MarkRefusal::MountPoint) => {
+            flash.set("mount points cannot be marked for deletion");
+        }
+    }
+}
+
+/// `D`: open the confirmation modal over the marked entries, computing
+/// the hardlink warning from the frozen arena.
+fn open_delete_confirm(ui: &mut UiState, phase: &Phase, flash: &mut Flash) {
+    let Phase::Done(outcome) = phase else {
+        flash.set(DELETION_LOCKED);
+        return;
+    };
+    if ui.marked_summary().is_none() {
+        flash.set("nothing marked — Space marks the row under the cursor");
+        return;
+    }
+    let nodes: Vec<NodeId> = ui.marks().iter().map(|mark| mark.node).collect();
+    let hardlinks = delete::hardlink_files_in(outcome, &nodes);
+    ui.open_confirm(hardlinks);
+}
+
+/// Modal confirmed (`y`): delete the marked entries from disk (all guards
+/// in [`camembert_core::delete`]), update the tree's accounting, and
+/// re-view from the nearest surviving directory.
+fn execute_deletion(ui: &mut UiState, phase: &mut Phase, generation: &mut u64, flash: &mut Flash) {
+    let Phase::Done(outcome) = phase else {
+        // The modal only opens post-scan, but never delete on a stale
+        // assumption.
+        ui.cancel_confirm();
+        return;
+    };
+    let Some(marks) = ui.take_confirmed_marks() else {
+        return;
+    };
+    let nodes: Vec<NodeId> = marks.iter().map(|mark| mark.node).collect();
+    info!(count = nodes.len(), "deletion confirmed");
+    let report = delete::delete_nodes(outcome, &nodes);
+    if report.failed > 0 || report.skipped > 0 {
+        flash.set(format!(
+            "deleted {} ({} freed), failed {}, skipped {} — see log",
+            report.deleted,
+            HumanSize(report.freed.real),
+            report.failed,
+            report.skipped
+        ));
+    } else {
+        flash.set(format!(
+            "deleted {} entries, {} freed",
+            report.deleted,
+            HumanSize(report.freed.real)
+        ));
+    }
+    // The viewed directory may sit inside a deleted subtree: climb to the
+    // nearest surviving ancestor before rebuilding the view.
+    let mut dir = ui.snapshot().dir;
+    {
+        let tree = outcome.tree();
+        while tree.is_removed(tree.dir(dir).node) {
+            dir = tree
+                .dir(dir)
+                .parent
+                .expect("the scan root is never removable");
+        }
+    }
+    serve_local(phase, dir, generation, ui);
 }
 
 /// Route a navigation request: over the bus while the owner lives, served
@@ -234,7 +377,13 @@ fn serve_local(phase: &Phase, dir: DirId, generation: &mut u64, ui: &mut UiState
     ui.apply_snapshot(Arc::new(snapshot));
 }
 
-fn draw(frame: &mut Frame<'_>, ui: &UiState, table_state: &mut TableState, spinner: char) {
+fn draw(
+    frame: &mut Frame<'_>,
+    ui: &UiState,
+    table_state: &mut TableState,
+    spinner: char,
+    flash: Option<&str>,
+) {
     let snapshot = ui.snapshot();
     let [header_area, table_area, footer_area] = Layout::vertical([
         Constraint::Length(2),
@@ -282,9 +431,14 @@ fn draw(frame: &mut Frame<'_>, ui: &UiState, table_state: &mut TableState, spinn
     };
     let mut header_cells = vec![
         Cell::from(" "),
+        Cell::from(" "),
         Cell::from(format!("real{}", arrow(SortKey::Disk))),
     ];
-    let mut widths = vec![Constraint::Length(1), Constraint::Length(10)];
+    let mut widths = vec![
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(10),
+    ];
     if ui.show_apparent {
         header_cells.push(Cell::from(format!("apparent{}", arrow(SortKey::Apparent))));
         widths.push(Constraint::Length(10));
@@ -302,6 +456,11 @@ fn draw(frame: &mut Frame<'_>, ui: &UiState, table_state: &mut TableState, spinn
 
     let parent_disk = snapshot.totals.disk;
     let rows = ui.rows().map(|row| {
+        let mark = if ui.is_marked(row.node) {
+            "*".red().bold()
+        } else {
+            Span::raw(" ")
+        };
         let marker = match row.state {
             RowState::Scanning => Span::from(spinner.to_string()).yellow(),
             RowState::Error => "!".red().bold(),
@@ -320,6 +479,7 @@ fn draw(frame: &mut Frame<'_>, ui: &UiState, table_state: &mut TableState, spinn
             Span::from(name)
         };
         let mut cells = vec![
+            Cell::from(mark),
             Cell::from(marker),
             Cell::from(format!("{:>9}", HumanSize(row.disk).to_string())),
         ];
@@ -341,28 +501,111 @@ fn draw(frame: &mut Frame<'_>, ui: &UiState, table_state: &mut TableState, spinn
         .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
     frame.render_stateful_widget(table, table_area, table_state);
 
-    // Footer: keys + status notes.
+    // Footer: keys + status notes (flash first, then marked summary,
+    // then scan notes).
     let mut notes: Vec<Span<'_>> = Vec::new();
+    let push_note = |notes: &mut Vec<Span<'_>>, note: Span<'static>| {
+        if !notes.is_empty() {
+            notes.push(Span::raw(" · "));
+        }
+        notes.push(note);
+    };
+    if let Some(text) = flash {
+        push_note(&mut notes, Span::from(format!(" {text}")).yellow().bold());
+    }
+    if let Some((count, disk)) = ui.marked_summary() {
+        push_note(
+            &mut notes,
+            Span::from(format!("marked: {count} entries, {}", HumanSize(disk))).red(),
+        );
+    }
     if show_hardlink_note(snapshot) {
-        notes.push(
+        push_note(
+            &mut notes,
             "provisional totals (hardlinks) — corrected at scan end"
                 .italic()
                 .yellow(),
         );
     }
     if show_updating_note(snapshot) {
-        if !notes.is_empty() {
-            notes.push(Span::raw(" · "));
-        }
-        notes.push("updating…".italic().dim());
+        push_note(&mut notes, "updating…".italic().dim());
     }
     let footer = Paragraph::new(vec![
         Line::from(
-            " ↑↓/jk move · ⏎/l/→ open · ⌫/h/← up · g/G ends · d/a/n/m/c/e sort · p apparent · q quit"
+            " ↑↓/jk move · ⏎/l/→ open · ⌫/h/← up · g/G ends · d/a/n/m/c/e sort · p apparent · Space mark · u unmark · D delete · q quit"
                 .dim(),
         ),
         Line::from(notes),
     ])
     .alignment(Alignment::Left);
     frame.render_widget(footer, footer_area);
+
+    if let Some(confirm) = ui.confirm() {
+        draw_confirm_modal(frame, ui, confirm);
+    }
+}
+
+/// Centered confirmation modal: count, cumulative size, the first few
+/// paths, the hardlink warning when applicable. `y` confirms, anything
+/// else cancels — rendering only; the key routing lives in `handle_key`.
+fn draw_confirm_modal(frame: &mut Frame<'_>, ui: &UiState, confirm: &ConfirmState) {
+    /// Paths listed in full before the "… and N more" ellipsis.
+    const MAX_PATHS: usize = 8;
+
+    let Some((count, disk)) = ui.marked_summary() else {
+        return; // unreachable: the modal only opens with marks
+    };
+    let mut lines: Vec<Line<'_>> = vec![
+        Line::from(Span::from(format!(
+            "Delete {count} entries — {} on disk?",
+            HumanSize(disk)
+        ))),
+        Line::default(),
+    ];
+    for mark in ui.marks().iter().take(MAX_PATHS) {
+        let suffix = if mark.is_dir { "/" } else { "" };
+        lines.push(Line::from(
+            Span::from(format!("  {}{suffix}", mark.path.display())).dim(),
+        ));
+    }
+    if count > MAX_PATHS {
+        lines.push(Line::from(
+            Span::from(format!("  … and {} more", count - MAX_PATHS)).dim(),
+        ));
+    }
+    if confirm.hardlink_files > 0 {
+        lines.push(Line::default());
+        lines.push(Line::from(
+            Span::from(format!(
+                "{} hardlinked file(s) in the selection: space is only",
+                confirm.hardlink_files
+            ))
+            .yellow(),
+        ));
+        lines.push(Line::from(
+            Span::from("freed once every link to an inode is deleted").yellow(),
+        ));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(
+        "press y to confirm — any other key cancels".bold(),
+    ));
+
+    let area = frame.area();
+    let width = (lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 4)
+        .min(area.width.saturating_sub(2));
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let modal = Rect {
+        x: area.width.saturating_sub(width) / 2,
+        y: area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, modal);
+    let dialog = Paragraph::new(lines).block(
+        Block::bordered()
+            .title(" delete marked entries ")
+            .border_style(Style::new().red()),
+    );
+    frame.render_widget(dialog, modal);
 }

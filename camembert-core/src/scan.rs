@@ -554,6 +554,29 @@ impl ScanOutcome {
         self.tree.path_of(dir)
     }
 
+    /// Remove a node from the tree's accounting after its on-disk entry
+    /// was deleted (see [`Tree::apply_removal`]), and refresh this
+    /// outcome's summary counters (`totals`, `entries`, `dirs`, `errors`)
+    /// from the root aggregates so they stay honest.
+    ///
+    /// Post-scan only: the outcome owner (the UI thread) is the frozen
+    /// arena's single writer.
+    pub fn apply_removal(
+        &mut self,
+        node: NodeId,
+    ) -> Result<crate::tree::RemovalDelta, crate::tree::RemovalError> {
+        let delta = self.tree.apply_removal(node)?;
+        let root_meta = self.tree.dir(self.root);
+        self.totals = Size {
+            apparent: root_meta.ta,
+            real: root_meta.td,
+        };
+        self.entries = root_meta.tn;
+        self.errors = u64::from(root_meta.te);
+        self.dirs = self.tree.live_dir_count();
+        Ok(delta)
+    }
+
     /// The `n` largest directories by real (disk) subtree size,
     /// descending. Ties broken by arena order for determinism.
     pub fn top_dirs_by_disk(&self, n: usize) -> Vec<DirId> {

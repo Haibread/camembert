@@ -34,7 +34,7 @@ mod interner;
 
 pub use interner::{NameInterner, NameRef};
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::size::Size;
 
@@ -269,8 +269,44 @@ impl DirMeta {
     }
 }
 
-/// The arena tree. Single-writer: all `&mut self` methods are crate-private
-/// and called by the scan owner only (D1).
+/// What a [`Tree::apply_removal`] subtracted from the ancestor aggregates.
+///
+/// For a [`NodeFlags::HARDLINK_EXTRA`] link everything is 0 (it never
+/// contributed); the entry is still tombstoned.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RemovalDelta {
+    /// Apparent bytes subtracted.
+    pub apparent: u64,
+    /// Disk bytes subtracted (`st_blocks * 512`).
+    pub disk: u64,
+    /// Inodes subtracted (hardlink extras excluded, like `tn`).
+    pub entries: u64,
+    /// Errors subtracted (the removed subtree's unreadables).
+    pub errors: u32,
+}
+
+/// Why [`Tree::apply_removal`] refused. Nothing was tombstoned or
+/// subtracted in any of these cases.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum RemovalError {
+    /// The node (or an ancestor subtree containing it) was already
+    /// removed — double removal is an error, see [`Tree::apply_removal`].
+    #[error("node already removed")]
+    AlreadyRemoved,
+    /// The scan root itself is never removable.
+    #[error("refusing to remove the scan root")]
+    IsRoot,
+    /// Excluded mount points ([`NodeFlags::EXCLUDED`]) are never
+    /// removable: their subtree was not scanned, so neither the aggregates
+    /// nor the on-disk contents are known.
+    #[error("refusing to remove an excluded mount point")]
+    Excluded,
+}
+
+/// The arena tree. Single-writer: the `&mut self` scan methods are
+/// crate-private and called by the scan owner only (D1). The one public
+/// mutation is [`Tree::apply_removal`], for the post-scan phase where the
+/// frozen arena has a single owner again (the UI thread).
 #[derive(Debug, Default)]
 pub struct Tree {
     nodes: Vec<Node>,
@@ -284,6 +320,20 @@ pub struct Tree {
     /// Tiny (one entry per skipped mount point); feeds the dump's `ex`
     /// field and the UI.
     excluded: FxHashMap<NodeId, ExcludedReason>,
+    /// Removed nodes ([`Tree::apply_removal`]). A side set rather than a
+    /// node flag: [`NodeFlags`] is full (3 bits), deletions are rare, and
+    /// a per-row set lookup at iteration time is cheap. Tombstoned rows
+    /// are filtered out of [`Tree::children`] — the single filter point;
+    /// snapshots and run lists never see them.
+    tombstones: FxHashSet<NodeId>,
+    /// First-seen (counted) links of `nlink > 1` inodes. Later links carry
+    /// [`NodeFlags::HARDLINK_EXTRA`] in the node; the first link cannot
+    /// (flags are full), so it lives here. Feeds the deletion dialog's
+    /// hardlink warning.
+    hardlink_firsts: FxHashSet<NodeId>,
+    /// Directories (with metadata) removed so far, so
+    /// [`Tree::live_dir_count`] stays honest without shrinking the arena.
+    removed_dirs: u64,
 }
 
 /// Why a directory entry was recorded but not descended into.
@@ -340,29 +390,52 @@ impl Tree {
     }
 
     /// Iterate a directory's children across all its runs, in integration
-    /// order (D2: slice-like iteration over the run list).
+    /// order (D2: slice-like iteration over the run list). Rows removed by
+    /// [`Tree::apply_removal`] are filtered out here — the single filter
+    /// point, so snapshots and every other consumer never see tombstones.
+    /// The set is empty during the scan; the per-row lookup is noise.
     pub fn children(&self, dir: DirId) -> impl Iterator<Item = NodeId> + '_ {
         self.dirs[dir.index()]
             .runs
             .iter()
             .flat_map(|run| (run.start..run.start + run.len).map(NodeId))
+            .filter(move |id| !self.tombstones.contains(id))
     }
 
-    /// All directory ids (arena order). Captures no borrow of the tree.
+    /// All directory ids (arena order), removed ones included (the arena
+    /// never shrinks; check the parent chain or use
+    /// [`Tree::live_dir_count`] when tombstones matter). Captures no
+    /// borrow of the tree.
     pub fn dir_ids(&self) -> impl Iterator<Item = DirId> + use<> {
         (0..u32::try_from(self.dirs.len()).expect("dir arena exceeds u32")).map(DirId)
+    }
+
+    /// Directories with metadata that have not been removed.
+    pub fn live_dir_count(&self) -> u64 {
+        self.dirs.len() as u64 - self.removed_dirs
     }
 
     /// Full path of a directory: the root's name (the path the scan was
     /// started with) joined with the names up the parent chain.
     pub fn path_of(&self, dir: DirId) -> std::path::PathBuf {
+        self.path_of_node(self.dir(dir).node)
+    }
+
+    /// Full path of any node (file or directory): the root's name joined
+    /// with the names up the node parent chain. This is the tree's record
+    /// of where the entry was at scan time — deletion re-verifies it on
+    /// disk before acting (see [`crate::delete`]).
+    pub fn path_of_node(&self, node: NodeId) -> std::path::PathBuf {
         use std::os::unix::ffi::OsStrExt;
         let mut components: Vec<&[u8]> = Vec::new();
-        let mut cur = Some(dir);
-        while let Some(d) = cur {
-            let meta = self.dir(d);
-            components.push(self.name(meta.node));
-            cur = meta.parent;
+        let mut cur = node;
+        loop {
+            components.push(self.name(cur));
+            let parent = self.node(cur).parent();
+            if parent == cur {
+                break;
+            }
+            cur = parent;
         }
         let mut path = std::path::PathBuf::new();
         for component in components.into_iter().rev() {
@@ -371,7 +444,141 @@ impl Tree {
         path
     }
 
+    /// Whether a node was removed by [`Tree::apply_removal`] (directly or
+    /// as part of a removed subtree).
+    pub fn is_removed(&self, id: NodeId) -> bool {
+        self.tombstones.contains(&id)
+    }
+
+    /// Whether a node is a link of an `nlink > 1` inode — either the
+    /// counted first-seen link or a [`NodeFlags::HARDLINK_EXTRA`] later
+    /// link. Deleting such an entry frees its space only when the last
+    /// link to the inode goes.
+    pub fn is_hardlink(&self, id: NodeId) -> bool {
+        self.node(id).flags().contains(NodeFlags::HARDLINK_EXTRA)
+            || self.hardlink_firsts.contains(&id)
+    }
+
+    // ---- post-scan removal (public: the frozen arena's owner — the UI
+    // thread once the scan is done — is the single writer again) ----
+
+    /// Remove a node from the tree's accounting after its on-disk entry
+    /// was deleted: tombstone it (and, for a directory, its whole
+    /// subtree), then propagate the negative aggregate delta up the
+    /// ancestor chain (mirror of [`Tree::apply_delta`]).
+    ///
+    /// Must only be called **post-scan**, when the arena is frozen and
+    /// this thread is its sole owner — mutating aggregates while the scan
+    /// owner integrates would break the single-writer rule (D1).
+    ///
+    /// Accounting:
+    /// - a [`NodeFlags::HARDLINK_EXTRA`] link contributed 0 to the
+    ///   aggregates, so its removal subtracts 0 (deleting one link of an
+    ///   `nlink > 1` inode frees nothing unless it is the last link);
+    /// - a counted first-seen hardlink subtracts its full size, which is
+    ///   optimistic when other links survive elsewhere — the deletion UI
+    ///   warns about this; exact freeable math is the future "libérable"
+    ///   column;
+    /// - a directory subtracts its subtree aggregates (which already
+    ///   exclude hardlink extras and previously removed children).
+    ///
+    /// Double removal is an **error** ([`RemovalError::AlreadyRemoved`]),
+    /// not a no-op: a second call for the same node means the caller's
+    /// bookkeeping is off, and silently succeeding would hide a
+    /// double-subtraction bug. Removing a node inside an already-removed
+    /// subtree reports the same error (the accounting already happened at
+    /// the ancestor).
+    pub fn apply_removal(&mut self, node: NodeId) -> Result<RemovalDelta, RemovalError> {
+        if self.tombstones.contains(&node) {
+            return Err(RemovalError::AlreadyRemoved);
+        }
+        let n = *self.node(node);
+        if n.parent() == node {
+            return Err(RemovalError::IsRoot);
+        }
+        if n.flags().contains(NodeFlags::EXCLUDED) {
+            return Err(RemovalError::Excluded);
+        }
+        let parent_dir = self
+            .dir_of(n.parent())
+            .expect("non-root node's parent is a scanned directory");
+
+        let delta = match self.dir_of(node) {
+            Some(dir) => {
+                let meta = self.dir(dir);
+                let delta = RemovalDelta {
+                    apparent: meta.ta,
+                    disk: meta.td,
+                    entries: meta.tn,
+                    errors: meta.te,
+                };
+                // Tombstone the whole subtree so no descendant can be
+                // removed (and double-subtracted) again. `children` skips
+                // already-removed rows, whose contribution was subtracted
+                // when they were removed — consistent with using the
+                // dir's *current* aggregates as the delta.
+                self.tombstones.insert(node);
+                self.removed_dirs += 1;
+                let mut stack = vec![dir];
+                while let Some(d) = stack.pop() {
+                    let children: Vec<NodeId> = self.children(d).collect();
+                    for child in children {
+                        self.tombstones.insert(child);
+                        if let Some(child_dir) = self.dir_of(child) {
+                            self.removed_dirs += 1;
+                            stack.push(child_dir);
+                        }
+                    }
+                }
+                delta
+            }
+            None => {
+                let size = n.size();
+                let counted = !n.flags().contains(NodeFlags::HARDLINK_EXTRA);
+                self.tombstones.insert(node);
+                RemovalDelta {
+                    apparent: if counted { size.apparent } else { 0 },
+                    disk: if counted { size.real } else { 0 },
+                    // `tn` excludes hardlink extras, mirror that here.
+                    entries: u64::from(counted),
+                    errors: u32::from(n.flags().contains(NodeFlags::ERROR)),
+                }
+            }
+        };
+        self.apply_negative_delta(parent_dir, delta);
+        Ok(delta)
+    }
+
+    /// Mirror of [`Tree::apply_delta`] with negative deltas: subtract a
+    /// removal from `dir` and every ancestor up to the root. `u64`
+    /// subtraction: underflow is an accounting bug — loud in debug builds,
+    /// clamped (never wrapped) in release.
+    fn apply_negative_delta(&mut self, dir: DirId, delta: RemovalDelta) {
+        let mut cur = Some(dir);
+        while let Some(d) = cur {
+            let meta = &mut self.dirs[d.index()];
+            debug_assert!(
+                meta.ta >= delta.apparent
+                    && meta.td >= delta.disk
+                    && meta.tn >= delta.entries
+                    && meta.te >= delta.errors,
+                "removal underflow: subtracting more than the aggregate holds"
+            );
+            meta.ta = meta.ta.saturating_sub(delta.apparent);
+            meta.td = meta.td.saturating_sub(delta.disk);
+            meta.tn = meta.tn.saturating_sub(delta.entries);
+            meta.te = meta.te.saturating_sub(delta.errors);
+            cur = meta.parent;
+        }
+    }
+
     // ---- owner-only mutation (crate-private, D1) ----
+
+    /// Record a counted first-seen link of an `nlink > 1` inode (see
+    /// [`Tree::is_hardlink`]).
+    pub(crate) fn mark_hardlink_first(&mut self, id: NodeId) {
+        self.hardlink_firsts.insert(id);
+    }
 
     pub(crate) fn push_node(
         &mut self,
@@ -683,6 +890,208 @@ mod tests {
             (sibling.ta, sibling.td, sibling.tn, sibling.te),
             (0, 0, 1, 0)
         );
+    }
+
+    /// root/{f1 (100 B), sub/{leaf (10 B)}} with fully applied aggregates.
+    fn removal_tree() -> (Tree, DirId, NodeId, DirId, NodeId, NodeId) {
+        let mut tree = Tree::new();
+        let root_node = tree.push_root_node(b"/scan", Size::default(), 0);
+        let root = tree.add_dir(root_node, None, 1);
+        let f1 = tree.push_node(
+            b"f1",
+            Kind::File,
+            NodeFlags::default(),
+            root_node,
+            Size::new(100, 1),
+            0,
+        );
+        let sub_node = tree.push_node(
+            b"sub",
+            Kind::Dir,
+            NodeFlags::default(),
+            root_node,
+            Size::new(4096, 8),
+            0,
+        );
+        tree.push_run(
+            root,
+            ChildRun {
+                start: f1.0,
+                len: 2,
+            },
+        );
+        let sub = tree.add_dir(sub_node, Some(root), 1);
+        tree.apply_delta(root, 100 + 4096, 512 + 4096, 2, 0);
+        let leaf = tree.push_node(
+            b"leaf",
+            Kind::File,
+            NodeFlags::default(),
+            sub_node,
+            Size::new(10, 1),
+            0,
+        );
+        tree.push_run(
+            sub,
+            ChildRun {
+                start: leaf.0,
+                len: 1,
+            },
+        );
+        tree.apply_delta(sub, 10, 512, 1, 0);
+        tree.release_token(sub);
+        tree.release_token(root);
+        (tree, root, f1, sub, sub_node, leaf)
+    }
+
+    #[test]
+    fn removal_of_a_file_subtracts_up_the_chain() {
+        let (mut tree, root, f1, sub, _, _) = removal_tree();
+        let before = (tree.dir(root).ta, tree.dir(root).td, tree.dir(root).tn);
+        let delta = tree.apply_removal(f1).expect("file removal");
+        assert_eq!(
+            delta,
+            RemovalDelta {
+                apparent: 100,
+                disk: 512,
+                entries: 1,
+                errors: 0
+            }
+        );
+        assert!(tree.is_removed(f1));
+        let meta = tree.dir(root);
+        assert_eq!(meta.ta, before.0 - 100);
+        assert_eq!(meta.td, before.1 - 512);
+        assert_eq!(meta.tn, before.2 - 1);
+        // Sibling dir untouched.
+        assert_eq!(tree.dir(sub).ta, 4096 + 10);
+    }
+
+    #[test]
+    fn removal_of_a_dir_tombstones_the_subtree() {
+        let (mut tree, root, f1, _sub, sub_node, leaf) = removal_tree();
+        let delta = tree.apply_removal(sub_node).expect("dir removal");
+        assert_eq!(
+            delta,
+            RemovalDelta {
+                apparent: 4096 + 10,
+                disk: 4096 + 512,
+                entries: 2,
+                errors: 0
+            }
+        );
+        assert!(tree.is_removed(sub_node));
+        assert!(tree.is_removed(leaf), "descendants tombstoned too");
+        assert!(!tree.is_removed(f1));
+        // Root keeps only f1 (+ its own inode).
+        let meta = tree.dir(root);
+        assert_eq!((meta.ta, meta.td, meta.tn), (100, 512, 2));
+        assert_eq!(tree.live_dir_count(), 1, "sub's metadata no longer live");
+        // Removing a node inside the removed subtree is refused.
+        assert_eq!(tree.apply_removal(leaf), Err(RemovalError::AlreadyRemoved));
+    }
+
+    #[test]
+    fn removed_rows_disappear_from_children_iteration() {
+        let (mut tree, root, f1, _, sub_node, _) = removal_tree();
+        assert_eq!(tree.children(root).count(), 2);
+        tree.apply_removal(f1).unwrap();
+        let remaining: Vec<&[u8]> = tree.children(root).map(|id| tree.name(id)).collect();
+        assert_eq!(remaining, [b"sub" as &[u8]]);
+        tree.apply_removal(sub_node).unwrap();
+        assert_eq!(tree.children(root).count(), 0);
+    }
+
+    #[test]
+    fn double_removal_is_an_error() {
+        let (mut tree, _, f1, _, _, _) = removal_tree();
+        tree.apply_removal(f1).unwrap();
+        assert_eq!(tree.apply_removal(f1), Err(RemovalError::AlreadyRemoved));
+    }
+
+    #[test]
+    fn root_and_excluded_are_not_removable() {
+        let (mut tree, root, _, _, _, _) = removal_tree();
+        let root_node = tree.dir(root).node;
+        assert_eq!(tree.apply_removal(root_node), Err(RemovalError::IsRoot));
+
+        let mounted = tree.push_node(
+            b"mnt",
+            Kind::Dir,
+            NodeFlags::EXCLUDED,
+            root_node,
+            Size::default(),
+            0,
+        );
+        tree.set_excluded(mounted, ExcludedReason::OtherFs);
+        assert_eq!(tree.apply_removal(mounted), Err(RemovalError::Excluded));
+        assert!(!tree.is_removed(mounted));
+    }
+
+    #[test]
+    fn hardlink_extra_removal_subtracts_zero() {
+        let (mut tree, root, _, _, _, _) = removal_tree();
+        let root_node = tree.dir(root).node;
+        let extra = tree.push_node(
+            b"extra-link",
+            Kind::File,
+            NodeFlags::HARDLINK_EXTRA,
+            root_node,
+            Size::new(500, 1),
+            0,
+        );
+        // Extras never entered the aggregates, so nothing to add here.
+        let before = (tree.dir(root).ta, tree.dir(root).td, tree.dir(root).tn);
+        let delta = tree.apply_removal(extra).expect("extra removal");
+        assert_eq!(delta, RemovalDelta::default(), "contributed 0, frees 0");
+        assert!(tree.is_removed(extra));
+        let meta = tree.dir(root);
+        assert_eq!((meta.ta, meta.td, meta.tn), before, "aggregates untouched");
+    }
+
+    #[test]
+    fn hardlink_first_seen_is_queryable() {
+        let (mut tree, root, f1, _, _, _) = removal_tree();
+        let root_node = tree.dir(root).node;
+        let extra = tree.push_node(
+            b"link2",
+            Kind::File,
+            NodeFlags::HARDLINK_EXTRA,
+            root_node,
+            Size::new(100, 1),
+            0,
+        );
+        tree.mark_hardlink_first(f1);
+        assert!(tree.is_hardlink(f1), "counted first link");
+        assert!(tree.is_hardlink(extra), "flagged extra link");
+        assert!(!tree.is_hardlink(tree.dir(root).node));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "removal underflow")]
+    fn removal_underflow_is_loud_in_debug() {
+        let mut tree = Tree::new();
+        let root_node = tree.push_root_node(b"/r", Size::default(), 0);
+        let root = tree.add_dir(root_node, None, 1);
+        // Node pushed but its size never aggregated into the parent:
+        // subtracting it underflows — an accounting bug that must not be
+        // silent.
+        let orphan_sized = tree.push_node(
+            b"f",
+            Kind::File,
+            NodeFlags::default(),
+            root_node,
+            Size::new(1000, 8),
+            0,
+        );
+        tree.push_run(
+            root,
+            ChildRun {
+                start: orphan_sized.0,
+                len: 1,
+            },
+        );
+        let _ = tree.apply_removal(orphan_sized);
     }
 
     #[test]

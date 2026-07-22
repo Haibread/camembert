@@ -256,6 +256,10 @@ impl Owner {
             if is_hardlink {
                 if !is_extra_link {
                     self.hardlinks.insert((entry.dev, entry.ino));
+                    // Queryable post-scan (deletion dialog warning): the
+                    // counted link has no free flag bit, so it lives in a
+                    // side set on the tree.
+                    self.tree.mark_hardlink_first(node);
                 }
                 self.hardlink_links.push(HardlinkLink {
                     node,

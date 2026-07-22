@@ -104,7 +104,29 @@ Keys (interactive mode):
   e                sort by subtree error count (find what was unreadable)
                    (pressing the active sort key reverses the direction)
   p                show/hide the apparent-size column
-  q, Esc, Ctrl-C   quit (cancels the scan if still running)";
+  Space            mark/unmark the row under the cursor for deletion,
+                   then move down (a marked directory implies its whole
+                   subtree; marks persist across navigation)
+  u                clear all marks
+  D                delete the marked entries: opens a confirmation dialog
+                   listing count, total size and the first paths;
+                   pressing y confirms, any other key cancels
+  q, Esc, Ctrl-C   quit (cancels the scan if still running)
+
+Deleting (mark-then-confirm, with guard rails):
+  Deletion only works once the scan has completed; during the scan the
+  mark keys just show a hint. Marks refuse mount points (excluded
+  directories) — unreadable (error) directories stay markable, deleting
+  one is legitimate cleanup. Before anything is removed, every entry is
+  re-checked: it must still exist, still be strictly under the scanned
+  root, and its file type (and, for directories, its device) must still
+  match what was scanned — anything that changed since the scan is
+  skipped, never deleted. Symlinks are removed themselves, never
+  followed. Failures (permissions, vanished files) never abort the
+  batch: the footer sums them up and details go to the log (--log-file).
+  Hardlinks: deleting one link of a multi-link inode only frees space
+  when the last link goes; the dialog warns when the selection contains
+  hardlinked files. Totals in the header shrink as entries are deleted.";
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
