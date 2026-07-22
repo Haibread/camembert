@@ -136,9 +136,9 @@ pub struct ViewSnapshot {
     /// The viewed directory's own subtree totals.
     pub totals: DirTotals,
     pub stats: ScanStats,
-    /// Any `nlink > 1` inode was seen: totals are provisional
+    /// `nlink > 1` inodes seen so far. When `> 0`, totals are provisional
     /// (first-seen attribution, D3) until the scan ends.
-    pub hardlinks_seen: bool,
+    pub hardlink_inodes: u64,
     /// Published on the degraded 250 ms cadence (D5): the UI shows
     /// "updating…".
     pub degraded: bool,
@@ -163,7 +163,7 @@ impl ViewSnapshot {
                 elapsed: Duration::ZERO,
                 root_complete: false,
             },
-            hardlinks_seen: false,
+            hardlink_inodes: 0,
             degraded: false,
         }
     }
@@ -179,7 +179,7 @@ pub fn build_snapshot(
     dir: DirId,
     generation: u64,
     stats: ScanStats,
-    hardlinks_seen: bool,
+    hardlink_inodes: u64,
     degraded: bool,
 ) -> ViewSnapshot {
     let meta = tree.dir(dir);
@@ -236,7 +236,7 @@ pub fn build_snapshot(
             errors: u64::from(meta.te),
         },
         stats,
-        hardlinks_seen,
+        hardlink_inodes,
         degraded,
     }
 }
@@ -339,7 +339,7 @@ impl ViewPublisher {
 
     /// One owner tick: serve a nav request immediately, otherwise
     /// republish when the cadence for the viewed directory elapsed (D5).
-    pub(crate) fn tick(&mut self, tree: &Tree, root: DirId, hardlinks_seen: bool) {
+    pub(crate) fn tick(&mut self, tree: &Tree, root: DirId, hardlink_inodes: u64) {
         let mut viewed = *self.viewed.get_or_insert(root);
         let mut force = false;
         if let Some(requested) = self.bus.take_request() {
@@ -376,7 +376,7 @@ impl ViewPublisher {
             viewed,
             self.generation,
             stats,
-            hardlinks_seen,
+            hardlink_inodes,
             degraded,
         );
         self.published_complete = root_complete;
@@ -460,7 +460,7 @@ mod tests {
     #[test]
     fn snapshot_rows_match_the_tree() {
         let (tree, root, sub) = sample_tree();
-        let snap = build_snapshot(&tree, root, 1, stats_of(&tree, root), false, false);
+        let snap = build_snapshot(&tree, root, 1, stats_of(&tree, root), 0, false);
 
         assert_eq!(snap.dir, root);
         assert_eq!(snap.parent, None);
@@ -491,7 +491,7 @@ mod tests {
         assert_eq!(snap.totals.items, tree.dir(root).tn);
 
         // Sub-view: parent set, one row.
-        let sub_snap = build_snapshot(&tree, sub, 2, stats_of(&tree, root), false, false);
+        let sub_snap = build_snapshot(&tree, sub, 2, stats_of(&tree, root), 0, false);
         assert_eq!(sub_snap.parent, Some(root));
         assert_eq!(sub_snap.rows.len(), 1);
         assert_eq!(&*sub_snap.rows[0].name, b"leaf");
@@ -515,18 +515,18 @@ mod tests {
         let mut publisher = ViewPublisher::new(Arc::clone(&bus));
 
         assert_eq!(bus.load().generation, 0, "initial placeholder");
-        publisher.tick(&tree, root, false);
+        publisher.tick(&tree, root, 0);
         assert_eq!(bus.load().generation, 1, "first tick publishes");
 
         // Within the cadence and without a nav request: no republish
         // (the sample tree's root is complete, and the one forced
         // completion publish already went out with the first tick)...
-        publisher.tick(&tree, root, false);
+        publisher.tick(&tree, root, 0);
         assert_eq!(bus.load().generation, 1);
 
         // ...but a nav request publishes immediately, cadence or not.
         bus.request(sub);
-        publisher.tick(&tree, root, false);
+        publisher.tick(&tree, root, 0);
         let snap = bus.load();
         assert_eq!(snap.generation, 2);
         assert_eq!(snap.dir, sub);
@@ -539,13 +539,13 @@ mod tests {
         let bus = Arc::new(ViewBus::new(PathBuf::from("/scan")));
         let mut publisher = ViewPublisher::new(Arc::clone(&bus));
 
-        publisher.tick(&tree, root, false);
+        publisher.tick(&tree, root, 0);
         let first = bus.load();
         assert!(first.stats.root_complete);
 
         // Root already complete: exactly one forced completion publish;
         // further ticks inside the cadence stay quiet.
-        publisher.tick(&tree, root, false);
+        publisher.tick(&tree, root, 0);
         assert_eq!(bus.load().generation, first.generation);
     }
 
@@ -583,16 +583,16 @@ mod tests {
 
         let bus = Arc::new(ViewBus::new(PathBuf::from("/big")));
         let mut publisher = ViewPublisher::new(Arc::clone(&bus));
-        publisher.tick(&tree, root, false);
+        publisher.tick(&tree, root, 0);
         let snap = bus.load();
         assert!(snap.degraded, ">20k children publish degraded (D5)");
         assert_eq!(snap.rows.len(), n);
     }
 
     #[test]
-    fn hardlink_flag_reaches_the_snapshot() {
+    fn hardlink_count_reaches_the_snapshot() {
         let (tree, root, _) = sample_tree();
-        let snap = build_snapshot(&tree, root, 1, stats_of(&tree, root), true, false);
-        assert!(snap.hardlinks_seen);
+        let snap = build_snapshot(&tree, root, 1, stats_of(&tree, root), 3, false);
+        assert_eq!(snap.hardlink_inodes, 3);
     }
 }

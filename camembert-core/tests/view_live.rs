@@ -47,7 +47,7 @@ fn live_scan_publishes_and_serves_nav_until_completion() {
             .all(|r| r.state == RowState::Complete)
     );
     assert!(!final_snap.degraded);
-    assert!(!final_snap.hardlinks_seen);
+    assert_eq!(final_snap.hardlink_inodes, 0);
 
     // Post-completion: the owner thread exits, the outcome hands over the
     // frozen arena, and navigation reads it directly (the documented
@@ -68,7 +68,7 @@ fn live_scan_publishes_and_serves_nav_until_completion() {
         a_dir,
         final_snap.generation + 1,
         stats,
-        outcome.hardlink_inodes > 0,
+        outcome.hardlink_inodes,
         false,
     );
     assert_eq!(a_snap.parent, Some(outcome.root()));
@@ -127,7 +127,7 @@ fn nav_request_over_the_bus_is_served() {
                 target,
                 1,
                 view::scan_stats(outcome.tree(), outcome.root(), outcome.elapsed),
-                false,
+                0,
                 false,
             );
             assert_eq!(snap.rows.len(), 64);

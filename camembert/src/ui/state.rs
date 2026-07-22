@@ -176,9 +176,11 @@ impl UiState {
         self.pending_nav
     }
 
-    /// Rows in the active sort order.
-    pub fn rows(&self) -> impl Iterator<Item = &Row> {
-        self.order.iter().map(|&i| &self.snapshot.rows[i])
+    /// Rows in the active sort order, with each row's index in
+    /// *snapshot* order — the key identity-color assignment is computed
+    /// under, so the table and the wheel dereference the same ranks.
+    pub fn rows_indexed(&self) -> impl Iterator<Item = (usize, &Row)> {
+        self.order.iter().map(|&i| (i, &self.snapshot.rows[i]))
     }
 
     /// The row under the cursor, if any.
@@ -413,7 +415,7 @@ impl UiState {
 /// D3 footer note: totals are provisional while hardlinks were seen and
 /// the scan still runs; the note drops once the root completes.
 pub fn show_hardlink_note(snapshot: &ViewSnapshot) -> bool {
-    snapshot.hardlinks_seen && !snapshot.stats.root_complete
+    snapshot.hardlink_inodes > 0 && !snapshot.stats.root_complete
 }
 
 /// D5 "updating…" indicator: the viewed dir publishes on the degraded
@@ -486,13 +488,13 @@ mod tests {
             rows,
             totals: DirTotals::default(),
             stats: stats(root_complete),
-            hardlinks_seen: false,
+            hardlink_inodes: 0,
             degraded: false,
         })
     }
 
     fn names(state: &UiState) -> Vec<&[u8]> {
-        state.rows().map(|r| &*r.name).collect()
+        state.rows_indexed().map(|(_, r)| &*r.name).collect()
     }
 
     #[test]
@@ -799,7 +801,7 @@ mod tests {
             rows: Vec::new(),
             totals: DirTotals::default(),
             stats: stats(false),
-            hardlinks_seen: true,
+            hardlink_inodes: 2,
             degraded: true,
         };
         assert!(show_hardlink_note(&snap), "hardlinks + scanning: shown");
@@ -810,7 +812,7 @@ mod tests {
         assert!(!show_updating_note(&snap));
 
         snap.stats.root_complete = false;
-        snap.hardlinks_seen = false;
+        snap.hardlink_inodes = 0;
         snap.degraded = false;
         assert!(!show_hardlink_note(&snap));
         assert!(!show_updating_note(&snap));
