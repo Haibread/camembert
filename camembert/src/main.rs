@@ -1,33 +1,66 @@
 mod ui;
 
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use tracing::{error, info};
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
-use camembert_core::dump::{self, DumpMeta};
+use camembert_core::diff::{self, DiffOptions, DiffReport};
+use camembert_core::dump::read::DumpReader;
+use camembert_core::dump::{self, DumpMeta, encode_name};
+use camembert_core::ncdu;
 use camembert_core::scan::{ScanOptions, Scanner};
-use camembert_core::size::HumanSize;
+use camembert_core::size::{HumanSize, SignedHumanSize, parse_size};
 
 /// Disk usage analyzer: what grew, what is freeable, what is cold.
+///
+/// Without a subcommand, scans PATH (interactive browser on a terminal,
+/// summary otherwise). `diff` compares two dumps; `import` converts an
+/// ncdu JSON export into a dump.
 #[derive(Debug, Parser)]
 #[command(version, about, after_help = AFTER_HELP)]
 struct Cli {
-    /// Directory to scan (env: SCAN_PATH)
-    #[arg(env = "SCAN_PATH", default_value = ".")]
-    path: PathBuf,
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    #[command(flatten)]
+    scan: ScanArgs,
 
     /// `tracing` filter directive (e.g. `info`, `camembert=debug`) (env: LOG_FILTER)
     ///
     /// Syntax: <https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html#directives>
-    #[arg(long = "log-filter", env = "LOG_FILTER", default_value = "info")]
+    #[arg(
+        long = "log-filter",
+        env = "LOG_FILTER",
+        default_value = "info",
+        global = true
+    )]
     log_filter: String,
+
+    /// Write diagnostics to this file instead of the default target
+    /// (env: LOG_FILE)
+    ///
+    /// Default target: stderr, except in the interactive scan mode where
+    /// log output would corrupt the full-screen UI and is discarded.
+    #[arg(long = "log-file", env = "LOG_FILE", global = true)]
+    log_file: Option<PathBuf>,
+}
+
+/// Arguments of the default (scan) mode.
+#[derive(Debug, Args)]
+struct ScanArgs {
+    /// Directory to scan (env: SCAN_PATH)
+    ///
+    /// To scan a directory literally named like a subcommand (`diff`,
+    /// `import`), prefix it: `camembert ./diff`.
+    #[arg(env = "SCAN_PATH", default_value = ".")]
+    path: PathBuf,
 
     /// Scan worker threads; 0 = auto (2x CPU cores, capped at 8) (env: THREADS)
     #[arg(long, env = "THREADS", default_value_t = 0)]
@@ -49,14 +82,6 @@ struct Cli {
     #[arg(long = "no-ui", env = "NO_UI")]
     no_ui: bool,
 
-    /// Write diagnostics to this file instead of the default target
-    /// (env: LOG_FILE)
-    ///
-    /// Default target: stderr in summary mode; discarded in interactive
-    /// mode, where log output would corrupt the full-screen UI.
-    #[arg(long = "log-file", env = "LOG_FILE")]
-    log_file: Option<PathBuf>,
-
     /// Write a dump of the scan to this file (camembert-dump v1, `.cmbt`)
     /// once the scan completes; `-` writes it to stdout, summary mode
     /// only (env: OUTPUT)
@@ -69,7 +94,82 @@ struct Cli {
     output: Option<PathBuf>,
 }
 
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Compare two dumps: what grew, shrank, appeared, disappeared
+    ///
+    /// Streams both ordered dumps through a constant-memory merge-join
+    /// (never loads either tree) and prints the total delta, the top
+    /// directories by growth and the top changed entries. Exit codes:
+    /// 0 = OK (and growth below --threshold if given), 1 = growth above
+    /// --threshold, 2 = error (unreadable/unordered/incomplete dump).
+    #[command(after_help = DIFF_AFTER_HELP)]
+    Diff(DiffArgs),
+
+    /// Convert an ncdu JSON export (ncdu -o) into a camembert dump
+    ///
+    /// Streams the ncdu 1.x JSON format (minor versions 0-2; newer minors
+    /// import with a warning, unknown fields are ignored) and writes an
+    /// ordered .cmbt with hardlinks deduplicated and canonically
+    /// attributed. The result diffs cleanly against fresh scans:
+    /// `camembert import old-ncdu.json -o old.cmbt && camembert diff
+    /// old.cmbt fresh.cmbt`. Exit codes: 0 = OK, 2 = error.
+    #[command(after_help = IMPORT_AFTER_HELP)]
+    Import(ImportArgs),
+}
+
+#[derive(Debug, Args)]
+struct DiffArgs {
+    /// The older dump (.cmbt)
+    old: PathBuf,
+
+    /// The newer dump (.cmbt)
+    new: PathBuf,
+
+    /// Number of directories and entries in each top list (env: TOP)
+    #[arg(long, env = "TOP", default_value_t = 20)]
+    top: usize,
+
+    /// Machine output: JSON Lines instead of human text (env: JSON_OUTPUT)
+    ///
+    /// One `{"t":"summary",...}` object, then one `{"t":"dir",...}` per
+    /// top directory and one `{"t":"entry",...}` per top entry; see
+    /// --help of the diff subcommand for the field list.
+    #[arg(long, env = "JSON_OUTPUT")]
+    json: bool,
+
+    /// Exit 1 when total disk growth exceeds this size (env: THRESHOLD)
+    ///
+    /// Size syntax: a decimal number with an optional binary-multiple
+    /// unit K/M/G/T/P (1K = 1024 bytes), `iB`/`B` suffix and fractions
+    /// allowed: 500M, 2G, 1.5GiB. Turns the diff into a monitoring
+    /// probe: 0 = within budget, 1 = grew too much, 2 = error.
+    #[arg(long, env = "THRESHOLD", value_parser = parse_size)]
+    threshold: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+struct ImportArgs {
+    /// The ncdu JSON export to convert; `-` reads stdin
+    ///
+    /// Accepts the output of `ncdu -o` (optionally with `-e` extended
+    /// info), gzip NOT handled — decompress first (`zcat x.json.gz |
+    /// camembert import - -o x.cmbt`).
+    input: PathBuf,
+
+    /// Where to write the camembert dump (.cmbt); `-` writes to stdout
+    /// (env: OUTPUT)
+    #[arg(short = 'o', long = "output", env = "OUTPUT")]
+    output: PathBuf,
+}
+
 const AFTER_HELP: &str = "\
+Subcommands:
+  camembert [PATH]             scan (the default mode, described below)
+  camembert diff OLD NEW       compare two dumps (growth, shrinkage, churn)
+  camembert import JSON -o OUT convert an ncdu JSON export into a dump
+  (see `camembert diff --help` / `camembert import --help`)
+
 Modes:
   Interactive (default when stdout is a terminal): a full-screen browser
   over the scanned tree, navigable WHILE the scan runs — totals fill in
@@ -128,30 +228,86 @@ Deleting (mark-then-confirm, with guard rails):
   when the last link goes; the dialog warns when the selection contains
   hardlinked files. Totals in the header shrink as entries are deleted.";
 
+const DIFF_AFTER_HELP: &str = "\
+Output (default): a summary line (total disk/apparent/entry delta and
+change counts), then 'Top N directories by growth' (signed subtree disk
+delta from the dump totals — canonical hardlink attribution — biggest
+growth first, shrinkage negative) and 'Top N entries by growth'.
+
+Change kinds: added, removed, grown, shrunk, touched (same sizes,
+different mtime), type-changed (file <-> symlink/device/directory).
+
+JSON Lines schema (--json, env JSON_OUTPUT), one object per line:
+  {\"t\":\"summary\",\"oldRoot\":S,\"newRoot\":S,\"diskDelta\":I,
+   \"apparentDelta\":I,\"entryDelta\":I,\"added\":N,\"removed\":N,
+   \"grown\":N,\"shrunk\":N,\"touched\":N,\"typeChanged\":N,
+   \"dirsAdded\":N,\"dirsRemoved\":N}
+  {\"t\":\"dir\",\"path\":S,\"change\":\"added|removed|changed\",
+   \"diskDelta\":I,\"apparentDelta\":I,\"entryDelta\":I}
+  {\"t\":\"entry\",\"path\":S,\"change\":\"added|removed|grown|shrunk|
+   touched|typeChanged\",\"diskDelta\":I,\"apparentDelta\":I}
+Paths are percent-encoded like dump names (non-UTF-8 bytes as %XX);
+integers with magnitude >= 2^53 are emitted as decimal strings, exactly
+like the dump format — parse both.
+
+Monitoring probe: `camembert diff old.cmbt new.cmbt --threshold 2G`
+exits 1 when the tree grew by more than 2 GiB (0 otherwise, 2 on error)
+without printing anything extra — wire it straight into a check.
+
+Requirements: both dumps must be ordered (header \"ordered\":true — the
+default writer output) and complete (their `e` end marker present).
+Unordered or truncated dumps are refused with exit code 2.";
+
+const IMPORT_AFTER_HELP: &str = "\
+Field mapping (ncdu -> dump): name -> n (raw bytes, re-encoded),
+asize/dsize -> a/d, ino/nlink/hlnkc -> i/l with (dev,ino) hardlink
+deduplication and canonical smallest-path attribution, read_error ->
+err, excluded otherfs/othfs/kernfs -> a never-scanned directory stub
+with ex, absent dev inherits the parent's.
+
+Not carried (documented losses): uid/gid/mode (extended info) are
+dropped; pattern/frmlink exclusion reasons collapse to ex:\"otherfs\";
+mtime is 0 when the export was made without `ncdu -e`; the dev of a
+non-hardlinked file is dropped; hlnkc without ino (very old exports)
+cannot be deduplicated and counts fully; the ncdu metadata block is
+ignored (as ncdu itself documents).
+
+The ncdu export does not guarantee sibling order; the importer sorts
+siblings by raw name bytes and computes subtree totals, so the result
+is a first-class ordered dump, diffable against any other.";
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    let interactive = !cli.no_ui && std::io::stdout().is_terminal();
-
-    if interactive && cli.output.as_deref() == Some(Path::new("-")) {
-        // Binary dump bytes and a full-screen TUI cannot share stdout.
-        eprintln!(
-            "camembert: --output - (dump to stdout) requires summary mode; \
-             add --no-ui or redirect stdout"
-        );
-        return ExitCode::FAILURE;
+    match &cli.command {
+        None => run_scan(&cli),
+        Some(Command::Diff(args)) => {
+            if init_tracing(&cli, false).is_err() {
+                return ExitCode::from(2);
+            }
+            run_diff(args)
+        }
+        Some(Command::Import(args)) => {
+            if init_tracing(&cli, false).is_err() {
+                return ExitCode::from(2);
+            }
+            run_import(args)
+        }
     }
+}
 
-    // In interactive mode the terminal belongs to ratatui: tracing output
-    // must never reach it (a single log line prints at the raw-mode cursor,
-    // right across the UI). Interactive diagnostics go to --log-file when
-    // given, and are discarded otherwise; summary mode keeps stderr.
+/// Install the global tracing subscriber. In interactive scan mode the
+/// terminal belongs to ratatui: tracing output must never reach it (a
+/// single log line prints at the raw-mode cursor, right across the UI),
+/// so without --log-file it is discarded; everywhere else stderr is the
+/// default target.
+fn init_tracing(cli: &Cli, interactive: bool) -> Result<(), ()> {
     let writer = match (&cli.log_file, interactive) {
         (Some(path), _) => {
             let file = match std::fs::File::create(path) {
                 Ok(file) => file,
                 Err(err) => {
                     eprintln!("camembert: cannot open log file {}: {err}", path.display());
-                    return ExitCode::FAILURE;
+                    return Err(());
                 }
             };
             let file = Arc::new(file);
@@ -165,14 +321,35 @@ fn main() -> ExitCode {
         .with_writer(writer)
         .with_ansi(cli.log_file.is_none())
         .init();
+    Ok(())
+}
+
+// ---- default mode: scan ----
+
+fn run_scan(cli: &Cli) -> ExitCode {
+    let args = &cli.scan;
+    let interactive = !args.no_ui && std::io::stdout().is_terminal();
+
+    if interactive && args.output.as_deref() == Some(Path::new("-")) {
+        // Binary dump bytes and a full-screen TUI cannot share stdout.
+        eprintln!(
+            "camembert: --output - (dump to stdout) requires summary mode; \
+             add --no-ui or redirect stdout"
+        );
+        return ExitCode::FAILURE;
+    }
+
+    if init_tracing(cli, interactive).is_err() {
+        return ExitCode::FAILURE;
+    }
 
     let scanner = Scanner::new(ScanOptions {
-        threads: cli.threads,
-        cross_filesystems: cli.cross_filesystems,
+        threads: args.threads,
+        cross_filesystems: args.cross_filesystems,
     });
 
     if interactive {
-        return match ui::run(scanner, &cli.path, cli.output.clone()) {
+        return match ui::run(scanner, &args.path, args.output.clone()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 // The terminal is restored by now; these are the process's
@@ -184,12 +361,12 @@ fn main() -> ExitCode {
             }
         };
     }
-    summary(&cli, &scanner)
+    summary(args, &scanner)
 }
 
 /// Non-interactive mode: scan to completion, then print the summary on
 /// stdout (diagnostics stay on stderr via tracing).
-fn summary(cli: &Cli, scanner: &Scanner) -> ExitCode {
+fn summary(args: &ScanArgs, scanner: &Scanner) -> ExitCode {
     // Progress line on stderr (via tracing) roughly every second while the
     // scan blocks this thread.
     let progress = scanner.progress();
@@ -213,7 +390,7 @@ fn summary(cli: &Cli, scanner: &Scanner) -> ExitCode {
         })
     };
 
-    let outcome = scanner.scan(&cli.path);
+    let outcome = scanner.scan(&args.path);
     done.store(true, Ordering::Release);
     let _ = poller.join();
 
@@ -228,13 +405,13 @@ fn summary(cli: &Cli, scanner: &Scanner) -> ExitCode {
     // are final, not first-seen provisional.
     outcome.finalize_hardlinks();
 
-    let dump_to_stdout = cli.output.as_deref() == Some(Path::new("-"));
+    let dump_to_stdout = args.output.as_deref() == Some(Path::new("-"));
     if dump_to_stdout {
         info!("dump streams to stdout: summary text suppressed");
     } else {
         println!(
             "Scanned {} in {:.2}s",
-            cli.path.display(),
+            args.path.display(),
             outcome.elapsed.as_secs_f64()
         );
         println!(
@@ -258,8 +435,8 @@ fn summary(cli: &Cli, scanner: &Scanner) -> ExitCode {
         }
         println!();
         println!();
-        println!("Top {} directories by real size:", cli.top);
-        for dir in outcome.top_dirs_by_disk(cli.top) {
+        println!("Top {} directories by real size:", args.top);
+        for dir in outcome.top_dirs_by_disk(args.top) {
             let meta = outcome.dir(dir);
             println!(
                 "  {:>10}  {}",
@@ -269,7 +446,7 @@ fn summary(cli: &Cli, scanner: &Scanner) -> ExitCode {
         }
     }
 
-    if let Some(path) = &cli.output {
+    if let Some(path) = &args.output {
         let meta = DumpMeta {
             timestamp: SystemTime::now(),
         };
@@ -310,5 +487,170 @@ fn summary(cli: &Cli, scanner: &Scanner) -> ExitCode {
         }
     }
 
+    ExitCode::SUCCESS
+}
+
+// ---- diff ----
+
+fn run_diff(args: &DiffArgs) -> ExitCode {
+    let open = |path: &Path| match DumpReader::open(path) {
+        Ok(reader) => Ok(reader),
+        Err(err) => {
+            error!(path = %path.display(), %err, "cannot open dump");
+            eprintln!("camembert diff: {}: {err}", path.display());
+            Err(())
+        }
+    };
+    let (Ok(old), Ok(new)) = (open(&args.old), open(&args.new)) else {
+        return ExitCode::from(2);
+    };
+    let report = match diff::diff_dumps(old, new, &DiffOptions { top: args.top }) {
+        Ok(report) => report,
+        Err(err) => {
+            error!(%err, "diff failed");
+            eprintln!("camembert diff: {err}");
+            return ExitCode::from(2);
+        }
+    };
+
+    if args.json {
+        print!("{}", report.to_json_lines());
+    } else {
+        print_human_report(&report, args.top);
+    }
+
+    if let Some(threshold) = args.threshold
+        && report.disk_delta > 0
+        && report.disk_delta.unsigned_abs() > threshold
+    {
+        info!(
+            disk_delta = report.disk_delta,
+            threshold, "growth exceeds the threshold"
+        );
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
+}
+
+fn print_human_report(report: &DiffReport, top: usize) {
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(
+        out,
+        "diff {} -> {}",
+        encode_name(&report.old_root),
+        encode_name(&report.new_root)
+    );
+    let _ = writeln!(
+        out,
+        "  total: {} disk, {} apparent, {:+} entries",
+        SignedHumanSize(report.disk_delta),
+        SignedHumanSize(report.apparent_delta),
+        report.entry_delta
+    );
+    let counts = &report.counts;
+    let _ = writeln!(
+        out,
+        "  added {}, removed {}, grown {}, shrunk {}, touched {}, type-changed {} \
+         (dirs: +{}/-{})",
+        counts.added,
+        counts.removed,
+        counts.grown,
+        counts.shrunk,
+        counts.touched,
+        counts.type_changed,
+        counts.dirs_added,
+        counts.dirs_removed
+    );
+
+    if !report.top_dirs.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Top {top} directories by growth:");
+        for dir in &report.top_dirs {
+            let _ = writeln!(
+                out,
+                "  {:>12}  {}",
+                SignedHumanSize(dir.disk_delta).to_string(),
+                encode_name(&dir.path)
+            );
+        }
+    }
+    if !report.top_entries.is_empty() {
+        let _ = writeln!(out);
+        let _ = writeln!(out, "Top {top} entries by growth:");
+        for entry in &report.top_entries {
+            let _ = writeln!(
+                out,
+                "  {:>12}  {:<12}  {}",
+                SignedHumanSize(entry.disk_delta).to_string(),
+                entry.change.as_str(),
+                encode_name(&entry.path)
+            );
+        }
+    }
+}
+
+// ---- import ----
+
+fn run_import(args: &ImportArgs) -> ExitCode {
+    let outcome = if args.input == Path::new("-") {
+        ncdu::import(std::io::stdin().lock())
+    } else {
+        match std::fs::File::open(&args.input) {
+            Ok(file) => ncdu::import(std::io::BufReader::new(file)),
+            Err(err) => {
+                error!(path = %args.input.display(), %err, "cannot open ncdu export");
+                eprintln!("camembert import: {}: {err}", args.input.display());
+                return ExitCode::from(2);
+            }
+        }
+    };
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            error!(%err, "import failed");
+            eprintln!("camembert import: {err}");
+            return ExitCode::from(2);
+        }
+    };
+
+    let meta = DumpMeta {
+        timestamp: SystemTime::now(),
+    };
+    let to_stdout = args.output == Path::new("-");
+    let written = if to_stdout {
+        dump::write_dump(
+            &outcome,
+            std::io::BufWriter::new(std::io::stdout().lock()),
+            &meta,
+        )
+    } else {
+        dump::write_dump_to_path(&outcome, &args.output, &meta)
+    };
+    if let Err(err) = written {
+        error!(%err, path = %args.output.display(), "dump write failed");
+        eprintln!(
+            "camembert import: cannot write {}: {err}",
+            args.output.display()
+        );
+        return ExitCode::from(2);
+    }
+    if !to_stdout {
+        println!(
+            "Imported {} into {}: {} entries ({} dirs), {} real, {} apparent, {} errors",
+            args.input.display(),
+            args.output.display(),
+            outcome.entries,
+            outcome.dirs,
+            HumanSize(outcome.totals.real),
+            HumanSize(outcome.totals.apparent),
+            outcome.errors
+        );
+        if outcome.hardlink_inodes > 0 {
+            println!(
+                "  hardlinked inodes: {} (deduplicated, canonically attributed)",
+                outcome.hardlink_inodes
+            );
+        }
+    }
     ExitCode::SUCCESS
 }

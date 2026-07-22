@@ -39,7 +39,8 @@
 //! scan completion.
 
 mod container;
-mod encode;
+pub(crate) mod encode;
+pub mod read;
 
 pub use encode::{decode_name, encode_name};
 
@@ -299,6 +300,16 @@ fn entry_line(
     }
     if node.flags().contains(NodeFlags::ERROR) {
         line.bool("err", true);
+    }
+    if node.flags().contains(NodeFlags::EXCLUDED) {
+        // Non-directory excluded entries (spec §6.4 `ex`): the scanner
+        // never produces them (mount points are directories), but the ncdu
+        // importer does (pattern-excluded files).
+        let reason = match tree.excluded_reason(id) {
+            Some(ExcludedReason::KernFs) => "kernfs",
+            _ => "otherfs",
+        };
+        line.str("ex", reason);
     }
     line.finish()
 }

@@ -16,8 +16,10 @@ Named after the pie chart — *camembert* in French.
 > **Status**: early development. The parallel scan engine (work-stealing
 > `openat`/`getdents64`/`statx` traversal, streaming aggregation, hardlink
 > dedup, mount-boundary detection), the interactive browse-during-scan
-> TUI, guarded mark-then-confirm deletion, and the ordered dump-format v1
-> writer (`--output`) are implemented.
+> TUI, guarded mark-then-confirm deletion, the ordered dump-format v1
+> writer (`--output`) and reader, the streaming **`camembert diff`**
+> between two dumps, and the **ncdu import** (`camembert import`) are
+> implemented.
 > See [HANDOFF.md](HANDOFF.md) for the full design hypotheses and roadmap,
 > `docs/design/` for the settled decisions, and
 > [`docs/format/dump-v1.md`](docs/format/dump-v1.md) for the dump format.
@@ -40,6 +42,17 @@ cargo build --workspace
 ```
 
 ## Run
+
+`camembert` has one default mode and two subcommands:
+
+| Command | What it does |
+| --- | --- |
+| `camembert [PATH]` | scan (interactive on a terminal, summary otherwise) |
+| `camembert diff OLD.cmbt NEW.cmbt` | compare two dumps — see [Diff](#diff-what-grew) |
+| `camembert import NCDU.json -o OUT.cmbt` | convert an ncdu export — see [Import](#import-from-ncdu) |
+
+(To scan a directory literally named `diff` or `import`, prefix it:
+`camembert ./diff`.)
 
 When stdout is a terminal, `camembert` opens the **interactive mode** by
 default (see below). With `--no-ui` (env `NO_UI`), or automatically when
@@ -189,8 +202,9 @@ is logged to stderr every second.
 
 Every CLI option is also settable through an environment variable
 (`SCAN_PATH`, `LOG_FILTER`, `LOG_FILE`, `THREADS`, `CROSS_FILESYSTEMS`,
-`TOP`, `NO_UI`, `OUTPUT`); see `cargo run -- --help` for the full reference,
-including the interactive-mode key map.
+`TOP`, `NO_UI`, `OUTPUT`, and for `diff`: `JSON_OUTPUT`, `THRESHOLD`);
+see `cargo run -- --help` (and `--help` on each subcommand) for the full
+reference, including the interactive-mode key map.
 
 ## Dump
 
@@ -234,6 +248,114 @@ Format notes:
   them.
 - Hardlinked inodes keep full metadata on every link (`i`/`l` fields) but
   are counted once in totals, at the canonical link.
+
+## Diff (what grew)
+
+`camembert diff OLD.cmbt NEW.cmbt` answers *the* incident question — "what
+changed since yesterday" — by streaming both dumps through a
+constant-memory merge-join (neither tree is ever loaded whole; memory is
+bounded by one directory block per side plus the top-N heaps, regardless
+of dump size).
+
+```bash
+camembert /var --no-ui -o monday.cmbt
+# ... a day later ...
+camembert /var --no-ui -o tuesday.cmbt
+camembert diff monday.cmbt tuesday.cmbt
+```
+
+Output: a summary (total disk/apparent/entry delta, counts of
+added/removed/grown/shrunk/touched/type-changed entries and added/removed
+directories), then **Top N directories by growth** (signed subtree disk
+delta, straight from the dump totals — canonical hardlink attribution
+included — biggest growth first, shrinkage negative) and **Top N entries
+by growth**. `--top N` (env `TOP`, default 20) sizes both lists.
+
+Change kinds: `added`, `removed`, `grown`, `shrunk`, `touched` (same
+sizes, different mtime), `typeChanged` (file ↔ symlink/device/…, and file
+↔ directory — a file replaced by a directory of the same name is
+reported as one type change, not a remove + add).
+
+### Machine output (`--json`, env `JSON_OUTPUT`)
+
+JSON Lines on stdout — one `summary` object, then one object per top
+directory and per top entry:
+
+```json
+{"t":"summary","oldRoot":"/var","newRoot":"/var","diskDelta":123,"apparentDelta":120,"entryDelta":2,"added":5,"removed":1,"grown":3,"shrunk":0,"touched":1,"typeChanged":0,"dirsAdded":1,"dirsRemoved":0}
+{"t":"dir","path":"/var/log","change":"changed","diskDelta":123,"apparentDelta":120,"entryDelta":2}
+{"t":"entry","path":"/var/log/syslog","change":"grown","diskDelta":100,"apparentDelta":100}
+```
+
+Same conventions as the dump format: paths are percent-encoded raw bytes
+(`%XX` for non-UTF-8), and any integer with magnitude ≥ 2^53 is emitted
+as a decimal string — parse both.
+
+### Monitoring probe (`--threshold`, env `THRESHOLD`)
+
+With `--threshold SIZE`, the exit code becomes the verdict:
+
+```bash
+camembert diff monday.cmbt tuesday.cmbt --threshold 2G --json
+echo $?   # 0 = grew by at most 2 GiB (or shrank), 1 = grew more, 2 = error
+```
+
+Size syntax: decimal number + optional binary unit `K`/`M`/`G`/`T`/`P`
+(1K = 1024 bytes), `iB`/`B` suffixes and fractions accepted — `500M`,
+`2G`, `1.5GiB`, `1048576`. Only *growth* trips the threshold; shrinkage
+exits 0.
+
+Exit codes (also without `--threshold`): `0` OK, `1` growth above the
+threshold, `2` error — unreadable file, not a dump, unsupported major
+version, unordered dump (`"ordered":false`: re-dump with the ordered
+writer; `camembert dump sort` is planned to upgrade in place), or a
+truncated dump (missing `e` end marker — refused because the missing
+tail would show up as phantom changes).
+
+## Import (from ncdu)
+
+`camembert import NCDU.json -o OUT.cmbt` converts an
+[ncdu JSON export](https://dev.yorhel.nl/ncdu/jsonfmt) (`ncdu -o`,
+major 1, minors 0–2; newer minors import with a warning) into an ordered
+camembert dump. `-` reads stdin, `-o -` writes the dump to stdout:
+
+```bash
+ncdu -x -o- / | camembert import - -o baseline.cmbt
+# or convert an old export you kept around:
+zcat old-export.json.gz | camembert import - -o old.cmbt
+
+# THE use case: diff an old ncdu export against a fresh camembert scan
+camembert / --no-ui -o today.cmbt
+camembert diff old.cmbt today.cmbt --top 30
+```
+
+The import is streaming (SAX-style pull parser, no full-file JSON value)
+and tolerant of the format's history: raw non-UTF-8 bytes inside names
+(pre-2.5 exports) are preserved as raw bytes, absent `dev` inherits the
+parent's, `hlnkc`/`nlink` hardlinks are deduplicated by `(dev, ino)` and
+re-attributed to their canonical (smallest-path) link, and ncdu's
+unspecified sibling order is re-sorted, so the result is a first-class
+ordered dump.
+
+What maps how (and what is lost — the importer never invents data):
+
+| ncdu | camembert dump |
+| --- | --- |
+| `name` | `n`/`path` (raw bytes, `%XX`-encoded) |
+| `asize` / `dsize` | `a` / `d` |
+| `ino`, `nlink`, `hlnkc` | `i`, `l` + hardlink dedup |
+| `read_error` | `err:true` (+ `te` error counts) |
+| `excluded: otherfs/othfs/kernfs` | never-scanned dir stub with `ex` |
+| `excluded: pattern/frmlink/…` | entry `ex:"otherfs"` (reason collapsed, lossy) |
+| `notreg` | non-regular entry, exact kind unknown (no `k`) |
+| extended `mtime` (`ncdu -e`) | `m`; without `-e` mtimes import as `0` |
+| extended `uid`/`gid`/`mode` | dropped (no extended storage yet) |
+| `dev` of a non-hardlinked file | dropped (only hardlinks carry `dev`) |
+| `hlnkc` without `ino` (very old) | not dedupable, counted fully |
+| metadata block | ignored (as ncdu itself documents) |
+
+Exit codes: `0` OK, `2` error (unreadable input, not an ncdu export,
+unsupported major version, write failure).
 
 ## Test
 
