@@ -2,4 +2,6 @@
 //! semantics. Frontends (TUI, GUI) depend on this crate and never the other
 //! way around.
 
+pub mod scan;
 pub mod size;
+pub mod tree;
