@@ -1,9 +1,10 @@
 # CLAUDE.md
 
-Disk-usage analyzer (ncdu successor) in Rust. All project context, design
-hypotheses, and roadmap live in [HANDOFF.md](HANDOFF.md) — read it before any
-design or implementation work. It is a set of challengeable hypotheses, not a
-frozen spec.
+Disk-usage analyzer (ncdu successor) in Rust. Read [HANDOFF.md](HANDOFF.md)
+(current project state and next steps) before any design or implementation
+work. The original ideation document is archived at
+[docs/design/handoff-original.md](docs/design/handoff-original.md); settled
+decisions live in `docs/design/*-decisions.md` and are binding.
 
 ## Documentation
 
