@@ -15,5 +15,7 @@ camembert-core = { path = "camembert-core" }
 clap = { version = "4", features = ["derive", "env"] }
 crossterm = "0.29"
 ratatui = "0.30"
+serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zstd = "0.13"

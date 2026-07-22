@@ -133,6 +133,10 @@ impl NodeFlags {
         self.0 |= other.0;
     }
 
+    pub fn remove(&mut self, other: Self) {
+        self.0 &= !other.0;
+    }
+
     fn bits(self) -> u8 {
         self.0
     }
@@ -318,8 +322,8 @@ impl Tree {
             .flat_map(|run| (run.start..run.start + run.len).map(NodeId))
     }
 
-    /// All directory ids (arena order).
-    pub fn dir_ids(&self) -> impl Iterator<Item = DirId> {
+    /// All directory ids (arena order). Captures no borrow of the tree.
+    pub fn dir_ids(&self) -> impl Iterator<Item = DirId> + use<> {
         (0..u32::try_from(self.dirs.len()).expect("dir arena exceeds u32")).map(DirId)
     }
 
@@ -422,6 +426,35 @@ impl Tree {
             meta.te += de;
             cur = meta.parent;
         }
+    }
+
+    /// Subtract a delta from `dir` and every ancestor up to the root — the
+    /// exact inverse of [`Tree::apply_delta`]. Used by the post-scan
+    /// hardlink canonical re-attribution (the amounts were added along
+    /// this chain during the scan, so the subtraction cannot underflow).
+    pub(crate) fn retract_delta(&mut self, dir: DirId, da: u64, dd: u64, dn: u64) {
+        let mut cur = Some(dir);
+        while let Some(d) = cur {
+            let meta = &mut self.dirs[d.index()];
+            meta.ta -= da;
+            meta.td -= dd;
+            meta.tn -= dn;
+            cur = meta.parent;
+        }
+    }
+
+    /// Set or clear [`NodeFlags::HARDLINK_EXTRA`] on a node (post-scan
+    /// canonical re-attribution moves the "counted" link of an inode).
+    pub(crate) fn set_hardlink_extra(&mut self, node: NodeId, extra: bool) {
+        let n = &mut self.nodes[node.index()];
+        let mut flags = NodeFlags::from_bits((n.name_kind >> FLAGS_SHIFT) as u8);
+        if extra {
+            flags.insert(NodeFlags::HARDLINK_EXTRA);
+        } else {
+            flags.remove(NodeFlags::HARDLINK_EXTRA);
+        }
+        n.name_kind =
+            (n.name_kind & !(0b111 << FLAGS_SHIFT)) | (u32::from(flags.bits()) << FLAGS_SHIFT);
     }
 
     pub(crate) fn mark_error(&mut self, dir: DirId) {

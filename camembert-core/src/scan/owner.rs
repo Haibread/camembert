@@ -15,13 +15,14 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::{debug, warn};
 
 use crate::size::Size;
-use crate::tree::{ChildRun, DirId, DirState, Kind, NodeFlags, NodeId, Tree};
+use crate::tree::{ChildRun, DirId, DirState, Kind, NodeFlags, Tree};
 
 use super::ScanProgress;
+use super::hardlink::HardlinkLink;
 use super::message::Batch;
 
 /// Token of the scan root (workers allocate from 1 upward).
@@ -41,22 +42,6 @@ pub(crate) const ROOT_TOKEN: u64 = 0;
 /// is what limits total in-flight data.
 const HOLDING_CAP_ENTRIES: usize = 512 * 1024;
 
-/// First-seen hardlink registry entry.
-///
-/// Canonical re-attribution (dump rule: the owner is the link with the
-/// smallest path under the raw-byte comparator) is a LATER increment, run
-/// off the owner's critical path overlapped with finalize (D3). For now
-/// live totals use first-seen attribution: the first link of a
-/// `(dev, ino)` counts, later links contribute 0 and carry
-/// [`NodeFlags::HARDLINK_EXTRA`].
-#[allow(dead_code, reason = "consumed by the future re-attribution increment")]
-struct HardlinkSeen {
-    first: NodeId,
-    /// Whether the first-seen link was counted in the aggregates (always
-    /// true in this increment; kept for the re-attribution pass).
-    counted: bool,
-}
-
 pub(crate) struct Owner {
     tree: Tree,
     root: DirId,
@@ -68,8 +53,16 @@ pub(crate) struct Owner {
     holding_entries: usize,
     /// Overflow beyond the holding cap: plain unordered buffer.
     spill: Vec<Batch>,
-    /// `(dev, ino)` → first-seen link, for `nlink > 1` non-directories.
-    hardlinks: FxHashMap<(u64, u64), HardlinkSeen>,
+    /// `(dev, ino)` already counted once, for `nlink > 1` non-directories.
+    /// Live totals use **first-seen** attribution: the first link of an
+    /// inode counts, later links contribute 0 and carry
+    /// [`NodeFlags::HARDLINK_EXTRA`]. The canonical re-attribution
+    /// (smallest path, D2) runs post-scan off the critical path (D3) — see
+    /// [`super::hardlink`].
+    hardlinks: FxHashSet<(u64, u64)>,
+    /// Every `nlink > 1` link seen (first and extras): input of the
+    /// post-scan re-attribution and of the dump writer's `i`/`l` fields.
+    hardlink_links: Vec<HardlinkLink>,
     /// Later links to an already-seen inode (nodes flagged
     /// `HARDLINK_EXTRA`).
     hardlink_extra_links: u64,
@@ -99,7 +92,8 @@ impl Owner {
             holding: FxHashMap::default(),
             holding_entries: 0,
             spill: Vec::new(),
-            hardlinks: FxHashMap::default(),
+            hardlinks: FxHashSet::default(),
+            hardlink_links: Vec::new(),
             hardlink_extra_links: 0,
             excluded_dirs: 0,
             progress,
@@ -130,8 +124,8 @@ impl Owner {
         self.hardlink_extra_links
     }
 
-    pub(crate) fn into_tree(self) -> (Tree, DirId) {
-        (self.tree, self.root)
+    pub(crate) fn into_parts(self) -> (Tree, DirId, Vec<HardlinkLink>) {
+        (self.tree, self.root, self.hardlink_links)
     }
 
     /// Handle one batch from the channel: integrate it if its directory is
@@ -232,9 +226,8 @@ impl Owner {
                 apparent: entry.apparent,
                 real: entry.disk,
             };
-            let is_extra_link = entry.kind != Kind::Dir
-                && entry.nlink > 1
-                && self.hardlinks.contains_key(&(entry.dev, entry.ino));
+            let is_hardlink = entry.kind != Kind::Dir && entry.nlink > 1;
+            let is_extra_link = is_hardlink && self.hardlinks.contains(&(entry.dev, entry.ino));
             if is_extra_link {
                 flags.insert(NodeFlags::HARDLINK_EXTRA);
                 dup.add(size);
@@ -246,14 +239,16 @@ impl Owner {
                 self.tree
                     .push_node(&entry.name, entry.kind, flags, dir_node, size, entry.mtime);
 
-            if entry.kind != Kind::Dir && entry.nlink > 1 && !is_extra_link {
-                self.hardlinks.insert(
-                    (entry.dev, entry.ino),
-                    HardlinkSeen {
-                        first: node,
-                        counted: true,
-                    },
-                );
+            if is_hardlink {
+                if !is_extra_link {
+                    self.hardlinks.insert((entry.dev, entry.ino));
+                }
+                self.hardlink_links.push(HardlinkLink {
+                    node,
+                    dev: entry.dev,
+                    ino: entry.ino,
+                    nlink: entry.nlink,
+                });
             }
 
             if let Some(token) = entry.child_token {

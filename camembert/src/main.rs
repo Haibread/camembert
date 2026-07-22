@@ -1,16 +1,17 @@
 mod ui;
 
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use clap::Parser;
 use tracing::{error, info};
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
+use camembert_core::dump::{self, DumpMeta};
 use camembert_core::scan::{ScanOptions, Scanner};
 use camembert_core::size::HumanSize;
 
@@ -55,6 +56,17 @@ struct Cli {
     /// mode, where log output would corrupt the full-screen UI.
     #[arg(long = "log-file", env = "LOG_FILE")]
     log_file: Option<PathBuf>,
+
+    /// Write a dump of the scan to this file (camembert-dump v1, `.cmbt`)
+    /// once the scan completes; `-` writes it to stdout, summary mode
+    /// only (env: OUTPUT)
+    ///
+    /// The dump is JSON Lines in a seekable zstd container, readable with
+    /// stock tools: `zstdcat dump.cmbt | jq`. Quitting the interactive
+    /// mode mid-scan cancels the scan and skips the dump. With `-` the
+    /// summary text is suppressed so stdout carries only the dump stream.
+    #[arg(short = 'o', long = "output", env = "OUTPUT")]
+    output: Option<PathBuf>,
 }
 
 const AFTER_HELP: &str = "\
@@ -69,6 +81,15 @@ Modes:
 
   Summary (--no-ui, env NO_UI, or stdout not a terminal): scan to
   completion, then print totals and the --top largest directories.
+
+Dump:
+  --output FILE (env: OUTPUT) writes a camembert-dump v1 (.cmbt) after
+  the scan: JSON Lines in a seekable zstd container that stock tools
+  read directly (zstdcat dump.cmbt | jq). Hardlinked inodes are
+  attributed to their canonical (smallest-path) link before writing.
+  '-' streams the dump to stdout (summary mode only; the summary text is
+  then suppressed). In interactive mode the dump is written when the
+  scan completes; quitting mid-scan cancels the scan and skips it.
 
 Keys (interactive mode):
   Down/j, Up/k     move the cursor
@@ -87,6 +108,15 @@ Keys (interactive mode):
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let interactive = !cli.no_ui && std::io::stdout().is_terminal();
+
+    if interactive && cli.output.as_deref() == Some(Path::new("-")) {
+        // Binary dump bytes and a full-screen TUI cannot share stdout.
+        eprintln!(
+            "camembert: --output - (dump to stdout) requires summary mode; \
+             add --no-ui or redirect stdout"
+        );
+        return ExitCode::FAILURE;
+    }
 
     // In interactive mode the terminal belongs to ratatui: tracing output
     // must never reach it (a single log line prints at the raw-mode cursor,
@@ -119,7 +149,7 @@ fn main() -> ExitCode {
     });
 
     if interactive {
-        return match ui::run(scanner, &cli.path) {
+        return match ui::run(scanner, &cli.path, cli.output.clone()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 // The terminal is restored by now; these are the process's
@@ -164,44 +194,74 @@ fn summary(cli: &Cli, scanner: &Scanner) -> ExitCode {
     done.store(true, Ordering::Release);
     let _ = poller.join();
 
-    let outcome = match outcome {
+    let mut outcome = match outcome {
         Ok(outcome) => outcome,
         Err(err) => {
             error!(%err, "scan failed");
             return ExitCode::FAILURE;
         }
     };
+    // Canonical hardlink attribution (D2/D3): totals below and any dump
+    // are final, not first-seen provisional.
+    outcome.finalize_hardlinks();
 
-    println!(
-        "Scanned {} in {:.2}s",
-        cli.path.display(),
-        outcome.elapsed.as_secs_f64()
-    );
-    println!(
-        "  total: {} real, {} apparent",
-        HumanSize(outcome.totals.real),
-        HumanSize(outcome.totals.apparent)
-    );
-    print!(
-        "  entries: {} ({} dirs)  errors: {}  excluded (other fs): {}",
-        outcome.entries, outcome.dirs, outcome.errors, outcome.excluded_dirs
-    );
-    if outcome.hardlink_inodes > 0 {
-        print!(
-            "  hardlinked inodes: {} (provisional first-seen totals)",
-            outcome.hardlink_inodes
-        );
-    }
-    println!();
-    println!();
-    println!("Top {} directories by real size:", cli.top);
-    for dir in outcome.top_dirs_by_disk(cli.top) {
-        let meta = outcome.dir(dir);
+    let dump_to_stdout = cli.output.as_deref() == Some(Path::new("-"));
+    if dump_to_stdout {
+        info!("dump streams to stdout: summary text suppressed");
+    } else {
         println!(
-            "  {:>10}  {}",
-            HumanSize(meta.td).to_string(),
-            outcome.path_of(dir).display()
+            "Scanned {} in {:.2}s",
+            cli.path.display(),
+            outcome.elapsed.as_secs_f64()
         );
+        println!(
+            "  total: {} real, {} apparent",
+            HumanSize(outcome.totals.real),
+            HumanSize(outcome.totals.apparent)
+        );
+        print!(
+            "  entries: {} ({} dirs)  errors: {}  excluded (other fs): {}",
+            outcome.entries, outcome.dirs, outcome.errors, outcome.excluded_dirs
+        );
+        if outcome.hardlink_inodes > 0 {
+            print!(
+                "  hardlinked inodes: {} (each counted once)",
+                outcome.hardlink_inodes
+            );
+        }
+        println!();
+        println!();
+        println!("Top {} directories by real size:", cli.top);
+        for dir in outcome.top_dirs_by_disk(cli.top) {
+            let meta = outcome.dir(dir);
+            println!(
+                "  {:>10}  {}",
+                HumanSize(meta.td).to_string(),
+                outcome.path_of(dir).display()
+            );
+        }
+    }
+
+    if let Some(path) = &cli.output {
+        let meta = DumpMeta {
+            timestamp: SystemTime::now(),
+        };
+        let written = if dump_to_stdout {
+            dump::write_dump(
+                &outcome,
+                std::io::BufWriter::new(std::io::stdout().lock()),
+                &meta,
+            )
+        } else {
+            dump::write_dump_to_path(&outcome, path, &meta)
+        };
+        match written {
+            Ok(()) => info!(path = %path.display(), "dump written"),
+            Err(err) => {
+                error!(%err, path = %path.display(), "dump write failed");
+                return ExitCode::FAILURE;
+            }
+        }
     }
 
     ExitCode::SUCCESS
