@@ -21,7 +21,7 @@ use rustix::io::Errno;
 use tracing::{debug, trace, warn};
 
 use crate::size::Size;
-use crate::tree::Kind;
+use crate::tree::{ExcludedReason, Kind};
 
 use super::message::{Batch, BatchEntry, SECTION_CAP, SectionSums};
 
@@ -47,6 +47,68 @@ pub(crate) enum JobFd {
 pub(crate) struct Job {
     pub fd: JobFd,
     pub token: u64,
+    /// `st_dev` of this directory — the mount-boundary reference for its
+    /// children (`child.dev != job.dev` ⇔ child is a mount point).
+    pub dev: u64,
+}
+
+/// Kernel pseudo-filesystem magics (`linux/magic.h`): mounts whose numbers
+/// are not disk usage. Never descended into, even with
+/// `--cross-filesystems` (HANDOFF §3: "exclure /proc, /sys"). `/proc` alone
+/// otherwise poisons totals (`/proc/kcore` reports a ~128 TiB apparent
+/// size) and floods the error count with permission noise.
+const KERNFS_MAGICS: &[(u64, &str)] = &[
+    (0x9fa0, "proc"),
+    (0x6265_6572, "sysfs"),
+    (0x6462_6720, "debugfs"),
+    (0x7472_6163, "tracefs"),
+    (0x7363_6673, "securityfs"),
+    (0x0027_e0eb, "cgroup"),
+    (0x6367_7270, "cgroup2"),
+    (0x6165_676c, "pstore"),
+    (0xde5e_81e4, "efivarfs"),
+    (0x6265_6570, "configfs"),
+    (0x4249_4e4d, "binfmt_misc"),
+    (0xcafe_4a11, "bpf"),
+    (0x1cd1, "devpts"),
+    (0x1980_0202, "mqueue"),
+    (0xf97c_ff8c, "selinuxfs"),
+    (0x6573_5543, "fusectl"),
+    (0x0187, "autofs"),
+    (0x6759_6969, "rpc_pipefs"),
+];
+
+fn kernfs_name(f_type: u64) -> Option<&'static str> {
+    KERNFS_MAGICS
+        .iter()
+        .find(|(magic, _)| *magic == f_type)
+        .map(|(_, name)| *name)
+}
+
+/// What a mount point turned out to be, decided by opening it and reading
+/// its filesystem magic. Only called at mount boundaries (`dev` change),
+/// so the extra `openat` + `fstatfs` cost is per-mount, not per-dir.
+enum MountKind {
+    /// Kernel pseudo-filesystem: record, never descend.
+    KernFs,
+    /// Real filesystem; the opened fd is reused for descent when
+    /// `--cross-filesystems` is on.
+    Real(OwnedFd),
+    /// Could not open it to classify.
+    Unreadable(rustix::io::Errno),
+}
+
+fn classify_mount(parent: BorrowedFd<'_>, name: &std::ffi::CStr) -> MountKind {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let fd = match rustix::fs::openat(parent, name, flags, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(errno) => return MountKind::Unreadable(errno),
+    };
+    match rustix::fs::fstatfs(&fd) {
+        Ok(statfs) if kernfs_name(statfs.f_type as u64).is_some() => MountKind::KernFs,
+        // A statfs failure is odd but not disqualifying: treat as real.
+        _ => MountKind::Real(fd),
+    }
 }
 
 /// State shared by all workers (and the owner, for `abort`).
@@ -65,8 +127,6 @@ pub(crate) struct WorkerShared {
     /// statx availability, flipped off on the first `ENOSYS` (seccomp,
     /// gVisor, old kernels) — all workers then use `fstatat`.
     pub statx_supported: AtomicBool,
-    /// `st_dev` of the scan root; mount boundary reference.
-    pub root_dev: u64,
     /// Descend into other filesystems instead of marking them excluded.
     pub cross_filesystems: bool,
     /// Owner-side failure: drop everything and exit.
@@ -125,6 +185,7 @@ fn process_job(
     tx: &Sender<Batch>,
 ) -> bool {
     let token = job.token;
+    let job_dev = job.dev;
     let fd = match job.fd {
         JobFd::Opened(fd) => Arc::new(fd),
         JobFd::At(parent, name) => {
@@ -186,25 +247,57 @@ fn process_job(
                     dev: stat.dev,
                     error: false,
                     child_token: None,
-                    excluded_otherfs: false,
+                    excluded: None,
                 };
                 if kind == Kind::Dir {
-                    if stat.dev != shared.root_dev && !shared.cross_filesystems {
-                        debug!(
-                            name = %String::from_utf8_lossy(name),
-                            dev = stat.dev,
-                            root_dev = shared.root_dev,
-                            "mount boundary: not descending"
-                        );
-                        entry.excluded_otherfs = true;
+                    let mut descend_via: Option<JobFd> = None;
+                    if stat.dev != job_dev {
+                        // Mount point: classify before deciding.
+                        match classify_mount(fd.as_fd(), name_c) {
+                            MountKind::KernFs => {
+                                debug!(
+                                    name = %String::from_utf8_lossy(name),
+                                    "kernel pseudo-filesystem: not descending"
+                                );
+                                entry.excluded = Some(ExcludedReason::KernFs);
+                            }
+                            MountKind::Real(child_fd) if shared.cross_filesystems => {
+                                descend_via = Some(JobFd::Opened(child_fd));
+                            }
+                            MountKind::Real(_) => {
+                                debug!(
+                                    name = %String::from_utf8_lossy(name),
+                                    dev = stat.dev,
+                                    "mount boundary: not descending"
+                                );
+                                entry.excluded = Some(ExcludedReason::OtherFs);
+                            }
+                            MountKind::Unreadable(errno) if shared.cross_filesystems => {
+                                debug!(
+                                    name = %String::from_utf8_lossy(name),
+                                    %errno,
+                                    "mount point unreadable"
+                                );
+                                sums.errors += 1;
+                                entry.error = true;
+                            }
+                            MountKind::Unreadable(_) => {
+                                // We were not going to descend anyway.
+                                entry.excluded = Some(ExcludedReason::OtherFs);
+                            }
+                        }
                     } else {
+                        descend_via = Some(JobFd::At(fd.clone(), name.to_vec()));
+                    }
+                    if let Some(job_fd) = descend_via {
                         let child_token = shared.next_token.fetch_add(1, Ordering::Relaxed);
                         entry.child_token = Some(child_token);
                         child_dirs += 1;
                         shared.pending_jobs.fetch_add(1, Ordering::AcqRel);
                         local.push(Job {
-                            fd: JobFd::At(fd.clone(), name.to_vec()),
+                            fd: job_fd,
                             token: child_token,
+                            dev: stat.dev,
                         });
                     }
                 }
@@ -228,7 +321,7 @@ fn process_job(
                     dev: 0,
                     error: true,
                     child_token: None,
-                    excluded_otherfs: false,
+                    excluded: None,
                 }
             }
         };

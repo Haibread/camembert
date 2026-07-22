@@ -168,6 +168,7 @@ fn handle_key(code: KeyCode, modifiers: KeyModifiers, ui: &mut UiState, phase: &
         KeyCode::Char('n') => ui.press_sort(SortKey::Name),
         KeyCode::Char('m') => ui.press_sort(SortKey::Mtime),
         KeyCode::Char('c') => ui.press_sort(SortKey::Items),
+        KeyCode::Char('e') => ui.press_sort(SortKey::Errors),
         KeyCode::Char('p') => ui.show_apparent = !ui.show_apparent,
         _ => {}
     }
@@ -326,7 +327,7 @@ fn draw(frame: &mut Frame<'_>, ui: &UiState, table_state: &mut TableState, spinn
     }
     let footer = Paragraph::new(vec![
         Line::from(
-            " ↑↓/jk move · ⏎/l/→ open · ⌫/h/← up · g/G ends · d/a/n/m/c sort · p apparent · q quit"
+            " ↑↓/jk move · ⏎/l/→ open · ⌫/h/← up · g/G ends · d/a/n/m/c/e sort · p apparent · q quit"
                 .dim(),
         ),
         Line::from(notes),

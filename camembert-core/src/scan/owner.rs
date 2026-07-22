@@ -19,7 +19,7 @@ use rustc_hash::FxHashMap;
 use tracing::{debug, warn};
 
 use crate::size::Size;
-use crate::tree::{ChildRun, DirId, DirState, Kind, NodeFlags, NodeId, Tree};
+use crate::tree::{ChildRun, DirId, DirState, ExcludedReason, Kind, NodeFlags, NodeId, Tree};
 
 use super::ScanProgress;
 use super::message::Batch;
@@ -74,6 +74,8 @@ pub(crate) struct Owner {
     /// `HARDLINK_EXTRA`).
     hardlink_extra_links: u64,
     excluded_dirs: u64,
+    /// Subset of `excluded_dirs` that are kernel pseudo-filesystems.
+    excluded_kernfs: u64,
     progress: Arc<ScanProgress>,
 }
 
@@ -102,6 +104,7 @@ impl Owner {
             hardlinks: FxHashMap::default(),
             hardlink_extra_links: 0,
             excluded_dirs: 0,
+            excluded_kernfs: 0,
             progress,
         }
     }
@@ -120,6 +123,10 @@ impl Owner {
 
     pub(crate) fn excluded_dirs(&self) -> u64 {
         self.excluded_dirs
+    }
+
+    pub(crate) fn excluded_kernfs(&self) -> u64 {
+        self.excluded_kernfs
     }
 
     pub(crate) fn hardlink_inodes(&self) -> u64 {
@@ -223,9 +230,12 @@ impl Owner {
             if entry.error {
                 flags.insert(NodeFlags::ERROR);
             }
-            if entry.excluded_otherfs {
-                flags.insert(NodeFlags::EXCLUDED_OTHERFS);
+            if entry.excluded.is_some() {
+                flags.insert(NodeFlags::EXCLUDED);
                 self.excluded_dirs += 1;
+                if entry.excluded == Some(ExcludedReason::KernFs) {
+                    self.excluded_kernfs += 1;
+                }
             }
 
             let size = Size {
@@ -245,6 +255,10 @@ impl Owner {
             let node =
                 self.tree
                     .push_node(&entry.name, entry.kind, flags, dir_node, size, entry.mtime);
+
+            if let Some(reason) = entry.excluded {
+                self.tree.set_excluded(node, reason);
+            }
 
             if entry.kind != Kind::Dir && entry.nlink > 1 && !is_extra_link {
                 self.hardlinks.insert(
@@ -319,7 +333,7 @@ mod tests {
             dev: 1,
             error: false,
             child_token: None,
-            excluded_otherfs: false,
+            excluded: None,
         }
     }
 
@@ -335,7 +349,7 @@ mod tests {
             dev: 1,
             error: false,
             child_token: Some(token),
-            excluded_otherfs: false,
+            excluded: None,
         }
     }
 

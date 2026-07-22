@@ -262,13 +262,13 @@ impl Scanner {
             pending_jobs: AtomicUsize::new(1),
             next_token: AtomicU64::new(ROOT_TOKEN + 1),
             statx_supported: AtomicBool::new(true),
-            root_dev,
             cross_filesystems: self.options.cross_filesystems,
             abort: AtomicBool::new(false),
         };
         shared.injector.push(Job {
             fd: JobFd::Opened(root_fd),
             token: ROOT_TOKEN,
+            dev: root_dev,
         });
 
         let mut owner = Owner::new(
@@ -362,6 +362,7 @@ impl Scanner {
 
         let elapsed = start.elapsed();
         let excluded_dirs = owner.excluded_dirs();
+        let excluded_kernfs = owner.excluded_kernfs();
         let hardlink_inodes = owner.hardlink_inodes();
         let hardlink_extra_links = owner.hardlink_extra_links();
         let (tree, root) = owner.into_tree();
@@ -375,6 +376,7 @@ impl Scanner {
             dirs: tree.dir_count() as u64,
             errors: u64::from(root_meta.te),
             excluded_dirs,
+            excluded_kernfs,
             hardlink_inodes,
             hardlink_extra_links,
             elapsed,
@@ -459,6 +461,9 @@ pub struct ScanOutcome {
     pub errors: u64,
     /// Mount points recorded but not descended into.
     pub excluded_dirs: u64,
+    /// Subset of `excluded_dirs` that are kernel pseudo-filesystems
+    /// (`/proc`, `/sys`, …) — excluded even with `--cross-filesystems`.
+    pub excluded_kernfs: u64,
     /// Distinct `(dev, ino)` with `nlink > 1` seen.
     pub hardlink_inodes: u64,
     /// Later links that contributed 0 to aggregates.
@@ -514,6 +519,29 @@ impl ScanOutcome {
     pub fn top_dirs_by_disk(&self, n: usize) -> Vec<DirId> {
         let mut dirs: Vec<DirId> = self.tree.dir_ids().collect();
         dirs.sort_by_key(|&d| (std::cmp::Reverse(self.tree.dir(d).td), d.index()));
+        dirs.truncate(n);
+        dirs
+    }
+
+    /// The `n` directories with the most *direct* errors (their own
+    /// unreadable children / failed stats, not their subtrees'),
+    /// descending, with the count. Subtree `te` would rank every ancestor
+    /// above the actual error site; direct counts point at *where* the
+    /// total is incomplete ("comptabiliser l'illisible").
+    pub fn top_dirs_by_errors(&self, n: usize) -> Vec<(DirId, u32)> {
+        let mut direct: Vec<u32> = self.tree.dir_ids().map(|d| self.tree.dir(d).te).collect();
+        for d in self.tree.dir_ids() {
+            if let Some(parent) = self.tree.dir(d).parent {
+                direct[parent.index()] = direct[parent.index()].saturating_sub(self.tree.dir(d).te);
+            }
+        }
+        let mut dirs: Vec<(DirId, u32)> = self
+            .tree
+            .dir_ids()
+            .map(|d| (d, direct[d.index()]))
+            .filter(|&(_, te)| te > 0)
+            .collect();
+        dirs.sort_by_key(|&(d, te)| (std::cmp::Reverse(te), d.index()));
         dirs.truncate(n);
         dirs
     }

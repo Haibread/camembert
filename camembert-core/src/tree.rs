@@ -122,8 +122,9 @@ impl NodeFlags {
     pub const HARDLINK_EXTRA: Self = Self(1);
     /// stat (or, for the root of an unreadable dir, open) failed.
     pub const ERROR: Self = Self(1 << 1);
-    /// Directory on another filesystem: recorded, not descended into.
-    pub const EXCLUDED_OTHERFS: Self = Self(1 << 2);
+    /// Directory not descended into (mount boundary or kernel
+    /// filesystem); the reason lives in [`Tree::excluded_reason`].
+    pub const EXCLUDED: Self = Self(1 << 2);
 
     pub fn contains(self, other: Self) -> bool {
         self.0 & other.0 == other.0
@@ -275,6 +276,22 @@ pub struct Tree {
     /// to hold the 32-byte budget; a hash lookup on descend is fine for
     /// navigation-frequency access.
     dir_of: FxHashMap<NodeId, DirId>,
+    /// Why an [`NodeFlags::EXCLUDED`] directory was not descended into.
+    /// Tiny (one entry per skipped mount point); feeds the dump's `ex`
+    /// field and the UI.
+    excluded: FxHashMap<NodeId, ExcludedReason>,
+}
+
+/// Why a directory entry was recorded but not descended into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExcludedReason {
+    /// Mount point to another (real) filesystem; `--cross-filesystems`
+    /// descends into these.
+    OtherFs,
+    /// Kernel pseudo-filesystem (`/proc`, `/sys`, cgroups, …): never
+    /// descended into, regardless of `--cross-filesystems` — its numbers
+    /// are not disk usage (HANDOFF §3: "exclure /proc, /sys").
+    KernFs,
 }
 
 impl Tree {
@@ -296,6 +313,15 @@ impl Tree {
 
     pub fn dir(&self, id: DirId) -> &DirMeta {
         &self.dirs[id.index()]
+    }
+
+    /// Why an [`NodeFlags::EXCLUDED`] node was not descended into.
+    pub fn excluded_reason(&self, id: NodeId) -> Option<ExcludedReason> {
+        self.excluded.get(&id).copied()
+    }
+
+    pub(crate) fn set_excluded(&mut self, id: NodeId, reason: ExcludedReason) {
+        self.excluded.insert(id, reason);
     }
 
     /// Raw name bytes of a node.

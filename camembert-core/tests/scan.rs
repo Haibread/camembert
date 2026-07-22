@@ -227,3 +227,59 @@ fn stress_scan_is_deterministic_across_runs() {
         assert_eq!(outcome.errors, 0);
     }
 }
+
+/// Kernel pseudo-filesystems are never descended into, even with
+/// `--cross-filesystems` (their numbers are not disk usage). Gated on a
+/// mounted kernfs being visible under /sys; skipped elsewhere.
+#[test]
+fn kernfs_mounts_are_excluded_even_when_crossing() {
+    // /sys/kernel/debug (debugfs) and /sys/kernel/tracing (tracefs) are
+    // kernfs mount points inside sysfs on any normal Linux box.
+    if !Path::new("/sys/kernel/debug").is_dir() {
+        eprintln!("skipping: no /sys/kernel/debug on this system");
+        return;
+    }
+    let scanner = Scanner::new(ScanOptions {
+        threads: 4,
+        cross_filesystems: true,
+    });
+    let outcome = scanner.scan(Path::new("/sys/kernel")).unwrap();
+    assert!(
+        outcome.excluded_kernfs >= 1,
+        "expected at least one kernfs exclusion under /sys/kernel, got {}",
+        outcome.excluded_kernfs
+    );
+    assert!(outcome.excluded_kernfs <= outcome.excluded_dirs);
+}
+
+/// The error report points at the directories where failures actually
+/// happened (direct counts), not at their ancestors' subtree rollups.
+#[test]
+fn error_report_uses_direct_counts() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fs::create_dir_all(root.join("outer/inner/locked")).unwrap();
+    fs::write(root.join("outer/file"), b"x").unwrap();
+    let locked = root.join("outer/inner/locked");
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(&locked).is_ok() {
+        eprintln!("skipping: running as root, cannot make a dir unreadable");
+        return;
+    }
+
+    let scanner = Scanner::new(ScanOptions {
+        threads: 2,
+        cross_filesystems: false,
+    });
+    let outcome = scanner.scan(root).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_eq!(outcome.errors, 1);
+    let top = outcome.top_dirs_by_errors(10);
+    // Exactly one error site: `locked` itself (the open failure is charged
+    // to the unreadable dir), with a direct count of 1 — no ancestor noise.
+    assert_eq!(top.len(), 1);
+    let (dir, direct) = top[0];
+    assert_eq!(direct, 1);
+    assert!(outcome.path_of(dir).ends_with("outer/inner/locked"));
+}

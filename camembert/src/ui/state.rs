@@ -17,6 +17,8 @@ pub enum SortKey {
     Mtime,
     /// Subtree item count.
     Items,
+    /// Subtree error count — jump straight to what could not be read.
+    Errors,
 }
 
 impl SortKey {
@@ -230,6 +232,7 @@ impl UiState {
                 SortKey::Name => ra.name.cmp(&rb.name),
                 SortKey::Mtime => ra.mtime.cmp(&rb.mtime),
                 SortKey::Items => ra.items.cmp(&rb.items),
+                SortKey::Errors => ra.errors.cmp(&rb.errors),
             };
             let primary = if sort.descending {
                 primary.reverse()

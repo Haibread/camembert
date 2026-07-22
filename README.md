@@ -56,7 +56,10 @@ cargo run --release -- /var --no-ui --top 10
 cargo run --release -- /home --threads 4
 
 # Follow mount points into other filesystems (off by default:
-# mount points are recorded but not descended into)
+# mount points are recorded but not descended into). Kernel
+# pseudo-filesystems (/proc, /sys, cgroups, …) are NEVER descended
+# into, even with this flag: their numbers are not disk usage
+# (/proc/kcore alone claims ~128 TiB of apparent size).
 cargo run --release -- / --cross-filesystems
 
 # Verbose engine diagnostics on stderr (product output stays on stdout)
@@ -82,6 +85,7 @@ directories still being scanned. Quitting mid-scan cancels the scan.
 | `n` | sort by name (raw bytes, ascending) |
 | `m` | sort by modification time |
 | `c` | sort by item count |
+| `e` | sort by subtree error count — jump straight to what could not be read |
 | *(active sort key again)* | reverse the sort direction |
 | `p` | show/hide the apparent-size column |
 | `q` / `Esc` / `Ctrl-C` | quit (cancels the scan if still running) |
@@ -104,7 +108,7 @@ Example output:
 ```text
 Scanned /usr/share/licenses in 0.04s
   total: 18.7 MiB real, 16.0 MiB apparent
-  entries: 1713 (591 dirs)  errors: 0  excluded (other fs): 0
+  entries: 1713 (591 dirs)  errors: 0  excluded mounts: 0 (0 kernfs)
 
 Top 5 directories by real size:
     18.7 MiB  /usr/share/licenses
@@ -120,6 +124,12 @@ Notes on the numbers (honesty is the point of this tool):
   the summary says so, since per-path attribution is provisional.
 - Unreadable directories never abort the scan: they are counted in
   `errors` and the affected totals stay honest about what was not read.
+  When `errors > 0` the summary lists the directories where the failures
+  actually happened (direct counts, not subtree rollups), so an incomplete
+  total is never unexplained; in the TUI, sort with `e` to find them.
+- Excluded mounts split into real filesystems (descend with
+  `--cross-filesystems`) and kernel pseudo-filesystems (`/proc`, `/sys`,
+  cgroups… — never descended into: their numbers are not disk usage).
 - Symlinks are never followed; they count with their own (link) size.
 
 While a scan runs, a progress line (entries, dirs, errors, bytes so far)

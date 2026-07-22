@@ -80,6 +80,7 @@ Keys (interactive mode):
   n                sort by name (raw bytes, ascending)
   m                sort by modification time
   c                sort by item count
+  e                sort by subtree error count (find what was unreadable)
                    (pressing the active sort key reverses the direction)
   p                show/hide the apparent-size column
   q, Esc, Ctrl-C   quit (cancels the scan if still running)";
@@ -183,8 +184,12 @@ fn summary(cli: &Cli, scanner: &Scanner) -> ExitCode {
         HumanSize(outcome.totals.apparent)
     );
     print!(
-        "  entries: {} ({} dirs)  errors: {}  excluded (other fs): {}",
-        outcome.entries, outcome.dirs, outcome.errors, outcome.excluded_dirs
+        "  entries: {} ({} dirs)  errors: {}  excluded mounts: {} ({} kernfs)",
+        outcome.entries,
+        outcome.dirs,
+        outcome.errors,
+        outcome.excluded_dirs,
+        outcome.excluded_kernfs
     );
     if outcome.hardlink_inodes > 0 {
         print!(
@@ -202,6 +207,24 @@ fn summary(cli: &Cli, scanner: &Scanner) -> ExitCode {
             HumanSize(meta.td).to_string(),
             outcome.path_of(dir).display()
         );
+    }
+
+    // "Comptabiliser l'illisible": when parts of the tree could not be
+    // read, say where — an unexplained error count is exactly the kind of
+    // dishonest total this tool exists to avoid.
+    if outcome.errors > 0 {
+        println!();
+        println!(
+            "{} entries could not be read; most affected directories:",
+            outcome.errors
+        );
+        for (dir, direct_errors) in outcome.top_dirs_by_errors(10) {
+            println!(
+                "  {:>6} errors  {}",
+                direct_errors,
+                outcome.path_of(dir).display()
+            );
+        }
     }
 
     ExitCode::SUCCESS

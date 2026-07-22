@@ -7,7 +7,7 @@
 
 use rustix::io::Errno;
 
-use crate::tree::Kind;
+use crate::tree::{ExcludedReason, Kind};
 
 /// Section flush threshold (entries). One run per flushed section.
 pub(crate) const SECTION_CAP: usize = 4096;
@@ -53,7 +53,7 @@ pub(crate) struct BatchEntry {
     /// assigned to the child's own future batches.
     pub child_token: Option<u64>,
     /// Directory on another filesystem: recorded but not descended into.
-    pub excluded_otherfs: bool,
+    pub excluded: Option<ExcludedReason>,
 }
 
 /// One section of one directory's entries.
