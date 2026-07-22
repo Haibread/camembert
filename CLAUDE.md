@@ -5,6 +5,20 @@ hypotheses, and roadmap live in [HANDOFF.md](HANDOFF.md) — read it before any
 design or implementation work. It is a set of challengeable hypotheses, not a
 frozen spec.
 
+## Documentation
+
+Everything added to the CLI/app (commands, flags, env vars, behaviors,
+output formats) must be documented in the same change:
+
+- in the command's `--help` (clap doc comments — self-sufficient, including
+  env var names and syntax of non-trivial values);
+- and in the user-facing docs (README for now; the format may change later —
+  man page, mdBook, … — but the information must exist from day one so it
+  can be migrated rather than reconstructed).
+
+No undocumented feature lands, even experimental ones — mark them as
+experimental instead.
+
 ## Agents and model selection
 
 Delegate work to subagents (Agent tool) whenever it helps, and pick the model
