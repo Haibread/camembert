@@ -1,6 +1,8 @@
 # Scan tree (UI-during-scan) — options dossier for the co-design session
 
-**Status: options for discussion, nothing decided.** Synthesizes one
+**Status: superseded — decisions taken, see
+[scan-tree-decisions.md](scan-tree-decisions.md).** Kept for the
+reasoning trail. Synthesizes one
 research pass ([research](scan-tree-research.md)), three design proposals
 ([A: single-owner](scan-tree-option-a-owner.md),
 [B: shared arena](scan-tree-option-b-shared.md),
