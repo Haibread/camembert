@@ -175,6 +175,8 @@ dependencies = [
  "crossterm",
  "ratatui",
  "rustix",
+ "serde_json",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]

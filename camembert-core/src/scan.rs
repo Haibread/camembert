@@ -485,6 +485,46 @@ pub struct ScanOutcome {
 }
 
 impl ScanOutcome {
+    /// Assemble an outcome around an externally built tree (the ncdu
+    /// importer, [`crate::ncdu`]): the summary counters derive from the
+    /// root aggregates, mirroring what [`Scanner::scan`] does. Hardlink
+    /// attribution is still first-seen; the caller runs
+    /// [`ScanOutcome::finalize_hardlinks`] before dumping.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn from_tree(
+        tree: Tree,
+        root: DirId,
+        root_path: PathBuf,
+        hardlink_links: Vec<HardlinkLink>,
+        hardlink_inodes: u64,
+        excluded_dirs: u64,
+        excluded_kernfs: u64,
+        elapsed: Duration,
+    ) -> Self {
+        let root_meta = tree.dir(root);
+        let hardlink_extra_links = (hardlink_links.len() as u64).saturating_sub(hardlink_inodes);
+        Self {
+            totals: Size {
+                apparent: root_meta.ta,
+                real: root_meta.td,
+            },
+            entries: root_meta.tn,
+            dirs: tree.dir_count() as u64,
+            errors: u64::from(root_meta.te),
+            excluded_dirs,
+            excluded_kernfs,
+            hardlink_inodes,
+            hardlink_extra_links,
+            elapsed,
+            cancelled: false,
+            root_path,
+            root,
+            tree,
+            hardlink_links,
+            hardlinks_finalized: false,
+        }
+    }
+
     /// The underlying arena (read-only).
     pub fn tree(&self) -> &Tree {
         &self.tree

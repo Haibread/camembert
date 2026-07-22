@@ -3,7 +3,9 @@
 //! way around.
 
 pub mod delete;
+pub mod diff;
 pub mod dump;
+pub mod ncdu;
 pub mod scan;
 pub mod size;
 pub mod tree;
