@@ -67,6 +67,16 @@ struct Cli {
     /// summary text is suppressed so stdout carries only the dump stream.
     #[arg(short = 'o', long = "output", env = "OUTPUT")]
     output: Option<PathBuf>,
+
+    /// Color output in the interactive UI: auto, always, never (env: COLOR)
+    ///
+    /// auto detects the terminal's capabilities (truecolor via COLORTERM,
+    /// 256 colors via TERM, 16 colors otherwise) and honors NO_COLOR (set
+    /// to any value, even empty, disables color). always ignores NO_COLOR
+    /// but is still capped by what the terminal advertises. never renders
+    /// monochrome with ASCII bars (the wheel needs color and is hidden).
+    #[arg(long, env = "COLOR", value_enum, default_value = "auto")]
+    color: ui::caps::ColorMode,
 }
 
 const AFTER_HELP: &str = "\
@@ -81,6 +91,13 @@ Modes:
 
   Summary (--no-ui, env NO_UI, or stdout not a terminal): scan to
   completion, then print totals and the --top largest directories.
+
+Look & feel (interactive mode):
+  Colors and glyphs adapt to the terminal: truecolor -> 256 -> 16 -> mono
+  (NO_COLOR honored, --color overrides), and sextant wheel -> half-block
+  wheel -> ASCII bars without a wheel. Terminals narrower than 100
+  columns hide the wheel panel. See the README's \"Look & feel\" section
+  for the exact detection rules.
 
 Dump:
   --output FILE (env: OUTPUT) writes a camembert-dump v1 (.cmbt) after
@@ -172,7 +189,8 @@ fn main() -> ExitCode {
     });
 
     if interactive {
-        return match ui::run(scanner, &cli.path, cli.output.clone()) {
+        let caps = ui::caps::Caps::detect(&ui::caps::TermEnv::from_env(), cli.color);
+        return match ui::run(scanner, &cli.path, cli.output.clone(), caps) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 // The terminal is restored by now; these are the process's

@@ -16,7 +16,9 @@ Named after the pie chart — *camembert* in French.
 > **Status**: early development. The parallel scan engine (work-stealing
 > `openat`/`getdents64`/`statx` traversal, streaming aggregation, hardlink
 > dedup, mount-boundary detection), the interactive browse-during-scan
-> TUI, guarded mark-then-confirm deletion, and the ordered dump-format v1
+> TUI (dashboard-cockpit layout with a live donut wheel, adaptive to the
+> terminal's color/glyph capabilities), guarded mark-then-confirm
+> deletion, and the ordered dump-format v1
 > writer (`--output`) are implemented.
 > See [HANDOFF.md](HANDOFF.md) for the full design hypotheses and roadmap,
 > `docs/design/` for the settled decisions, and
@@ -79,6 +81,14 @@ and re-sort live (snapshots at ~30 fps; directories with more than ~20k
 children update at 4 Hz and show an "updating…" note), and a spinner marks
 directories still being scanned. Quitting mid-scan cancels the scan.
 
+The screen is a **dashboard cockpit**: a header line (`▞ camembert`,
+the viewed path, scan status), a row of metric cards (total real size ·
+entries · errors · hardlinked inodes), a disk gauge, the directory table
+with per-row proportion bars, a **donut camembert** of the viewed
+directory's children on the right, a selection card under the table
+(size, share of parent, humanized mtime, item and error counts), and the
+key-hint footer.
+
 | Key | Action |
 | --- | --- |
 | `↓` / `j`, `↑` / `k` | move the cursor |
@@ -108,6 +118,56 @@ hardlinks actually exist in the tree.
 Diagnostics (`tracing`) never touch the interactive screen: they are
 discarded by default, or written to a file with `--log-file scan.log`
 (env: `LOG_FILE`) when you need them while debugging.
+
+### Look & feel
+
+**Palette.** A Tokyo-Night-family truecolor palette; amber (`#e0af68`)
+is the signature accent, errors are always the coral family (`#f7768e`),
+chrome is muted gray (`#565f89`). The **top 9 children** of the viewed
+directory (by real size) each get an **identity color**: the same color
+paints the row's name, its proportion bar, and its slice in the wheel,
+so the eye links the same entry across panels. Everything else stays
+default/gray.
+
+**The wheel.** The right-hand donut shows the viewed directory's
+children as slices, ordered by the current sort and colored with the
+identity colors. Slices below ~2% of the total, entries beyond the top
+9, and the part of the total not covered by any child (the directory's
+own blocks) merge into a gray "rest" slice. During the scan the wheel
+re-renders from every snapshot, so slices visibly grow and
+re-proportion. The donut is drawn with sub-cell pixels: half-blocks
+(`▀`, 1×2 pixels per cell) or, on capable terminals, sextants
+(Unicode 13 "Symbols for Legacy Computing", 2×3 pixels per cell).
+Below ~100 columns the wheel panel is hidden and the table takes the
+full width.
+
+**Disk gauge.** `statvfs` on the scan root: how much of the filesystem
+is occupied, and how much of that occupied space this scan's total
+accounts for (clamped to 100% — mid-scan hardlink attribution and
+concurrent writes can transiently overshoot).
+
+**Capability ladder**, detected once at startup:
+
+| Colors | when |
+| --- | --- |
+| truecolor | `COLORTERM` is `truecolor` or `24bit` (case-insensitive) |
+| 256 | `TERM` contains `256color` |
+| ANSI-16 | any other `TERM` |
+| mono | `TERM` unset or `dumb`, `NO_COLOR` set, or `--color never` |
+
+| Glyphs | when |
+| --- | --- |
+| sextants | truecolor **and** a known-modern terminal: kitty, WezTerm, foot, alacritty or ghostty (substring of `TERM`/`TERM_PROGRAM`) |
+| half-blocks | any other colored terminal |
+| ASCII | mono or `TERM=dumb`: `#` proportion bars, **no wheel** (slices that cannot be told apart by color would be decoration, not data) |
+
+`NO_COLOR` (set to any value, even empty) disables color, per
+[no-color.org](https://no-color.org). `--color auto|always|never`
+(env: `COLOR`, default `auto`) overrides: `always` ignores `NO_COLOR`
+but is still capped by what the terminal advertises; `never` renders
+monochrome ASCII. Sextants are gated on the known-modern set because
+font coverage for U+1FB00.. is unreliable elsewhere; half-blocks render
+correctly on effectively every UTF-8 terminal.
 
 ### Deleting
 

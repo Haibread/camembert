@@ -201,7 +201,7 @@ impl Scanner {
             .spawn(move || {
                 let mut publisher = ViewPublisher::new(Arc::clone(&owner_bus));
                 self.scan_with_tick(&path, |ctx| {
-                    publisher.tick(ctx.tree, ctx.root, ctx.hardlinks_seen);
+                    publisher.tick(ctx.tree, ctx.root, ctx.hardlink_inodes);
                     !owner_bus.cancel_requested()
                 })
             })
@@ -312,7 +312,7 @@ impl Scanner {
                 tick(TickContext {
                     tree: owner.tree(),
                     root: owner.root(),
-                    hardlinks_seen: owner.hardlink_inodes() > 0,
+                    hardlink_inodes: owner.hardlink_inodes(),
                 })
             };
             loop {
@@ -405,9 +405,9 @@ impl Scanner {
 pub(crate) struct TickContext<'a> {
     pub tree: &'a Tree,
     pub root: DirId,
-    /// Any `nlink > 1` inode seen so far (drives the D3 provisional-totals
-    /// note).
-    pub hardlinks_seen: bool,
+    /// `nlink > 1` inodes seen so far (drives the D3 provisional-totals
+    /// note and the UI's hardlink metric card).
+    pub hardlink_inodes: u64,
 }
 
 /// A scan running on a background thread, navigable while it runs.
