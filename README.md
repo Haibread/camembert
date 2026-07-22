@@ -93,8 +93,9 @@ If any hardlinks were encountered, the footer shows *"provisional totals
 final numbers count each inode exactly once. The note only appears when
 hardlinks actually exist in the tree.
 
-Diagnostics (`tracing`) still go to stderr in interactive mode; redirect
-them (`2>scan.log`) to keep the screen pristine while debugging.
+Diagnostics (`tracing`) never touch the interactive screen: they are
+discarded by default, or written to a file with `--log-file scan.log`
+(env: `LOG_FILE`) when you need them while debugging.
 
 ## Summary mode
 
@@ -125,8 +126,8 @@ While a scan runs, a progress line (entries, dirs, errors, bytes so far)
 is logged to stderr every second.
 
 Every CLI option is also settable through an environment variable
-(`SCAN_PATH`, `LOG_FILTER`, `THREADS`, `CROSS_FILESYSTEMS`, `TOP`,
-`NO_UI`); see `cargo run -- --help` for the full reference, including the
+(`SCAN_PATH`, `LOG_FILTER`, `LOG_FILE`, `THREADS`, `CROSS_FILESYSTEMS`,
+`TOP`, `NO_UI`); see `cargo run -- --help` for the full reference, including the
 interactive-mode key map.
 
 ## Test

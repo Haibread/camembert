@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use tracing::{error, info};
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
 use camembert_core::scan::{ScanOptions, Scanner};
 use camembert_core::size::HumanSize;
@@ -46,6 +47,14 @@ struct Cli {
     /// (pipes, redirections).
     #[arg(long = "no-ui", env = "NO_UI")]
     no_ui: bool,
+
+    /// Write diagnostics to this file instead of the default target
+    /// (env: LOG_FILE)
+    ///
+    /// Default target: stderr in summary mode; discarded in interactive
+    /// mode, where log output would corrupt the full-screen UI.
+    #[arg(long = "log-file", env = "LOG_FILE")]
+    log_file: Option<PathBuf>,
 }
 
 const AFTER_HELP: &str = "\
@@ -55,8 +64,8 @@ Modes:
   and re-sort live. Quitting mid-scan cancels the scan. While hardlinks
   were seen and the scan is still running, the footer notes that totals
   are provisional (first-seen attribution, corrected at scan end).
-  Diagnostics still go to stderr; redirect it (2>scan.log) to keep the
-  screen clean.
+  Diagnostics never touch the screen: they are discarded unless
+  --log-file (env: LOG_FILE) points them at a file.
 
   Summary (--no-ui, env NO_UI, or stdout not a terminal): scan to
   completion, then print totals and the --top largest directories.
@@ -77,9 +86,31 @@ Keys (interactive mode):
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let interactive = !cli.no_ui && std::io::stdout().is_terminal();
+
+    // In interactive mode the terminal belongs to ratatui: tracing output
+    // must never reach it (a single log line prints at the raw-mode cursor,
+    // right across the UI). Interactive diagnostics go to --log-file when
+    // given, and are discarded otherwise; summary mode keeps stderr.
+    let writer = match (&cli.log_file, interactive) {
+        (Some(path), _) => {
+            let file = match std::fs::File::create(path) {
+                Ok(file) => file,
+                Err(err) => {
+                    eprintln!("camembert: cannot open log file {}: {err}", path.display());
+                    return ExitCode::FAILURE;
+                }
+            };
+            let file = Arc::new(file);
+            BoxMakeWriter::new(move || Arc::clone(&file))
+        }
+        (None, true) => BoxMakeWriter::new(std::io::sink),
+        (None, false) => BoxMakeWriter::new(std::io::stderr),
+    };
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(&cli.log_filter))
-        .with_writer(std::io::stderr)
+        .with_writer(writer)
+        .with_ansi(cli.log_file.is_none())
         .init();
 
     let scanner = Scanner::new(ScanOptions {
@@ -87,11 +118,15 @@ fn main() -> ExitCode {
         cross_filesystems: cli.cross_filesystems,
     });
 
-    if !cli.no_ui && std::io::stdout().is_terminal() {
+    if interactive {
         return match ui::run(scanner, &cli.path) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
+                // The terminal is restored by now; these are the process's
+                // dying words, so they must reach the user even when logs
+                // are discarded or filed away.
                 error!(%err, "interactive UI failed");
+                eprintln!("camembert: interactive UI failed: {err}");
                 ExitCode::FAILURE
             }
         };
