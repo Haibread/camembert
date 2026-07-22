@@ -268,6 +268,10 @@ impl Owner {
                         counted: true,
                     },
                 );
+                // Queryable post-scan (deletion dialog warning): the
+                // counted link has no free flag bit, so it lives in a
+                // side set on the tree.
+                self.tree.mark_hardlink_first(node);
             }
 
             if let Some(token) = entry.child_token {

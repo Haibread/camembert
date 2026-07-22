@@ -113,7 +113,7 @@ pub fn scan_stats(tree: &Tree, root: DirId, elapsed: Duration) -> ScanStats {
     let meta = tree.dir(root);
     ScanStats {
         entries: meta.tn,
-        dirs: tree.dir_count() as u64,
+        dirs: tree.live_dir_count(),
         errors: u64::from(meta.te),
         disk_bytes: meta.td,
         elapsed,
@@ -241,7 +241,10 @@ pub fn build_snapshot(
     }
 }
 
-/// Number of children of `dir` (sum of its run lengths, D2).
+/// Number of children of `dir` (sum of its run lengths, D2). Counts
+/// tombstoned rows too — used only as a capacity hint and for the
+/// degraded-cadence threshold, both of which tolerate a post-removal
+/// overcount (removals happen after the scan; the cadence is then moot).
 pub fn children_count(tree: &Tree, dir: DirId) -> usize {
     tree.dir(dir)
         .runs()
