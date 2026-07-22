@@ -14,9 +14,9 @@
 mod state;
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Alignment, Constraint, Layout};
@@ -24,8 +24,9 @@ use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row as TableRow, Table, TableState};
 use ratatui::{DefaultTerminal, Frame};
-use tracing::{debug, info};
+use tracing::{debug, error, info, warn};
 
+use camembert_core::dump::{self, DumpMeta};
 use camembert_core::scan::{LiveScan, ScanOutcome, Scanner};
 use camembert_core::size::HumanSize;
 use camembert_core::tree::DirId;
@@ -51,19 +52,43 @@ enum Phase {
 
 /// Run the interactive UI over a live scan of `path`. Blocks until the
 /// user quits; quitting mid-scan cancels the scan (workers stop, partial
-/// results are dropped).
-pub fn run(scanner: Scanner, path: &Path) -> io::Result<()> {
+/// results are dropped). When `output` is set, a dump is written once the
+/// scan completes — never on a mid-scan cancel.
+pub fn run(scanner: Scanner, path: &Path, output: Option<PathBuf>) -> io::Result<()> {
     let live = scanner.scan_live(path);
     // ratatui::init enters the alternate screen, enables raw mode, and
     // installs a panic hook that restores the terminal first.
     let mut terminal = ratatui::init();
-    let result = event_loop(&mut terminal, live);
+    let result = event_loop(&mut terminal, live, output);
     ratatui::restore();
     result
 }
 
-fn event_loop(terminal: &mut DefaultTerminal, live: LiveScan) -> io::Result<()> {
+/// Finalize hardlink attribution and, when requested, write the dump.
+/// Dump failures are logged, not fatal — the browsing session goes on.
+fn finish_scan(outcome: &mut ScanOutcome, output: Option<PathBuf>) {
+    outcome.finalize_hardlinks();
+    let Some(path) = output else { return };
+    if outcome.cancelled {
+        warn!(path = %path.display(), "scan cancelled mid-run: dump not written");
+        return;
+    }
+    let meta = DumpMeta {
+        timestamp: SystemTime::now(),
+    };
+    match dump::write_dump_to_path(outcome, &path, &meta) {
+        Ok(()) => info!(path = %path.display(), "dump written"),
+        Err(err) => error!(%err, path = %path.display(), "dump write failed"),
+    }
+}
+
+fn event_loop(
+    terminal: &mut DefaultTerminal,
+    live: LiveScan,
+    output: Option<PathBuf>,
+) -> io::Result<()> {
     let bus = Arc::clone(live.bus());
+    let mut output = output;
     let mut phase = Phase::Scanning(live);
     let mut ui = UiState::new(bus.load());
     let mut table_state = TableState::default();
@@ -86,8 +111,11 @@ fn event_loop(terminal: &mut DefaultTerminal, live: LiveScan) -> io::Result<()> 
                             info!("quit during scan: cancelling");
                             live.cancel();
                             match live.join() {
-                                Ok(outcome) => {
-                                    debug!(cancelled = outcome.cancelled, "scan wound down")
+                                Ok(mut outcome) => {
+                                    debug!(cancelled = outcome.cancelled, "scan wound down");
+                                    // Rarely, the scan finished before the
+                                    // cancel landed: honor --output then.
+                                    finish_scan(&mut outcome, output.take());
                                 }
                                 Err(err) => debug!(%err, "scan failed while quitting"),
                             }
@@ -104,12 +132,15 @@ fn event_loop(terminal: &mut DefaultTerminal, live: LiveScan) -> io::Result<()> 
             let Phase::Scanning(live) = std::mem::replace(&mut phase, Phase::Transitioning) else {
                 unreachable!("checked above");
             };
-            let outcome = live.join().map_err(io::Error::other)?;
+            let mut outcome = live.join().map_err(io::Error::other)?;
             info!(
                 entries = outcome.entries,
                 cancelled = outcome.cancelled,
                 "scan finished; UI now serves the frozen arena"
             );
+            // Canonical hardlink attribution + dump, before the frozen
+            // arena starts serving views (D3: corrected at scan end).
+            finish_scan(&mut outcome, output.take());
             local_generation = ui.snapshot().generation;
             phase = Phase::Done(Box::new(outcome));
             // Re-view the current dir so states/totals show final values,

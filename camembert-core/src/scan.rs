@@ -18,6 +18,7 @@
 //! snapshots and serves nav requests from its tick (called between batch
 //! integrations and on receive timeouts), per D5.
 
+mod hardlink;
 mod message;
 mod owner;
 mod worker;
@@ -30,12 +31,13 @@ use std::time::{Duration, Instant};
 
 use crossbeam_deque::{Injector, Worker as WorkerQueue};
 use rustix::fs::{Mode, OFlags};
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::size::Size;
 use crate::tree::{DirId, DirMeta, Node, NodeId, Tree};
 use crate::view::{ViewBus, ViewPublisher};
 
+pub(crate) use hardlink::HardlinkLink;
 use owner::{Owner, ROOT_TOKEN};
 use worker::{Job, JobFd, WorkerShared};
 
@@ -365,7 +367,7 @@ impl Scanner {
         let excluded_kernfs = owner.excluded_kernfs();
         let hardlink_inodes = owner.hardlink_inodes();
         let hardlink_extra_links = owner.hardlink_extra_links();
-        let (tree, root) = owner.into_tree();
+        let (tree, root, hardlink_links) = owner.into_parts();
         let root_meta = tree.dir(root);
         let outcome = ScanOutcome {
             totals: Size {
@@ -384,6 +386,8 @@ impl Scanner {
             root_path: path.to_path_buf(),
             root,
             tree,
+            hardlink_links,
+            hardlinks_finalized: false,
         };
         info!(
             entries = outcome.entries,
@@ -450,6 +454,12 @@ pub struct ScanOutcome {
     tree: Tree,
     root: DirId,
     root_path: PathBuf,
+    /// Every `nlink > 1` link seen (side data for
+    /// [`ScanOutcome::finalize_hardlinks`] and the dump writer).
+    hardlink_links: Vec<HardlinkLink>,
+    /// [`ScanOutcome::finalize_hardlinks`] ran: per-directory totals use
+    /// canonical (smallest-path) hardlink attribution, not first-seen.
+    hardlinks_finalized: bool,
     /// Subtree totals of the root (hardlink first-seen attribution).
     pub totals: Size,
     /// Inodes counted (root's `tn`: hardlink extras excluded).
@@ -478,6 +488,36 @@ impl ScanOutcome {
     /// The underlying arena (read-only).
     pub fn tree(&self) -> &Tree {
         &self.tree
+    }
+
+    /// Re-attribute every hardlinked (`nlink > 1`) inode from its
+    /// first-seen link to its **canonical owner** — the link with the
+    /// smallest full path under the raw-byte, component-wise comparator
+    /// (dump-format decision D2). Per-directory subtree totals shift
+    /// accordingly; global (root) totals are unchanged. Idempotent and
+    /// cheap when the tree has no hardlinks; both CLI modes call it right
+    /// after scan completion (scan-tree D3: off the scan's critical path),
+    /// making live first-seen totals final.
+    pub fn finalize_hardlinks(&mut self) {
+        if self.hardlinks_finalized {
+            return;
+        }
+        self.hardlinks_finalized = true;
+        let moved = hardlink::reattribute(&mut self.tree, &self.hardlink_links);
+        if moved > 0 {
+            debug!(moved, "hardlink totals re-attributed to canonical owners");
+        }
+    }
+
+    /// Whether [`ScanOutcome::finalize_hardlinks`] ran (the dump writer
+    /// requires canonical attribution).
+    pub fn hardlinks_finalized(&self) -> bool {
+        self.hardlinks_finalized
+    }
+
+    /// Side records of every `nlink > 1` link (dump writer input).
+    pub(crate) fn hardlink_links(&self) -> &[HardlinkLink] {
+        &self.hardlink_links
     }
 
     /// The scan root directory.
