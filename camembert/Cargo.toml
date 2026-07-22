@@ -4,6 +4,7 @@ description = "Disk usage analyzer that answers the real questions: what grew, w
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 camembert-core = { workspace = true }
