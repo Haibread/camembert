@@ -1,3 +1,6 @@
+mod ui;
+
+use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -12,7 +15,7 @@ use camembert_core::size::HumanSize;
 
 /// Disk usage analyzer: what grew, what is freeable, what is cold.
 #[derive(Debug, Parser)]
-#[command(version, about)]
+#[command(version, about, after_help = AFTER_HELP)]
 struct Cli {
     /// Directory to scan (env: SCAN_PATH)
     #[arg(env = "SCAN_PATH", default_value = ".")]
@@ -32,10 +35,45 @@ struct Cli {
     #[arg(long, env = "CROSS_FILESYSTEMS")]
     cross_filesystems: bool,
 
-    /// Number of directories in the "top directories by real size" list (env: TOP)
+    /// Number of directories in the "top directories by real size" list,
+    /// summary mode only (env: TOP)
     #[arg(long, env = "TOP", default_value_t = 20)]
     top: usize,
+
+    /// Disable the interactive UI: scan, then print the summary (env: NO_UI)
+    ///
+    /// This is also the automatic behavior when stdout is not a terminal
+    /// (pipes, redirections).
+    #[arg(long = "no-ui", env = "NO_UI")]
+    no_ui: bool,
 }
+
+const AFTER_HELP: &str = "\
+Modes:
+  Interactive (default when stdout is a terminal): a full-screen browser
+  over the scanned tree, navigable WHILE the scan runs — totals fill in
+  and re-sort live. Quitting mid-scan cancels the scan. While hardlinks
+  were seen and the scan is still running, the footer notes that totals
+  are provisional (first-seen attribution, corrected at scan end).
+  Diagnostics still go to stderr; redirect it (2>scan.log) to keep the
+  screen clean.
+
+  Summary (--no-ui, env NO_UI, or stdout not a terminal): scan to
+  completion, then print totals and the --top largest directories.
+
+Keys (interactive mode):
+  Down/j, Up/k     move the cursor
+  Enter, l, Right  open the directory under the cursor
+  Backspace, h, Left  go back up to the parent
+  g / G            jump to the top / bottom
+  d                sort by real (disk) size [default, descending]
+  a                sort by apparent size
+  n                sort by name (raw bytes, ascending)
+  m                sort by modification time
+  c                sort by item count
+                   (pressing the active sort key reverses the direction)
+  p                show/hide the apparent-size column
+  q, Esc, Ctrl-C   quit (cancels the scan if still running)";
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -49,6 +87,21 @@ fn main() -> ExitCode {
         cross_filesystems: cli.cross_filesystems,
     });
 
+    if !cli.no_ui && std::io::stdout().is_terminal() {
+        return match ui::run(scanner, &cli.path) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                error!(%err, "interactive UI failed");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    summary(&cli, &scanner)
+}
+
+/// Non-interactive mode: scan to completion, then print the summary on
+/// stdout (diagnostics stay on stderr via tracing).
+fn summary(cli: &Cli, scanner: &Scanner) -> ExitCode {
     // Progress line on stderr (via tracing) roughly every second while the
     // scan blocks this thread.
     let progress = scanner.progress();
@@ -84,7 +137,6 @@ fn main() -> ExitCode {
         }
     };
 
-    // Product output on stdout (diagnostics stay on stderr via tracing).
     println!(
         "Scanned {} in {:.2}s",
         cli.path.display(),

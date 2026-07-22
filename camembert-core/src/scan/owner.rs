@@ -110,7 +110,6 @@ impl Owner {
         &self.tree
     }
 
-    #[cfg(test)]
     pub(crate) fn root(&self) -> DirId {
         self.root
     }

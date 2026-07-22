@@ -12,17 +12,17 @@
 //! The owner runs on the **calling thread**: [`Scanner::scan`] blocks
 //! until the scan completes, which keeps the API synchronous and saves a
 //! thread; progress is observable from other threads through the shared
-//! [`ScanProgress`] handle. The view-snapshot publication API (arc-swap,
-//! D5) is a later increment — the owner loop already exposes the hook
-//! point where publication will happen (the `tick` closure, called
-//! between batch integrations).
+//! [`ScanProgress`] handle. For a UI, [`Scanner::scan_live`] moves the
+//! whole engine (owner included) to a background thread and returns a
+//! [`crate::view::ViewBus`] immediately: the owner publishes view-scoped
+//! snapshots and serves nav requests from its tick (called between batch
+//! integrations and on receive timeouts), per D5.
 
 mod message;
 mod owner;
 mod worker;
 
 use std::io;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -34,6 +34,7 @@ use tracing::info;
 
 use crate::size::Size;
 use crate::tree::{DirId, DirMeta, Node, NodeId, Tree};
+use crate::view::{ViewBus, ViewPublisher};
 
 use owner::{Owner, ROOT_TOKEN};
 use worker::{Job, JobFd, WorkerShared};
@@ -42,9 +43,10 @@ use worker::{Job, JobFd, WorkerShared};
 /// stall rather than letting integration lag grow unbounded.
 const CHANNEL_CAP: usize = 32;
 
-/// Owner-side receive timeout; only used to run liveness checks, not a
-/// deadline on the scan.
-const RECV_TIMEOUT: Duration = Duration::from_millis(200);
+/// Owner-side receive timeout: bounds how stale the owner's tick (view
+/// publication, nav requests, cancellation checks, liveness) can get when
+/// no batches arrive. Matches the D5 snapshot cadence.
+const RECV_TIMEOUT: Duration = Duration::from_millis(33);
 
 /// Scan configuration.
 #[derive(Debug, Clone, Default)]
@@ -168,16 +170,51 @@ impl Scanner {
     /// Scan `path` to completion (blocking; the owner runs on this
     /// thread).
     pub fn scan(&self, path: impl AsRef<Path>) -> Result<ScanOutcome, ScanError> {
-        // Publication hook: the TUI increment inserts its arc-swap
-        // snapshot publication here (D5 cadence) without touching the
-        // engine.
-        self.scan_with_tick(path.as_ref(), |_| {})
+        self.scan_with_tick(path.as_ref(), |_| true)
     }
 
+    /// Scan `path` on a background thread and return immediately with the
+    /// [`ViewBus`] a UI reads snapshots from (D5) plus the handle the
+    /// final [`ScanOutcome`] is retrieved through.
+    ///
+    /// During the scan the owner serves nav requests and publishes
+    /// snapshots from its tick. **After completion the owner thread
+    /// exits** and the outcome (the frozen arena) is handed to the caller
+    /// via [`LiveScan::join`]; post-scan navigation is served by the
+    /// caller reading the arena directly with
+    /// [`crate::view::build_snapshot`]. Chosen over keeping the owner
+    /// thread alive: the arena is immutable once the scan ends, so
+    /// single-threaded direct reads are trivially correct and there is no
+    /// idle thread or shutdown handshake to maintain.
+    ///
+    /// Cancellation: [`ViewBus::cancel`] (or [`LiveScan::cancel`]) makes
+    /// workers stop taking work, the owner drain, and [`LiveScan::join`]
+    /// return a partial outcome with [`ScanOutcome::cancelled`] set.
+    pub fn scan_live(self, path: impl Into<PathBuf>) -> LiveScan {
+        let path: PathBuf = path.into();
+        let bus = Arc::new(ViewBus::new(path.clone()));
+        let owner_bus = Arc::clone(&bus);
+        let handle = std::thread::Builder::new()
+            .name("camembert-owner".into())
+            .spawn(move || {
+                let mut publisher = ViewPublisher::new(Arc::clone(&owner_bus));
+                self.scan_with_tick(&path, |ctx| {
+                    publisher.tick(ctx.tree, ctx.root, ctx.hardlinks_seen);
+                    !owner_bus.cancel_requested()
+                })
+            })
+            .expect("spawn scan owner thread");
+        LiveScan { bus, handle }
+    }
+
+    /// Core scan loop. `tick` runs on the owner thread between batch
+    /// integrations and on receive timeouts; returning `false` cancels
+    /// the scan (workers stop, the owner drains, the outcome is partial
+    /// and flagged [`ScanOutcome::cancelled`]).
     pub(crate) fn scan_with_tick(
         &self,
         path: &Path,
-        mut tick: impl FnMut(&Tree),
+        mut tick: impl FnMut(TickContext<'_>) -> bool,
     ) -> Result<ScanOutcome, ScanError> {
         let start = Instant::now();
         self.progress.reset();
@@ -264,7 +301,18 @@ impl Scanner {
             }
             drop(tx);
 
-            // Owner loop: integrate until the root completes.
+            // Owner loop: integrate until the root completes (or the tick
+            // cancels the scan). `tick` (D5 publication hook + nav +
+            // cancellation) runs after every integration AND on receive
+            // timeouts, so the view stays live even when the storage
+            // stalls.
+            let mut run_tick = |owner: &Owner| {
+                tick(TickContext {
+                    tree: owner.tree(),
+                    root: owner.root(),
+                    hardlinks_seen: owner.hardlink_inodes() > 0,
+                })
+            };
             loop {
                 if owner.root_complete() {
                     break;
@@ -272,17 +320,22 @@ impl Scanner {
                 match rx.recv_timeout(RECV_TIMEOUT) {
                     Ok(batch) => {
                         owner.handle_batch(batch);
-                        // Publication hook (D5): called between batch
-                        // integrations, sees the current tree.
-                        tick(owner.tree());
+                        if !run_tick(&owner) {
+                            return Ok(true);
+                        }
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        if !run_tick(&owner) {
+                            return Ok(true);
+                        }
                         if shared.pending_jobs.load(Ordering::Acquire) == 0 {
                             // All jobs done: drain what is left, then the
                             // root must be complete.
                             while let Ok(batch) = rx.try_recv() {
                                 owner.handle_batch(batch);
-                                tick(owner.tree());
+                                if !run_tick(&owner) {
+                                    return Ok(true);
+                                }
                             }
                             if !owner.root_complete() {
                                 return Err(ScanError::Incomplete {
@@ -300,9 +353,12 @@ impl Scanner {
                     }
                 }
             }
-            Ok(())
+            // Final tick after root completion so the publisher can emit
+            // its root_complete snapshot before the owner returns.
+            run_tick(&owner);
+            Ok(false)
         });
-        result?;
+        let cancelled = result?;
 
         let elapsed = start.elapsed();
         let excluded_dirs = owner.excluded_dirs();
@@ -322,6 +378,7 @@ impl Scanner {
             hardlink_inodes,
             hardlink_extra_links,
             elapsed,
+            cancelled,
             root_path: path.to_path_buf(),
             root,
             tree,
@@ -330,10 +387,58 @@ impl Scanner {
             entries = outcome.entries,
             dirs = outcome.dirs,
             errors = outcome.errors,
+            cancelled,
             elapsed_ms = elapsed.as_millis() as u64,
-            "scan complete"
+            "scan finished"
         );
         Ok(outcome)
+    }
+}
+
+/// What the owner tick sees between batch integrations.
+pub(crate) struct TickContext<'a> {
+    pub tree: &'a Tree,
+    pub root: DirId,
+    /// Any `nlink > 1` inode seen so far (drives the D3 provisional-totals
+    /// note).
+    pub hardlinks_seen: bool,
+}
+
+/// A scan running on a background thread, navigable while it runs.
+///
+/// Returned by [`Scanner::scan_live`]: the [`ViewBus`] is available
+/// immediately; the final [`ScanOutcome`] via [`LiveScan::join`] once
+/// [`LiveScan::is_finished`] (or blockingly at any time).
+pub struct LiveScan {
+    bus: Arc<ViewBus>,
+    handle: std::thread::JoinHandle<Result<ScanOutcome, ScanError>>,
+}
+
+impl LiveScan {
+    /// The shared snapshot/nav handle (wait-free on the UI side).
+    pub fn bus(&self) -> &Arc<ViewBus> {
+        &self.bus
+    }
+
+    /// Whether the scan thread has finished (completed, cancelled, or
+    /// failed). [`LiveScan::join`] will not block once this is true.
+    pub fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    /// Request cancellation (see [`ViewBus::cancel`]); the scan winds down
+    /// within roughly one worker send-retry interval (~100 ms).
+    pub fn cancel(&self) {
+        self.bus.cancel();
+    }
+
+    /// Wait for the scan thread and return its outcome. A panic on the
+    /// owner thread is resumed here.
+    pub fn join(self) -> Result<ScanOutcome, ScanError> {
+        match self.handle.join() {
+            Ok(result) => result,
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
     }
 }
 
@@ -359,6 +464,9 @@ pub struct ScanOutcome {
     /// Later links that contributed 0 to aggregates.
     pub hardlink_extra_links: u64,
     pub elapsed: Duration,
+    /// The scan was cancelled ([`ViewBus::cancel`]): the tree and every
+    /// counter above are partial (whatever integrated before the stop).
+    pub cancelled: bool,
 }
 
 impl ScanOutcome {
@@ -398,18 +506,7 @@ impl ScanOutcome {
     /// Full path of a directory: the root path joined with the names up
     /// the parent chain.
     pub fn path_of(&self, dir: DirId) -> PathBuf {
-        let mut components: Vec<&[u8]> = Vec::new();
-        let mut cur = Some(dir);
-        while let Some(d) = cur {
-            let meta = self.tree.dir(d);
-            components.push(self.tree.name(meta.node));
-            cur = meta.parent;
-        }
-        let mut path = PathBuf::new();
-        for component in components.into_iter().rev() {
-            path.push(std::ffi::OsStr::from_bytes(component));
-        }
-        path
+        self.tree.path_of(dir)
     }
 
     /// The `n` largest directories by real (disk) subtree size,

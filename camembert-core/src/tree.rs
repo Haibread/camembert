@@ -52,6 +52,13 @@ impl NodeId {
     pub fn index(self) -> usize {
         self.0 as usize
     }
+
+    /// Build an id from a raw index. Only meaningful against the arena
+    /// that issued the index; intended for frontends building synthetic
+    /// rows/snapshots in tests.
+    pub fn from_raw(index: u32) -> Self {
+        Self(index)
+    }
 }
 
 /// Index of a [`DirMeta`] in the directory arena.
@@ -61,6 +68,13 @@ pub struct DirId(pub(crate) u32);
 impl DirId {
     pub fn index(self) -> usize {
         self.0 as usize
+    }
+
+    /// Build an id from a raw index. Only meaningful against the arena
+    /// that issued the index; intended for frontends building synthetic
+    /// rows/snapshots in tests.
+    pub fn from_raw(index: u32) -> Self {
+        Self(index)
     }
 }
 
@@ -307,6 +321,24 @@ impl Tree {
     /// All directory ids (arena order).
     pub fn dir_ids(&self) -> impl Iterator<Item = DirId> {
         (0..u32::try_from(self.dirs.len()).expect("dir arena exceeds u32")).map(DirId)
+    }
+
+    /// Full path of a directory: the root's name (the path the scan was
+    /// started with) joined with the names up the parent chain.
+    pub fn path_of(&self, dir: DirId) -> std::path::PathBuf {
+        use std::os::unix::ffi::OsStrExt;
+        let mut components: Vec<&[u8]> = Vec::new();
+        let mut cur = Some(dir);
+        while let Some(d) = cur {
+            let meta = self.dir(d);
+            components.push(self.name(meta.node));
+            cur = meta.parent;
+        }
+        let mut path = std::path::PathBuf::new();
+        for component in components.into_iter().rev() {
+            path.push(std::ffi::OsStr::from_bytes(component));
+        }
+        path
     }
 
     // ---- owner-only mutation (crate-private, D1) ----

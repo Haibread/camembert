@@ -15,9 +15,10 @@ Named after the pie chart — *camembert* in French.
 
 > **Status**: early development. The parallel scan engine (work-stealing
 > `openat`/`getdents64`/`statx` traversal, streaming aggregation, hardlink
-> dedup, mount-boundary detection) is implemented; the TUI and the dump
-> format are not yet. See [HANDOFF.md](HANDOFF.md) for the full design
-> hypotheses and roadmap, and `docs/design/` for the settled decisions.
+> dedup, mount-boundary detection) and the interactive browse-during-scan
+> TUI are implemented; the dump format is not yet. See
+> [HANDOFF.md](HANDOFF.md) for the full design hypotheses and roadmap, and
+> `docs/design/` for the settled decisions.
 
 ## Layout
 
@@ -38,15 +39,18 @@ cargo build --workspace
 
 ## Run
 
-Scan a directory and print totals plus the largest directories by real
-(on-disk) size:
+When stdout is a terminal, `camembert` opens the **interactive mode** by
+default (see below). With `--no-ui` (env `NO_UI`), or automatically when
+stdout is a pipe or a file, it runs in **summary mode**: scan to
+completion, then print totals plus the largest directories by real
+(on-disk) size.
 
 ```bash
-# Scan the current directory, top 20 by default
+# Browse the current directory interactively (default on a terminal)
 cargo run --release
 
-# Scan /var, show the top 10 directories
-cargo run --release -- /var --top 10
+# Summary mode: scan /var, print the top 10 directories
+cargo run --release -- /var --no-ui --top 10
 
 # Pin the worker-thread count (0 = auto: 2x CPU cores, capped at 8)
 cargo run --release -- /home --threads 4
@@ -56,8 +60,43 @@ cargo run --release -- /home --threads 4
 cargo run --release -- / --cross-filesystems
 
 # Verbose engine diagnostics on stderr (product output stays on stdout)
-cargo run --release -- /var --log-filter camembert_core=debug
+cargo run --release -- /var --no-ui --log-filter camembert_core=debug
 ```
+
+## Interactive mode
+
+The core promise of the interactive mode: the tree is **navigable while
+the scan runs**. Directories appear as they are discovered, totals fill in
+and re-sort live (snapshots at ~30 fps; directories with more than ~20k
+children update at 4 Hz and show an "updating…" note), and a spinner marks
+directories still being scanned. Quitting mid-scan cancels the scan.
+
+| Key | Action |
+| --- | --- |
+| `↓` / `j`, `↑` / `k` | move the cursor |
+| `Enter` / `l` / `→` | open the directory under the cursor |
+| `Backspace` / `h` / `←` | go back up to the parent |
+| `g` / `G` | jump to the top / bottom |
+| `d` | sort by real (disk) size — the default, descending |
+| `a` | sort by apparent size |
+| `n` | sort by name (raw bytes, ascending) |
+| `m` | sort by modification time |
+| `c` | sort by item count |
+| *(active sort key again)* | reverse the sort direction |
+| `p` | show/hide the apparent-size column |
+| `q` / `Esc` / `Ctrl-C` | quit (cancels the scan if still running) |
+
+**Provisional totals (hardlinks)**: while the scan is running, a
+hardlinked inode is attributed to the directory where it was *first seen*.
+If any hardlinks were encountered, the footer shows *"provisional totals
+(hardlinks) — corrected at scan end"* until the scan completes — the
+final numbers count each inode exactly once. The note only appears when
+hardlinks actually exist in the tree.
+
+Diagnostics (`tracing`) still go to stderr in interactive mode; redirect
+them (`2>scan.log`) to keep the screen pristine while debugging.
+
+## Summary mode
 
 Example output:
 
@@ -86,8 +125,9 @@ While a scan runs, a progress line (entries, dirs, errors, bytes so far)
 is logged to stderr every second.
 
 Every CLI option is also settable through an environment variable
-(`SCAN_PATH`, `LOG_FILTER`, `THREADS`, `CROSS_FILESYSTEMS`, `TOP`); see
-`cargo run -- --help` for the full reference.
+(`SCAN_PATH`, `LOG_FILTER`, `THREADS`, `CROSS_FILESYSTEMS`, `TOP`,
+`NO_UI`); see `cargo run -- --help` for the full reference, including the
+interactive-mode key map.
 
 ## Test
 
