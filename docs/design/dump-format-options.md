@@ -1,6 +1,8 @@
 # Dump format — options dossier for the co-design session
 
-**Status: options for discussion, nothing decided.** This synthesizes one
+**Status: superseded — decisions taken, see
+[dump-format-decisions.md](dump-format-decisions.md) and the
+[v1 spec](../format/dump-v1.md).** Kept for the reasoning trail. This synthesizes one
 research pass ([research](dump-format-research.md)), three independent
 design proposals pushed to their limit
 ([A: JSONL/zstd](dump-format-option-a-jsonl.md),
