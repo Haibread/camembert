@@ -1,0 +1,11 @@
+[package]
+name = "camembert"
+description = "Disk usage analyzer that answers the real questions: what grew, what is freeable, what is cold"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+camembert-core = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

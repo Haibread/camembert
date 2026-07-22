@@ -1,0 +1,8 @@
+[package]
+name = "camembert-core"
+description = "Core scanning and aggregation library for camembert"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tracing = { workspace = true }
