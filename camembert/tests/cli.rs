@@ -364,3 +364,51 @@ fn scan_default_mode_is_untouched_by_the_subcommand_split() {
     assert!(text.contains("Scanned"), "{text}");
     assert!(text.contains("Top 3 directories by real size:"), "{text}");
 }
+
+// ---- D5: flat-view top files in the --no-ui summary ----
+
+#[test]
+fn no_ui_summary_lists_top_files_after_the_top_directories_block() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tree = dir.path().join("tree");
+    fs::create_dir_all(&tree).unwrap();
+    write_file(&tree.join("big.bin"), 8192);
+    write_file(&tree.join("small.bin"), 128);
+
+    let output = run(&[tree.to_str().unwrap(), "--no-ui", "--top", "5"]);
+    assert_eq!(code(&output), 0);
+    let text = stdout(&output);
+    let dirs_at = text
+        .find("Top 5 directories by real size:")
+        .expect("top-dirs block present");
+    let files_at = text
+        .find("Top 5 files by real size:")
+        .expect("top-files block present (D5)");
+    assert!(files_at > dirs_at, "files block comes after dirs: {text}");
+    assert!(text.contains("big.bin"), "{text}");
+}
+
+#[test]
+fn dump_to_stdout_suppresses_the_summary_including_the_top_files_block() {
+    // The `-o -` gate (attack finding 7): stdout carries only the dump
+    // stream, so neither the top-dirs nor the new top-files text may
+    // appear on it — same gate, no new hole introduced by D5.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tree = dir.path().join("tree");
+    fs::create_dir_all(&tree).unwrap();
+    write_file(&tree.join("f"), 4096);
+
+    let output = run(&[tree.to_str().unwrap(), "--no-ui", "-o", "-"]);
+    assert_eq!(code(&output), 0);
+    // zstd frame magic number: stdout is exactly the dump stream, nothing
+    // prepended (a stray summary line would land before this and break the
+    // magic-number check on any real dump reader, not just this test).
+    assert_eq!(
+        &output.stdout[..4.min(output.stdout.len())],
+        &[0x28, 0xB5, 0x2F, 0xFD][..],
+        "stdout starts with the zstd magic number, not summary text"
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(!text.contains("Top"), "no summary text of any kind: {text}");
+    assert!(!text.contains("Scanned"), "{text}");
+}

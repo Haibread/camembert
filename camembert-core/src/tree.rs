@@ -361,6 +361,12 @@ impl Tree {
         self.dirs.len()
     }
 
+    /// Number of unique interned names. Sizes the flat-view glob memo
+    /// ([`crate::flat`]), which indexes verdicts by name id.
+    pub fn name_count(&self) -> usize {
+        self.names.len()
+    }
+
     pub fn node(&self, id: NodeId) -> &Node {
         &self.nodes[id.index()]
     }
@@ -578,6 +584,18 @@ impl Tree {
     /// [`Tree::is_hardlink`]).
     pub(crate) fn mark_hardlink_first(&mut self, id: NodeId) {
         self.hardlink_firsts.insert(id);
+    }
+
+    /// Move the "counted link" marker from `from` to `to`, keeping
+    /// [`Tree::is_hardlink`] correct after post-scan canonical
+    /// re-attribution moves an inode's counted link (the old link becomes a
+    /// [`NodeFlags::HARDLINK_EXTRA`], the new one loses that flag but must
+    /// still answer `is_hardlink`). Without this the deletion dialog's
+    /// hardlink warning and the flat view's `⛓` badge would miss the
+    /// canonical link.
+    pub(crate) fn move_hardlink_first(&mut self, from: NodeId, to: NodeId) {
+        self.hardlink_firsts.remove(&from);
+        self.hardlink_firsts.insert(to);
     }
 
     pub(crate) fn push_node(

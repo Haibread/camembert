@@ -77,6 +77,9 @@ pub(crate) fn reattribute(tree: &mut Tree, links: &[HardlinkLink]) -> u64 {
         }
         tree.set_hardlink_extra(counted, true);
         tree.set_hardlink_extra(canonical, false);
+        // Keep the counted-link side set (Tree::is_hardlink) consistent
+        // with the flags we just flipped.
+        tree.move_hardlink_first(counted, canonical);
         moved += 1;
     }
     moved
@@ -233,6 +236,16 @@ mod tests {
             .collect();
         assert!(extras.contains(&(b"link1".to_vec(), true)));
         assert!(extras.contains(&(b"link0".to_vec(), false)));
+
+        // Both links still answer `is_hardlink` — the counted-link side set
+        // followed the re-attribution (the canonical link is no longer
+        // flagged EXTRA but must still count as a hardlink).
+        for link in &links {
+            assert!(
+                tree.is_hardlink(link.node),
+                "every link of an nlink>1 inode stays a hardlink after finalize"
+            );
+        }
     }
 
     #[test]

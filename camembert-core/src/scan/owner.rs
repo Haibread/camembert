@@ -18,6 +18,7 @@ use std::sync::Arc;
 use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::{debug, warn};
 
+use crate::flat::{Accumulator, FlatConfig, FlatSummary};
 use crate::size::Size;
 use crate::tree::{ChildRun, DirId, DirState, ExcludedReason, Kind, NodeFlags, Tree};
 
@@ -70,6 +71,11 @@ pub(crate) struct Owner {
     /// Subset of `excluded_dirs` that are kernel pseudo-filesystems.
     excluded_kernfs: u64,
     progress: Arc<ScanProgress>,
+    /// Flat-view incremental accumulator (D2), when the frontend enabled it
+    /// with a [`FlatConfig`]. Fed per inserted node; snapshotted on the
+    /// publication cadence. `None` = no flat view (the default, and every
+    /// non-interactive path).
+    flat: Option<Accumulator>,
 }
 
 impl Owner {
@@ -100,7 +106,33 @@ impl Owner {
             excluded_dirs: 0,
             excluded_kernfs: 0,
             progress,
+            flat: None,
         }
+    }
+
+    /// Enable flat-view accumulation (D2) with `config`. Seeds the root
+    /// directory's coverage and own inode, so it must run once, right after
+    /// [`Owner::new`], before any batch is integrated.
+    pub(crate) fn enable_flat(&mut self, config: FlatConfig) {
+        let root_node = self.tree.dir(self.root).node;
+        let node = self.tree.node(root_node);
+        let size = node.size();
+        let name_id = node.name_ref().0;
+        let name = self.tree.name(root_node).to_vec();
+        let mut accum = Accumulator::new(config.patterns, config.cap);
+        accum.on_dir(self.root, None, &name, name_id, size);
+        self.flat = Some(accum);
+    }
+
+    /// The live flat accumulator, if enabled (for the publisher's tick).
+    pub(crate) fn flat_accumulator(&self) -> Option<&Accumulator> {
+        self.flat.as_ref()
+    }
+
+    /// Snapshot the final provisional flat summary (first-seen hardlinks),
+    /// captured at scan end before the outcome runs the authoritative fold.
+    pub(crate) fn flat_snapshot(&self, epoch: u64) -> Option<FlatSummary> {
+        self.flat.as_ref().map(|accum| accum.snapshot(epoch))
     }
 
     pub(crate) fn tree(&self) -> &Tree {
@@ -275,6 +307,27 @@ impl Owner {
                 self.tokens.insert(token, child);
                 new_tokens.push(token);
                 child_dirs_seen += 1;
+                // Flat view (D2): a scanned directory contributes its own
+                // inode and sets its subtree's coverage. Parent processed
+                // first (topological), so `dir`'s coverage is already known.
+                if let Some(flat) = &mut self.flat {
+                    let name_id = self.tree.node(node).name_ref().0;
+                    flat.on_dir(child, Some(dir), &entry.name, name_id, size);
+                }
+            } else if let Some(flat) = &mut self.flat {
+                // Flat view (D2): files, symlinks, and excluded mount points
+                // (dir-kind, no DirMeta). Extras contribute 0 (first-seen).
+                let name_id = self.tree.node(node).name_ref().0;
+                flat.on_leaf(
+                    node,
+                    dir,
+                    &entry.name,
+                    name_id,
+                    entry.kind,
+                    is_extra_link,
+                    is_hardlink,
+                    size,
+                );
             }
         }
         debug_assert_eq!(child_dirs_seen, batch.child_dirs, "child_dirs miscount");

@@ -33,6 +33,7 @@ use crossbeam_deque::{Injector, Worker as WorkerQueue};
 use rustix::fs::{Mode, OFlags};
 use tracing::{debug, info};
 
+use crate::flat::{Accumulator, FlatConfig, FlatSummary};
 use crate::size::Size;
 use crate::tree::{DirId, DirMeta, Node, NodeId, Tree};
 use crate::view::{ViewBus, ViewPublisher};
@@ -153,6 +154,9 @@ pub enum ScanError {
 pub struct Scanner {
     options: ScanOptions,
     progress: Arc<ScanProgress>,
+    /// Flat-view accumulation config (D2), set via [`Scanner::with_flat`].
+    /// `None` = no live flat view during the scan.
+    flat: Option<FlatConfig>,
 }
 
 impl Scanner {
@@ -160,7 +164,22 @@ impl Scanner {
         Self {
             options,
             progress: Arc::new(ScanProgress::default()),
+            flat: None,
         }
+    }
+
+    /// Enable the live flat view + pattern breakdown (D2): the owner
+    /// accumulates group totals and top-N files incrementally during the
+    /// scan and publishes provisional [`FlatSummary`] snapshots on the view
+    /// cadence (read with [`ViewBus::load_flat`]). Patterns are fixed at
+    /// scan start (config is loaded first). Without this, the scan does no
+    /// flat-view work and [`ViewBus::load_flat`] stays `None`; the
+    /// authoritative summary is still available post-scan via
+    /// [`crate::flat::fold`].
+    #[must_use]
+    pub fn with_flat(mut self, config: FlatConfig) -> Self {
+        self.flat = Some(config);
+        self
     }
 
     /// Shared progress handle; poll it from another thread while
@@ -201,7 +220,7 @@ impl Scanner {
             .spawn(move || {
                 let mut publisher = ViewPublisher::new(Arc::clone(&owner_bus));
                 self.scan_with_tick(&path, |ctx| {
-                    publisher.tick(ctx.tree, ctx.root, ctx.hardlink_inodes);
+                    publisher.tick(ctx.tree, ctx.root, ctx.hardlink_inodes, ctx.flat);
                     !owner_bus.cancel_requested()
                 })
             })
@@ -280,6 +299,9 @@ impl Scanner {
             root_dev,
             Arc::clone(&self.progress),
         );
+        if let Some(flat) = self.flat.clone() {
+            owner.enable_flat(flat);
+        }
 
         let result = std::thread::scope(|scope| {
             // Whatever happens below (including a panic in the owner
@@ -313,6 +335,7 @@ impl Scanner {
                     tree: owner.tree(),
                     root: owner.root(),
                     hardlink_inodes: owner.hardlink_inodes(),
+                    flat: owner.flat_accumulator(),
                 })
             };
             loop {
@@ -367,6 +390,10 @@ impl Scanner {
         let excluded_kernfs = owner.excluded_kernfs();
         let hardlink_inodes = owner.hardlink_inodes();
         let hardlink_extra_links = owner.hardlink_extra_links();
+        // Final provisional flat summary (first-seen hardlinks), captured
+        // before the arena is handed off; the authoritative post-finalize
+        // fold is computed by the caller (D2). Epoch 0: no deletions yet.
+        let flat_provisional = owner.flat_snapshot(0);
         let (tree, root, hardlink_links) = owner.into_parts();
         let root_meta = tree.dir(root);
         let outcome = ScanOutcome {
@@ -388,6 +415,7 @@ impl Scanner {
             tree,
             hardlink_links,
             hardlinks_finalized: false,
+            flat_provisional,
         };
         info!(
             entries = outcome.entries,
@@ -408,6 +436,9 @@ pub(crate) struct TickContext<'a> {
     /// `nlink > 1` inodes seen so far (drives the D3 provisional-totals
     /// note and the UI's hardlink metric card).
     pub hardlink_inodes: u64,
+    /// The live flat accumulator (D2), when the flat view is enabled; the
+    /// publisher snapshots it on the publication cadence.
+    pub flat: Option<&'a Accumulator>,
 }
 
 /// A scan running on a background thread, navigable while it runs.
@@ -460,6 +491,12 @@ pub struct ScanOutcome {
     /// [`ScanOutcome::finalize_hardlinks`] ran: per-directory totals use
     /// canonical (smallest-path) hardlink attribution, not first-seen.
     hardlinks_finalized: bool,
+    /// The final live flat-view summary (D2), when the scan ran with
+    /// [`Scanner::with_flat`]: first-seen hardlink attribution,
+    /// `provisional = true`. `None` for `--no-ui` scans and every import.
+    /// The authoritative post-scan summary is [`crate::flat::fold`] over
+    /// the finalized tree — this is only the provisional hand-off value.
+    flat_provisional: Option<FlatSummary>,
     /// Subtree totals of the root (hardlink first-seen attribution).
     pub totals: Size,
     /// Inodes counted (root's `tn`: hardlink extras excluded).
@@ -522,12 +559,22 @@ impl ScanOutcome {
             tree,
             hardlink_links,
             hardlinks_finalized: false,
+            // Import is non-interactive: fold-only, no live accumulator.
+            flat_provisional: None,
         }
     }
 
     /// The underlying arena (read-only).
     pub fn tree(&self) -> &Tree {
         &self.tree
+    }
+
+    /// The final provisional flat-view summary (D2), if the scan ran with
+    /// [`Scanner::with_flat`]. First-seen hardlink attribution; the
+    /// authoritative summary is [`crate::flat::fold`] over
+    /// [`ScanOutcome::tree`] after [`ScanOutcome::finalize_hardlinks`].
+    pub fn flat_provisional(&self) -> Option<&FlatSummary> {
+        self.flat_provisional.as_ref()
     }
 
     /// Re-attribute every hardlinked (`nlink > 1`) inode from its

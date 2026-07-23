@@ -36,6 +36,7 @@
 
 mod anim;
 pub mod caps;
+mod flatview;
 mod fmt;
 mod freeable_panel;
 mod keymap;
@@ -67,20 +68,38 @@ use tracing::{debug, error, info, warn};
 
 use camembert_core::delete;
 use camembert_core::dump::{self, DumpMeta};
+use camembert_core::flat::{self, FlatConfig};
 use camembert_core::freeable::{self, Ledger};
 use camembert_core::scan::{LiveScan, ScanOutcome, Scanner};
 use camembert_core::size::HumanSize;
-use camembert_core::tree::{DirId, NodeId};
+use camembert_core::tree::{DirId, NodeId, Tree};
 use camembert_core::view::{self, RowState, ViewSnapshot};
 
 use caps::{Caps, GlyphLevel};
 use fmt::DiskSpace;
 use state::{
     ConfirmState, FrameGeometry, MarkRefusal, ReviewState, SortKey, TableGeometry, UiState,
-    WheelGeometry, show_hardlink_note, show_updating_note,
+    ViewMode, WheelGeometry, show_hardlink_note, show_updating_note,
 };
 use theme::{Theme, ThemeName};
 use toast::ToastQueue;
+
+/// Flash shown when a flat/breakdown action needs the frozen post-scan
+/// arena (Enter-jump, marking): both need a real path to resolve a
+/// containing directory or build a [`state::MarkedEntry`], and a path
+/// requires walking the arena's parent chain — not shareable with the UI
+/// thread mid-scan (D3; see [`flatview`]'s module doc for why that's a
+/// real API boundary and not a shortcut). The name alone (shown in the
+/// table) is available live; only these two actions stay gated.
+const FLAT_ROW_DETAILS_LOCKED: &str = "row details available once the scan completes";
+
+/// Flash for Enter on a breakdown row (D3 phase 1: group drill-down is
+/// wave 3's query language, not this feature).
+const BREAKDOWN_DRILLDOWN_LOCKED: &str = "group drill-down comes with the query language";
+
+/// Flash for a sort key the active mode has no meaningful column for (D3
+/// — e.g. `m`/`e` in a flat/breakdown mode, or `c` in flat mode).
+const SORT_NOT_APPLICABLE: &str = "not available in this view";
 
 /// Frame budget: poll timeout of the render loop (~30 fps, D5) while
 /// something needs a timely redraw without new input — a running scan,
@@ -146,6 +165,11 @@ struct RenderCtx {
     /// index refresh — for paranoid environments and containers with a
     /// masked `/proc`.
     no_proc_sweep: bool,
+    /// Flat-view config (D2/D4: presets + `[patterns]` + `flat_cap`) —
+    /// kept around post-scan to recompute the authoritative
+    /// [`flat::fold`] on a render-time epoch mismatch (see
+    /// [`ensure_flat_summary_fresh`]).
+    flat_config: FlatConfig,
 }
 
 impl RenderCtx {
@@ -213,7 +237,14 @@ enum Phase {
 /// light background, before the alternate screen opens. `no_proc_sweep` is
 /// `--no-proc-sweep`/`NO_PROC_SWEEP` (freeable phase 1, D7): disables both
 /// the scan-end `/proc` sweep and the pre-deletion open-file index
-/// refresh.
+/// refresh. `flat_config` (D2/D4) is what `main` already handed the
+/// scanner via `Scanner::with_flat` — kept here too so post-scan
+/// deletions can recompute the authoritative [`flat::fold`] (the scanner
+/// itself only needed it to seed the live accumulator). `startup_toasts`
+/// (D4) surfaces config-time warnings collected before the UI existed —
+/// today just the combined `[patterns]` warning count ("N invalid
+/// patterns ignored — see log").
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     scanner: Scanner,
     path: &Path,
@@ -222,6 +253,8 @@ pub fn run(
     animate: bool,
     theme_choice: Option<ThemeName>,
     no_proc_sweep: bool,
+    flat_config: FlatConfig,
+    startup_toasts: Vec<String>,
 ) -> io::Result<()> {
     info!(
         ?caps,
@@ -243,8 +276,9 @@ pub fn run(
         disk,
         animate,
         no_proc_sweep,
+        flat_config,
     };
-    let result = event_loop(&mut terminal, live, output, &ctx);
+    let result = event_loop(&mut terminal, live, output, &ctx, startup_toasts);
     disable_mouse_capture();
     ratatui::restore();
     result
@@ -377,6 +411,7 @@ fn event_loop(
     live: LiveScan,
     output: Option<PathBuf>,
     ctx: &RenderCtx,
+    startup_toasts: Vec<String>,
 ) -> io::Result<()> {
     let bus = Arc::clone(live.bus());
     let mut output = output;
@@ -389,6 +424,12 @@ fn event_loop(
     let mut local_generation: u64 = 0;
     let mut flash = Flash::new();
     let mut toasts = ToastQueue::new();
+    // D4: config-time warnings collected before the UI existed (today just
+    // the combined invalid-pattern count) — one toast each, same as any
+    // other startup notice.
+    for text in startup_toasts {
+        toasts.push(text);
+    }
     // Last left-click's time and cell, for double-click detection —
     // independent of the click-already-selected-row shortcut.
     let mut last_click: Option<(Instant, u16, u16)> = None;
@@ -446,7 +487,7 @@ fn event_loop(
                     }
                 }
                 Event::Mouse(mouse) => {
-                    handle_mouse(mouse, &mut ui, &phase, &mut last_click);
+                    handle_mouse(mouse, &mut ui, &phase, &mut last_click, &mut flash);
                 }
                 _ => {}
             }
@@ -525,7 +566,15 @@ fn event_loop(
 
         // 3. Snapshot for this frame (wait-free).
         match &phase {
-            Phase::Scanning(_) => ui.apply_snapshot(bus.load()),
+            Phase::Scanning(_) => {
+                ui.apply_snapshot(bus.load());
+                // D2: the live accumulator's provisional flat-view summary
+                // rides the same arc-swap cadence as the tree snapshot —
+                // `None` when the scan didn't enable `with_flat` at all.
+                if let Some(flat) = bus.load_flat() {
+                    ui.set_flat_summary(flat);
+                }
+            }
             Phase::Done(_) => {
                 if let Some(dir) = ui.pending_nav() {
                     serve_local(&phase, dir, &mut local_generation, &mut ui);
@@ -534,12 +583,14 @@ fn event_loop(
             Phase::Transitioning => unreachable!("resolved in step 2"),
         }
 
+        // 3.5. Flat/breakdown freshness (D2/D3, attack finding 1):
+        // render-time epoch check, not "on first t/b" — a delete performed
+        // from *within* a flat/breakdown mode must never leave a stale,
+        // already-deleted row on screen past this very frame.
+        ensure_flat_summary_fresh(&phase, &ctx.flat_config, &mut ui);
+
         // 4. Render.
-        table_state.select(if ui.selected().is_some() {
-            Some(ui.cursor())
-        } else {
-            None
-        });
+        table_state.select((ui.row_count() > 0).then_some(ui.cursor()));
         let spinner = spinner_frame(ctx, started.elapsed());
         let flash_text = flash.current().map(str::to_owned);
         // `is_empty` skips the prune-and-collect work on the (overwhelmingly
@@ -558,6 +609,7 @@ fn event_loop(
             geometry = draw(
                 frame,
                 &ui,
+                &phase,
                 &mut table_state,
                 spinner,
                 flash_text.as_deref(),
@@ -711,17 +763,45 @@ fn handle_key(
         return Action::Continue;
     }
     match code {
-        KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
+        KeyCode::Char('q') => return Action::Quit,
+        // Contextual Esc (D3): a modal already returned above, so getting
+        // here means none is open — leave a flat/breakdown mode if one is
+        // active, otherwise quit exactly like `q`. `q` itself always
+        // quits, mode or no mode (D3: "`q` always quits").
+        KeyCode::Esc => {
+            if ui.mode() == ViewMode::Tree {
+                return Action::Quit;
+            }
+            ui.leave_mode();
+        }
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return Action::Quit,
-        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => try_descend(ui, phase),
-        KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => try_ascend(ui, phase),
+        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => activate_selected(ui, phase, flash),
+        KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
+            // Ascend is a tree-mode concept only: a flat/breakdown row
+            // list has no descend stack of its own to climb.
+            if ui.mode() == ViewMode::Tree {
+                try_ascend(ui, phase);
+            }
+        }
         KeyCode::Char(' ') => try_toggle_mark(ui, phase, flash),
         KeyCode::Char('D') => open_delete_confirm(ui, phase, flash, no_proc_sweep),
         KeyCode::Char('v') => try_open_review(ui, flash),
         KeyCode::Char('f') => open_freeable_panel(ui, phase),
-        // Every other key (movement, sort, `p`, `u`, `?`) is stateless
-        // enough to live in the keymap dispatch table (`ui::keymap`) —
-        // the single source the `?` cheatsheet also renders from.
+        // The sort keys are mode-aware (D3: a group total has no mtime or
+        // error count) and need the flash queue to say so when refused —
+        // context the stateless `keymap::SIMPLE` table doesn't carry (see
+        // its module doc), so they are hand-written here instead of
+        // dispatched through it.
+        KeyCode::Char('d') => try_sort(ui, flash, SortKey::Disk),
+        KeyCode::Char('a') => try_sort(ui, flash, SortKey::Apparent),
+        KeyCode::Char('n') => try_sort(ui, flash, SortKey::Name),
+        KeyCode::Char('m') => try_sort(ui, flash, SortKey::Mtime),
+        KeyCode::Char('c') => try_sort(ui, flash, SortKey::Items),
+        KeyCode::Char('e') => try_sort(ui, flash, SortKey::Errors),
+        // Every other key (movement, `p`, `u`, `?`, `t`, `b`, `z`) is
+        // stateless enough to live in the keymap dispatch table
+        // (`ui::keymap`) — the single source the `?` cheatsheet also
+        // renders from.
         _ => {
             keymap::dispatch_simple(code, ui);
         }
@@ -746,6 +826,90 @@ fn try_ascend(ui: &mut UiState, phase: &Phase) {
     }
 }
 
+/// Activate the row under the cursor: descend in tree mode, jump to the
+/// containing directory on a flat row, flash the phase-1 no-op on a
+/// breakdown row (D3). Shared by the keyboard (`Enter`/`l`/`Right`) and
+/// every mouse action that opens a row (double-click,
+/// click-on-already-selected, donut slice) — the same idiom `try_descend`
+/// already was for tree mode alone.
+fn activate_selected(ui: &mut UiState, phase: &Phase, flash: &mut Flash) {
+    match ui.mode() {
+        ViewMode::Tree => try_descend(ui, phase),
+        ViewMode::FlatTop => try_jump_flat_row(ui, phase, flash),
+        ViewMode::Breakdown => flash.set(BREAKDOWN_DRILLDOWN_LOCKED),
+    }
+}
+
+/// Enter on a flat top-files row (D3): jump to its containing directory in
+/// tree view, cursor on the file itself. Only possible post-scan —
+/// resolving a containing directory needs a real path, and the live
+/// accumulator's `TopFile` (denormalized name aside, see `flatview`'s
+/// module doc) has no path to give one from, so mid-scan this flashes the
+/// same "available once the scan completes" note marking already uses.
+fn try_jump_flat_row(ui: &mut UiState, phase: &Phase, flash: &mut Flash) {
+    let Phase::Done(outcome) = phase else {
+        flash.set(FLAT_ROW_DETAILS_LOCKED);
+        return;
+    };
+    let Some(summary) = ui.flat_summary() else {
+        return;
+    };
+    let rows = flatview::flat_rows(summary, Some(outcome));
+    let order = flatview::sort_flat_rows(&rows, ui.sort());
+    let Some(&index) = order.get(ui.cursor()) else {
+        return; // empty view: silent no-op
+    };
+    let node = rows[index].node;
+    let tree = outcome.tree();
+    let Some(dir) = tree.dir_of(tree.node(node).parent()) else {
+        // Every live file's parent is a scanned directory with a DirId;
+        // this would only miss on a data-model bug, never a user action.
+        warn!(
+            ?node,
+            "flat row's parent has no directory metadata: cannot jump"
+        );
+        return;
+    };
+    let ancestors = ancestor_chain(tree, dir);
+    if let Some(target) = ui.jump_to_directory(dir, ancestors, node) {
+        request_nav(phase, target);
+        ui.leave_mode();
+    }
+}
+
+/// Root-first chain of ancestor directories *above* `dir` (excluding
+/// `dir` itself) — what [`UiState::jump_to_directory`] needs to rebuild
+/// the breadcrumb stack for a directory reached directly (not via
+/// `descend`/`ascend`), same shape as [`UiState::stack_dirs`].
+fn ancestor_chain(tree: &Tree, dir: DirId) -> Vec<DirId> {
+    let mut chain = Vec::new();
+    let mut current = dir;
+    while let Some(parent) = tree.dir(current).parent {
+        chain.push(parent);
+        current = parent;
+    }
+    chain.reverse();
+    chain
+}
+
+/// Sort keypress (`d`/`a`/`n`/`m`/`c`/`e`, D3): refused with a flash when
+/// the active mode has no meaningful column for the key (a group total
+/// has no mtime; a single top file has no subtree item count) — hand
+/// -written rather than in `keymap::SIMPLE` because the refusal needs the
+/// flash queue, context that table doesn't carry (see its module doc).
+fn try_sort(ui: &mut UiState, flash: &mut Flash, key: SortKey) {
+    let supported = match ui.mode() {
+        ViewMode::Tree => true,
+        ViewMode::FlatTop => flatview::flat_supports_sort(key),
+        ViewMode::Breakdown => flatview::breakdown_supports_sort(key),
+    };
+    if !supported {
+        flash.set(SORT_NOT_APPLICABLE);
+        return;
+    }
+    ui.press_sort(key);
+}
+
 /// Route a mouse event against the last frame's [`FrameGeometry`] (mouse
 /// support, design slice 3). Inert while any modal is open — confirm,
 /// review, the freeable panel (D5) or cheatsheet (design slice 4) — they
@@ -756,6 +920,7 @@ fn handle_mouse(
     ui: &mut UiState,
     phase: &Phase,
     last_click: &mut Option<(Instant, u16, u16)>,
+    flash: &mut Flash,
 ) {
     if ui.confirm().is_some() || ui.review().is_some() || ui.freeable_open() || ui.cheatsheet_open()
     {
@@ -763,7 +928,7 @@ fn handle_mouse(
     }
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            handle_click(mouse.column, mouse.row, ui, phase, last_click);
+            handle_click(mouse.column, mouse.row, ui, phase, last_click, flash);
         }
         MouseEventKind::Moved => handle_hover(mouse.column, mouse.row, ui),
         MouseEventKind::ScrollDown if over_table(mouse.column, mouse.row, ui) => {
@@ -798,6 +963,7 @@ fn handle_click(
     ui: &mut UiState,
     phase: &Phase,
     last_click: &mut Option<(Instant, u16, u16)>,
+    flash: &mut Flash,
 ) {
     if ui.geometry().gauge_freeable_hit(col, row) {
         open_freeable_panel(ui, phase);
@@ -805,7 +971,7 @@ fn handle_click(
         return;
     }
     if ui.geometry().errors_card_hit(col, row) {
-        ui.press_sort(SortKey::Errors);
+        try_sort(ui, flash, SortKey::Errors);
         *last_click = None;
         return;
     }
@@ -821,9 +987,9 @@ fn handle_click(
         .and_then(|w| w.hit_test(col, row));
     if let Some(position) = wheel_target {
         // A slice already summarizes an entire child: click always
-        // navigates, there is no separate "select" step.
+        // activates, there is no separate "select" step.
         ui.select_at(position);
-        try_descend(ui, phase);
+        activate_selected(ui, phase, flash);
         *last_click = None;
         return;
     }
@@ -836,11 +1002,11 @@ fn handle_click(
         *last_click = None;
         return;
     };
-    let already_selected = ui.selected().is_some() && ui.cursor() == position;
+    let already_selected = ui.row_count() > 0 && ui.cursor() == position;
     let double_click = matches!(*last_click, Some((at, c, r)) if c == col && r == row && at.elapsed() < DOUBLE_CLICK);
     ui.select_at(position);
     if already_selected || double_click {
-        try_descend(ui, phase);
+        activate_selected(ui, phase, flash);
         *last_click = None;
     } else {
         *last_click = Some((Instant::now(), col, row));
@@ -871,16 +1037,55 @@ fn handle_hover(col: u16, row: u16, ui: &mut UiState) {
 
 /// `Space`: mark/unmark the row under the cursor. Inactive during the
 /// scan (HANDOFF §5: deletion only works on the frozen post-scan arena).
+/// Mode-aware (D3): flat rows mark real nodes into the same shared basket;
+/// breakdown rows aren't markable at all (a group isn't a single node —
+/// group-level marking is a deliberate fast-follow, D6).
 fn try_toggle_mark(ui: &mut UiState, phase: &Phase, flash: &mut Flash) {
     if matches!(phase, Phase::Scanning(_)) {
         flash.set(DELETION_LOCKED);
         return;
     }
-    match ui.toggle_mark() {
+    match ui.mode() {
+        ViewMode::Tree => match ui.toggle_mark() {
+            Ok(()) => {}
+            Err(MarkRefusal::ScanRunning) => flash.set(DELETION_LOCKED),
+            Err(MarkRefusal::MountPoint) => {
+                flash.set("mount points cannot be marked for deletion");
+            }
+        },
+        ViewMode::FlatTop => try_toggle_mark_flat(ui, phase, flash),
+        ViewMode::Breakdown => flash.set("marking is not available in the breakdown view"),
+    }
+}
+
+/// `Space` on a flat top-files row (D3): resolve the row's real
+/// `NodeId`/path/disk size from the frozen arena and mark/unmark it in the
+/// same shared basket tree-mode marking uses. Only possible post-scan —
+/// same reason as [`try_jump_flat_row`] (the live accumulator's
+/// `TopFile` has no path to resolve).
+fn try_toggle_mark_flat(ui: &mut UiState, phase: &Phase, flash: &mut Flash) {
+    let Phase::Done(outcome) = phase else {
+        flash.set(DELETION_LOCKED);
+        return;
+    };
+    let Some(summary) = ui.flat_summary() else {
+        return;
+    };
+    let rows = flatview::flat_rows(summary, Some(outcome));
+    let order = flatview::sort_flat_rows(&rows, ui.sort());
+    let Some(&index) = order.get(ui.cursor()) else {
+        return; // empty view: silent no-op, matching tree mode
+    };
+    let row = &rows[index];
+    let path = row
+        .path
+        .clone()
+        .unwrap_or_else(|| outcome.tree().path_of_node(row.node));
+    match ui.toggle_mark_flat(row.node, path, row.disk) {
         Ok(()) => {}
         Err(MarkRefusal::ScanRunning) => flash.set(DELETION_LOCKED),
         Err(MarkRefusal::MountPoint) => {
-            flash.set("mount points cannot be marked for deletion");
+            debug!("unreachable: flat rows are always regular files, never mount points");
         }
     }
 }
@@ -1051,6 +1256,13 @@ fn execute_deletion(
     let nodes: Vec<NodeId> = marks.iter().map(|mark| mark.node).collect();
     info!(count = nodes.len(), "deletion confirmed");
     let report = delete::delete_nodes(outcome, &nodes);
+    if report.deleted > 0 {
+        // D2/D3, attack finding 1: advance the epoch so the very next
+        // render-time check (`ensure_flat_summary_fresh`) recomputes the
+        // flat/breakdown summary before drawing — regardless of which
+        // mode this deletion was performed from.
+        ui.bump_flat_epoch();
+    }
     if report.failed > 0 || report.skipped > 0 {
         toasts.push(format!(
             "deleted {} ({} freed), failed {}, skipped {} — see log",
@@ -1109,6 +1321,41 @@ fn serve_local(phase: &Phase, dir: DirId, generation: &mut u64, ui: &mut UiState
     ui.apply_snapshot(Arc::new(snapshot));
 }
 
+/// Recompute the flat/breakdown summary on a render-time epoch mismatch
+/// (D2/D3, attack finding 1) — called once per frame, right before
+/// drawing, regardless of which mode is active: cheap to check (two field
+/// reads), and checking unconditionally is what makes the very next frame
+/// after a delete honest even though the delete itself may have happened
+/// while flat/breakdown mode was already open (the deleted row must never
+/// render as still occupying space).
+///
+/// Mid-scan this is a no-op (the accumulator's provisional summary is
+/// already fresh every frame via `bus.load_flat()`, see `event_loop` step
+/// 3, and marks/deletes don't exist yet to bump the epoch). Post-scan, a
+/// stale or absent summary — no cache yet, the cached one is still the
+/// scan-end provisional hand-off, or its `epoch` disagrees with
+/// [`UiState::flat_epoch`] — triggers one authoritative
+/// [`flat::fold`] over the frozen arena.
+fn ensure_flat_summary_fresh(phase: &Phase, flat_config: &FlatConfig, ui: &mut UiState) {
+    let Phase::Done(outcome) = phase else {
+        return;
+    };
+    let epoch = ui.flat_epoch();
+    let stale = ui
+        .flat_summary()
+        .is_none_or(|summary| summary.provisional || summary.epoch != epoch);
+    if !stale {
+        return;
+    }
+    let summary = flat::fold(
+        outcome.tree(),
+        &flat_config.patterns,
+        flat_config.cap,
+        epoch,
+    );
+    ui.set_flat_summary(Arc::new(summary));
+}
+
 /// Draws one frame and returns the hit-testing geometry mouse events are
 /// matched against next: recomputed every draw so it always describes
 /// exactly what is on screen (design slice 3).
@@ -1122,6 +1369,7 @@ fn serve_local(phase: &Phase, dir: DirId, generation: &mut u64, ui: &mut UiState
 fn draw(
     frame: &mut Frame<'_>,
     ui: &UiState,
+    phase: &Phase,
     table_state: &mut TableState,
     spinner: char,
     flash: Option<&str>,
@@ -1158,11 +1406,10 @@ fn draw(
     ])
     .areas(frame.area());
 
-    // Identity colors: assigned once per frame from the snapshot rows (in
-    // snapshot order), shared by the table bars/names and the wheel so
-    // they can never disagree.
-    let disks: Vec<u64> = snapshot.rows.iter().map(|row| row.disk).collect();
-    let ranks = theme::assign_identity(&disks, theme::IDENTITY_LEN);
+    let outcome = match phase {
+        Phase::Done(outcome) => Some(outcome.as_ref()),
+        _ => None,
+    };
 
     let breadcrumb = draw_header(frame, header_area, ui, spinner, ctx);
     let errors_card = if ui.zen() {
@@ -1178,11 +1425,11 @@ fn draw(
 
     // Main split: table (with selection card) left, wheel right — see
     // `wheel_layout` for the responsive-collapse/zen-mode rules (design
-    // slice 5).
+    // slice 5). The selection card only makes sense over tree rows (mtime/
+    // items/share of *this row's parent*); flat/breakdown rows don't carry
+    // that shape, so it is hidden in those modes rather than showing
+    // something misleading.
     let layout = wheel_layout(frame.area().width, ctx.ascii(), ui.zen());
-    if layout == WheelLayout::Mini {
-        draw_mini_donut(frame, header_area, ui, &ranks, motion, ctx);
-    }
     let (left_area, wheel_area) = if layout == WheelLayout::Full {
         let [left, right] =
             Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
@@ -1191,7 +1438,7 @@ fn draw(
     } else {
         (main_area, None)
     };
-    let show_selection_card = !ui.zen() && left_area.height >= 9;
+    let show_selection_card = !ui.zen() && ui.mode() == ViewMode::Tree && left_area.height >= 9;
     let (table_area, card_area) = if show_selection_card {
         let [table, card] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(4)]).areas(left_area);
@@ -1201,21 +1448,57 @@ fn draw(
     };
 
     let bar_progress = motion.bar_progress();
-    let table = draw_table(
-        frame,
-        table_area,
-        ui,
-        table_state,
-        spinner,
-        &ranks,
-        bar_progress,
-        ctx,
-    );
+    // Table and wheel are always built together from the same rows/ranks
+    // (D3): tree, flat top files, or the pattern breakdown — so the
+    // identity colors and the slice->row click mapping can never disagree
+    // between the two, the same guarantee tree mode already relied on.
+    let (table, wheel_source) = match ui.mode() {
+        ViewMode::Tree => {
+            let disks: Vec<u64> = snapshot.rows.iter().map(|row| row.disk).collect();
+            let ranks = theme::assign_identity(&disks, theme::IDENTITY_LEN);
+            let table = draw_table(
+                frame,
+                table_area,
+                ui,
+                table_state,
+                spinner,
+                &ranks,
+                bar_progress,
+                ctx,
+            );
+            let slice_rows: Vec<(u64, Option<usize>)> = ui
+                .rows_indexed()
+                .map(|(index, row)| (row.disk, ranks.get(index).copied().flatten()))
+                .collect();
+            let wheel_source = WheelSource {
+                slice_rows,
+                total: snapshot.totals.disk,
+                caption: snapshot.path.display().to_string(),
+            };
+            (table, wheel_source)
+        }
+        ViewMode::FlatTop => draw_flat_table(
+            frame,
+            table_area,
+            ui,
+            outcome,
+            table_state,
+            snapshot.stats.disk_bytes,
+            bar_progress,
+            ctx,
+        ),
+        ViewMode::Breakdown => {
+            draw_breakdown_table(frame, table_area, ui, table_state, bar_progress, ctx)
+        }
+    };
     if let Some(card_area) = card_area {
         draw_selection_card(frame, card_area, ui, ctx);
     }
+    if layout == WheelLayout::Mini {
+        draw_mini_donut(frame, header_area, &wheel_source, motion, ctx);
+    }
     let wheel =
-        wheel_area.and_then(|wheel_area| draw_wheel(frame, wheel_area, ui, &ranks, motion, ctx));
+        wheel_area.and_then(|wheel_area| draw_wheel(frame, wheel_area, &wheel_source, motion, ctx));
 
     draw_basket_strip(frame, basket_area, ui, ctx);
     draw_footer(frame, footer_area, ui, flash, ctx);
@@ -1307,15 +1590,22 @@ fn draw_header(
         Span::from(format!("{spinner} scanning")).fg(theme.color(theme::ACCENT))
     };
     let path = snapshot.path.display().to_string();
-    let header = Line::from(vec![
+    let mut spans = vec![
         Span::from(" "),
         Span::from(signature).fg(theme.color(theme::ACCENT)).bold(),
         Span::from("  "),
         Span::from(path.clone()).bold(),
         Span::from("  "),
         status,
-    ]);
-    frame.render_widget(Paragraph::new(header), area);
+    ];
+    // D3 mode badge: which flat/breakdown mode is active, and whether its
+    // summary is still the live provisional one — same style as the
+    // hardlink footer note (italic, accent color).
+    if let Some(text) = mode_badge_text(ui.mode(), ui.flat_summary()) {
+        spans.push(Span::from("  ·  "));
+        spans.push(Span::from(text).fg(theme.color(theme::ACCENT)).italic());
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 
     // Path starts right after " " + signature + "  " on the header line.
     let path_col = area.x + (1 + signature.chars().count() + 2) as u16;
@@ -1340,6 +1630,26 @@ fn draw_header(
             (path_col + start as u16, path_col + end as u16, target)
         })
         .collect()
+}
+
+/// The D3 mode badge text for the header line, or `None` in tree mode
+/// (nothing to badge). Mirrors the hardlink footer note's own
+/// "provisional totals... corrected at scan end" framing: the summary is
+/// still the live accumulator's, not the authoritative post-scan fold.
+/// The truncation line ("top N shown") is a separate footer note (see
+/// [`draw_footer`]) — distinct information from provenance, worth its own
+/// line rather than one badge carrying both.
+fn mode_badge_text(mode: ViewMode, summary: Option<&flat::FlatSummary>) -> Option<String> {
+    let label = match mode {
+        ViewMode::Tree => return None,
+        ViewMode::FlatTop => "flat top files",
+        ViewMode::Breakdown => "pattern breakdown",
+    };
+    let mut text = label.to_owned();
+    if summary.is_some_and(|s| s.provisional) {
+        text.push_str(" — provisional, updates live during the scan");
+    }
+    Some(text)
 }
 
 /// Metric cards row: total real · entries · errors · hardlinks, one
@@ -1620,6 +1930,318 @@ fn draw_table(
     }
 }
 
+/// `t` mode: the flat top-files table (D3). Columns: mark, `⛓` hardlink
+/// badge, real size, optional apparent size, % of the whole scan, bar,
+/// name/path. Mid-scan (no frozen arena yet, see `flatview`'s module doc)
+/// the last column shows the basename alone — real data, not a
+/// placeholder — widening to the full path (abbreviated like the
+/// breadcrumb) once the scan completes. Rows are real arena nodes:
+/// marking and Enter-jump act on them exactly like a tree row (see
+/// `try_toggle_mark_flat`/`try_jump_flat_row`), though both stay gated to
+/// post-scan since they need a real path. Returns the same
+/// [`TableGeometry`] shape as [`draw_table`] (mouse hit-testing is
+/// mode-agnostic) plus the [`WheelSource`] built from the same rows/order,
+/// so the donut can never disagree with what's on screen.
+#[allow(clippy::too_many_arguments)]
+fn draw_flat_table(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    ui: &UiState,
+    outcome: Option<&ScanOutcome>,
+    table_state: &mut TableState,
+    scan_disk_total: u64,
+    bar_progress: f64,
+    ctx: &RenderCtx,
+) -> (TableGeometry, WheelSource) {
+    let theme = &ctx.theme;
+    let sort = ui.sort();
+    let arrow = |key: SortKey| -> &'static str {
+        if sort.key != key {
+            ""
+        } else if sort.descending {
+            if ctx.ascii() { "v" } else { "▼" }
+        } else if ctx.ascii() {
+            "^"
+        } else {
+            "▲"
+        }
+    };
+
+    let flat_rows = ui
+        .flat_summary()
+        .map(|summary| flatview::flat_rows(summary, outcome))
+        .unwrap_or_default();
+    let order = flatview::sort_flat_rows(&flat_rows, sort);
+    let disks: Vec<u64> = flat_rows.iter().map(|row| row.disk).collect();
+    let ranks = theme::assign_identity(&disks, theme::IDENTITY_LEN);
+
+    let header_cells = vec![
+        Cell::from(" "),
+        Cell::from("⛓"),
+        Cell::from(format!("real{}", arrow(SortKey::Disk))),
+        Cell::from(format!("apparent{}", arrow(SortKey::Apparent))),
+        Cell::from("%"),
+        Cell::from(""),
+        Cell::from(format!("name/path{}", arrow(SortKey::Name))),
+    ];
+    let widths = [
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(6),
+        Constraint::Length(BAR_WIDTH as u16),
+        Constraint::Min(10),
+    ];
+    // Every fixed-width column above, so the path column's actual share
+    // (`Constraint::Min(10)`) can be computed here for abbreviation (D3:
+    // "path, abbreviated like the breadcrumb does") — same idiom
+    // `draw_wheel`'s caption already uses for the viewed directory's path.
+    const FIXED_COLUMNS_WIDTH: u16 = 1 + 1 + 10 + 10 + 6 + BAR_WIDTH as u16;
+    let path_width = area.width.saturating_sub(FIXED_COLUMNS_WIDTH) as usize;
+
+    let muted = theme.color(theme::MUTED);
+    let coral = theme.color(theme::ERROR);
+    let table_rows = order.iter().map(|&index| {
+        let row = &flat_rows[index];
+        let marked = ui.is_marked(row.node);
+        let mark = if marked {
+            Span::from("*").fg(coral).bold()
+        } else {
+            Span::raw(" ")
+        };
+        let badge = if row.hardlink {
+            Span::from("⛓").fg(theme.color(theme::MAUVE))
+        } else {
+            Span::raw(" ")
+        };
+        let frac = if scan_disk_total > 0 {
+            row.disk as f64 / scan_disk_total as f64
+        } else {
+            0.0
+        };
+        let pct = if scan_disk_total > 0 {
+            format!("{:5.1}", 100.0 * frac)
+        } else {
+            format!("{:>5}", "-")
+        };
+        let identity = ranks
+            .get(index)
+            .copied()
+            .flatten()
+            .map(|rank| theme.identity(rank));
+        let bar = Span::from(wheel::proportion_bar(
+            frac * bar_progress,
+            BAR_WIDTH,
+            ctx.ascii(),
+        ))
+        .fg(identity.unwrap_or(muted));
+        // Post-scan: the full path, abbreviated like the breadcrumb.
+        // Mid-scan (no frozen arena yet): the basename alone — real data
+        // straight off `TopFile.name`, not a placeholder (D3/flatview's
+        // module doc).
+        let path_text = match &row.path {
+            Some(p) => fmt::abbreviate_path(&p.display().to_string(), path_width),
+            None => fmt::abbreviate_path(&row.name, path_width),
+        };
+        let path = Span::from(path_text);
+        let path = if marked {
+            path.fg(coral)
+        } else if let Some(color) = identity {
+            path.fg(color)
+        } else {
+            path
+        };
+        let apparent = row
+            .apparent
+            .map(|a| HumanSize(a).to_string())
+            .unwrap_or_else(|| "-".to_owned());
+        TableRow::new(vec![
+            Cell::from(mark),
+            Cell::from(badge),
+            Cell::from(format!("{:>9}", HumanSize(row.disk).to_string())),
+            Cell::from(format!("{apparent:>9}")),
+            Cell::from(pct),
+            Cell::from(bar),
+            Cell::from(path),
+        ])
+    });
+    let table = Table::new(table_rows, widths)
+        .header(
+            TableRow::new(header_cells).style(
+                Style::new()
+                    .fg(theme.color(theme::MUTED))
+                    .add_modifier(Modifier::UNDERLINED),
+            ),
+        )
+        .row_highlight_style(theme.selection_style());
+    frame.render_stateful_widget(table, area, table_state);
+    let geometry = TableGeometry {
+        x: area.x,
+        y: area.y + 1,
+        width: area.width,
+        height: area.height.saturating_sub(1),
+        offset: table_state.offset(),
+    };
+    let slice_rows: Vec<(u64, Option<usize>)> = order
+        .iter()
+        .map(|&index| (flat_rows[index].disk, ranks.get(index).copied().flatten()))
+        .collect();
+    let wheel_source = WheelSource {
+        slice_rows,
+        total: scan_disk_total,
+        caption: "flat top files".to_owned(),
+    };
+    (geometry, wheel_source)
+}
+
+/// `b` mode: the pattern-breakdown table (D3/D1). Columns: label, kind
+/// (dir-pattern/file-pattern/blank for the uncategorized row), total,
+/// entry count, % of the breakdown's own total. The trailing uncategorized
+/// row ([`flatview::breakdown_rows`]) is always shown but never given an
+/// identity rank or a wheel slice of its own — D1's disjoint-partition
+/// invariant means the wheel's automatic "unaccounted" remainder already
+/// equals it exactly, so excluding it from `slice_rows` here is what
+/// produces the correct gray "uncategorized" wedge (attack finding 2's
+/// fix) instead of a second, redundant colored one.
+fn draw_breakdown_table(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    ui: &UiState,
+    table_state: &mut TableState,
+    bar_progress: f64,
+    ctx: &RenderCtx,
+) -> (TableGeometry, WheelSource) {
+    let theme = &ctx.theme;
+    let sort = ui.sort();
+    let arrow = |key: SortKey| -> &'static str {
+        if sort.key != key {
+            ""
+        } else if sort.descending {
+            if ctx.ascii() { "v" } else { "▼" }
+        } else if ctx.ascii() {
+            "^"
+        } else {
+            "▲"
+        }
+    };
+
+    let rows = ui
+        .flat_summary()
+        .map(flatview::breakdown_rows)
+        .unwrap_or_default();
+    let order = flatview::sort_breakdown_rows(&rows, sort);
+    let total_disk = ui
+        .flat_summary()
+        .map(flatview::breakdown_total_disk)
+        .unwrap_or(0);
+    // Every row except the trailing uncategorized one gets a rank (never
+    // that one — see the function doc); `rows.len() - 1` is always the
+    // uncategorized row's position (`flatview::breakdown_rows` appends it
+    // last, unconditionally).
+    let group_disks: Vec<u64> = rows
+        .iter()
+        .take(rows.len().saturating_sub(1))
+        .map(|row| row.disk)
+        .collect();
+    let mut ranks = theme::assign_identity(&group_disks, theme::IDENTITY_LEN);
+    ranks.push(None);
+
+    let header_cells = vec![
+        Cell::from(format!("label{}", arrow(SortKey::Name))),
+        Cell::from("kind"),
+        Cell::from(format!("real{}", arrow(SortKey::Disk))),
+        Cell::from(format!("apparent{}", arrow(SortKey::Apparent))),
+        Cell::from(format!("entries{}", arrow(SortKey::Items))),
+        Cell::from("%"),
+        Cell::from(""),
+    ];
+    let widths = [
+        Constraint::Min(16),
+        Constraint::Length(5),
+        Constraint::Length(10),
+        Constraint::Length(10),
+        Constraint::Length(9),
+        Constraint::Length(6),
+        Constraint::Length(BAR_WIDTH as u16),
+    ];
+
+    let muted = theme.color(theme::MUTED);
+    let table_rows = order.iter().map(|&index| {
+        let row = &rows[index];
+        let kind = match row.kind {
+            Some(flat::PatternKind::Dir) => "dir/",
+            Some(flat::PatternKind::File) => "file",
+            None => "",
+        };
+        let pct = flatview::breakdown_percent(row, total_disk);
+        let pct_text = if total_disk > 0 {
+            format!("{pct:5.1}")
+        } else {
+            format!("{:>5}", "-")
+        };
+        let identity = ranks
+            .get(index)
+            .copied()
+            .flatten()
+            .map(|rank| theme.identity(rank));
+        let bar = Span::from(wheel::proportion_bar(
+            (pct / 100.0) * bar_progress,
+            BAR_WIDTH,
+            ctx.ascii(),
+        ))
+        .fg(identity.unwrap_or(muted));
+        let label = Span::from(row.label.clone());
+        let label = if let Some(color) = identity {
+            label.fg(color)
+        } else {
+            label
+        };
+        TableRow::new(vec![
+            Cell::from(label),
+            Cell::from(kind),
+            Cell::from(format!("{:>9}", HumanSize(row.disk).to_string())),
+            Cell::from(format!("{:>9}", HumanSize(row.apparent).to_string())),
+            Cell::from(format!("{:>8}", row.entries)),
+            Cell::from(pct_text),
+            Cell::from(bar),
+        ])
+    });
+    let table = Table::new(table_rows, widths)
+        .header(
+            TableRow::new(header_cells).style(
+                Style::new()
+                    .fg(theme.color(theme::MUTED))
+                    .add_modifier(Modifier::UNDERLINED),
+            ),
+        )
+        .row_highlight_style(theme.selection_style());
+    frame.render_stateful_widget(table, area, table_state);
+    let geometry = TableGeometry {
+        x: area.x,
+        y: area.y + 1,
+        width: area.width,
+        height: area.height.saturating_sub(1),
+        offset: table_state.offset(),
+    };
+    // The uncategorized row is excluded from the donut's own rows (see the
+    // function doc): its share reaches the wheel only as the automatic
+    // "unaccounted" remainder `build_slices` computes from `total -
+    // sum(slice_rows)`, which — thanks to D1's disjoint partition — is
+    // exactly `summary.rest`, never an overlap artifact.
+    let slice_rows: Vec<(u64, Option<usize>)> = order
+        .iter()
+        .filter(|&&index| rows[index].kind.is_some())
+        .map(|&index| (rows[index].disk, ranks.get(index).copied().flatten()))
+        .collect();
+    let wheel_source = WheelSource {
+        slice_rows,
+        total: total_disk,
+        caption: "pattern breakdown".to_owned(),
+    };
+    (geometry, wheel_source)
+}
+
 /// Selection card under the table: humanized mtime, item count, share of
 /// the parent, error count for the row under the cursor — or the
 /// mouse-hovered row while the pointer sits over the table.
@@ -1682,38 +2304,46 @@ fn draw_selection_card(frame: &mut Frame<'_>, area: Rect, ui: &UiState, ctx: &Re
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// The donut camembert: the viewed directory's children as slices, in the
-/// current sort order, colored with the same identity colors as the
-/// table. Small/unranked slices merge into a gray rest slice; under the
-/// wheel: the viewed path (abbreviated) and its total.
+/// The donut's data source for the current frame (D3): the same
+/// `(disk, identity rank)` rows and total the table used, in display
+/// order — so `slice_rows`' position doubles as the cursor position a
+/// click on that slice should land on, whichever mode built it. `caption`
+/// is the un-abbreviated text to show under the donut (a directory path
+/// in tree mode, a short mode label in flat/breakdown mode — see
+/// [`draw_wheel`], which abbreviates it to fit).
+#[derive(Debug, Clone, Default)]
+struct WheelSource {
+    slice_rows: Vec<(u64, Option<usize>)>,
+    total: u64,
+    caption: String,
+}
+
+/// The donut camembert: `source`'s rows as slices, colored with the same
+/// identity colors as the table they came from. Small/unranked slices
+/// merge into a gray rest slice (in breakdown mode this is exactly D1's
+/// disjoint "everything matched by no group", since the rest bucket is
+/// never itself one of `source`'s rows — see
+/// [`draw_breakdown_table`]); under the wheel: `source.caption`
+/// (abbreviated) and its total.
 fn draw_wheel(
     frame: &mut Frame<'_>,
     area: Rect,
-    ui: &UiState,
-    ranks: &[Option<usize>],
+    source: &WheelSource,
     motion: &mut anim::Motion,
     ctx: &RenderCtx,
 ) -> Option<WheelGeometry> {
     let theme = &ctx.theme;
-    let snapshot = ui.snapshot();
     let block = card_block(ctx).border_style(Style::new().fg(theme.color(theme::MUTED)));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width < 4 || inner.height < 4 {
         return None;
     }
-    // Reserve the bottom two lines for path + total.
+    // Reserve the bottom two lines for caption + total.
     let [donut_area, caption_area] =
         Layout::vertical([Constraint::Min(2), Constraint::Length(2)]).areas(inner);
 
-    // Same rows, same order, same identity ranks as the table — and, since
-    // `slice_rows` is built in cursor/display order, its position doubles
-    // as the cursor position a click on that slice should land on.
-    let slice_rows: Vec<(u64, Option<usize>)> = ui
-        .rows_indexed()
-        .map(|(index, row)| (row.disk, ranks.get(index).copied().flatten()))
-        .collect();
-    let (target_fracs, slice_ranks) = wheel::build_slices(&slice_rows, snapshot.totals.disk);
+    let (target_fracs, slice_ranks) = wheel::build_slices(&source.slice_rows, source.total);
     // Donut morph (design slice 5): eases from whatever was last drawn
     // into `target_fracs` on a navigation/sort — during a live scan the
     // donut already grows continuously and `motion` never triggers (see
@@ -1743,7 +2373,7 @@ fn draw_wheel(
         };
         blit_wheel(frame, donut_area, &cells, &colors);
 
-        let targets = wheel::build_slice_targets(&slice_rows, snapshot.totals.disk);
+        let targets = wheel::build_slice_targets(&source.slice_rows, source.total);
         let (width, height) = (donut_area.width as usize, donut_area.height as usize);
         let mut cell_slices = vec![None; width * height];
         for (row, line) in cells.iter().enumerate().take(height) {
@@ -1764,13 +2394,13 @@ fn draw_wheel(
     let caption = vec![
         Line::from(
             Span::from(fmt::abbreviate_path(
-                &snapshot.path.display().to_string(),
+                &source.caption,
                 inner.width.saturating_sub(2) as usize,
             ))
             .fg(theme.color(theme::MUTED)),
         )
         .alignment(Alignment::Center),
-        Line::from(Span::from(HumanSize(snapshot.totals.disk).to_string()).bold())
+        Line::from(Span::from(HumanSize(source.total).to_string()).bold())
             .alignment(Alignment::Center),
     ];
     frame.render_widget(Paragraph::new(caption), caption_area);
@@ -1793,8 +2423,7 @@ fn draw_wheel(
 fn draw_mini_donut(
     frame: &mut Frame<'_>,
     header_area: Rect,
-    ui: &UiState,
-    ranks: &[Option<usize>],
+    source: &WheelSource,
     motion: &mut anim::Motion,
     ctx: &RenderCtx,
 ) {
@@ -1808,12 +2437,7 @@ fn draw_mini_donut(
         height: 1,
     };
     let theme = &ctx.theme;
-    let snapshot = ui.snapshot();
-    let slice_rows: Vec<(u64, Option<usize>)> = ui
-        .rows_indexed()
-        .map(|(index, row)| (row.disk, ranks.get(index).copied().flatten()))
-        .collect();
-    let (target_fracs, slice_ranks) = wheel::build_slices(&slice_rows, snapshot.totals.disk);
+    let (target_fracs, slice_ranks) = wheel::build_slices(&source.slice_rows, source.total);
     let fracs = motion.donut_fracs(&target_fracs);
     if fracs.is_empty() {
         return;
@@ -1910,15 +2534,37 @@ fn draw_footer(
     if show_updating_note(snapshot) {
         push_note(&mut notes, "updating…".italic().dim());
     }
-    let footer = Paragraph::new(vec![
-        Line::from(
+    // D3 / attack finding 5: a silent cap is exactly the dishonesty this
+    // tool exists to avoid — name the cap and where to change it.
+    if ui.mode() == ViewMode::FlatTop
+        && let Some(summary) = ui.flat_summary()
+        && summary.truncated
+    {
+        push_note(
+            &mut notes,
+            Span::from(format!(
+                "top {} shown — flat_cap in camembert.toml",
+                summary.top_files.len()
+            ))
+            .fg(theme.color(theme::ACCENT))
+            .italic(),
+        );
+    }
+    let hints = match ui.mode() {
+        ViewMode::Tree => {
             " ↑↓/jk move · ⏎/l/→ open · ⌫/h/← up · g/G ends · d/a/n/m/c/e sort · p apparent · \
-             Space mark · u unmark · v review · D delete · ? help · q quit"
-                .dim(),
-        ),
-        Line::from(notes),
-    ])
-    .alignment(Alignment::Left);
+             Space mark · u unmark · v review · D delete · t/b flat/breakdown · ? help · q quit"
+        }
+        ViewMode::FlatTop => {
+            " ↑↓/jk move · ⏎/l/→ jump to directory · g/G ends · d/a/n sort · p apparent · \
+             Space mark · u unmark · v review · D delete · t back to tree · ? help · q quit"
+        }
+        ViewMode::Breakdown => {
+            " ↑↓/jk move · g/G ends · d/a/n/c sort · p apparent · b back to tree · ? help · q quit"
+        }
+    };
+    let footer =
+        Paragraph::new(vec![Line::from(hints.dim()), Line::from(notes)]).alignment(Alignment::Left);
     frame.render_widget(footer, area);
 }
 
@@ -2458,6 +3104,7 @@ mod tests {
             }),
             animate: true,
             no_proc_sweep: false,
+            flat_config: FlatConfig::default(),
         }
     }
 
@@ -2499,6 +3146,7 @@ mod tests {
                         draw(
                             frame,
                             &ui,
+                            &Phase::Transitioning,
                             &mut table_state,
                             '⠋',
                             Some("note"),
@@ -2510,6 +3158,95 @@ mod tests {
                     .unwrap();
             }
         }
+    }
+
+    /// D3: the flat top-files and breakdown tables (and their donut)
+    /// render without panicking at every size/capability rung, both with
+    /// a populated summary and with none at all yet (mode entered before
+    /// the first summary arrives) — mirrors
+    /// `draw_never_panics_across_sizes_and_caps` for the two new modes.
+    #[test]
+    fn flat_and_breakdown_modes_never_panic_across_sizes_and_caps() {
+        let sizes = [
+            (120, 35),
+            (100, 30),
+            (80, 24),
+            (40, 10),
+            (10, 5),
+            (3, 2),
+            (1, 1),
+        ];
+        let rungs = [
+            (GlyphLevel::Sextant, ColorLevel::Truecolor),
+            (GlyphLevel::Ascii, ColorLevel::Mono),
+        ];
+        for populated in [false, true] {
+            for mode_key in [KeyCode::Char('t'), KeyCode::Char('b')] {
+                for (width, height) in sizes {
+                    for (glyphs, color) in rungs {
+                        let ctx = ctx(glyphs, color);
+                        let mut ui = UiState::new(sample_snapshot());
+                        keymap::dispatch_simple(mode_key, &mut ui);
+                        if populated {
+                            ui.set_flat_summary(flat_summary_test_fixture());
+                        }
+                        let mut table_state = TableState::default();
+                        let mut motion = no_motion();
+                        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                        terminal
+                            .draw(|frame| {
+                                draw(
+                                    frame,
+                                    &ui,
+                                    &Phase::Transitioning,
+                                    &mut table_state,
+                                    '⠋',
+                                    None,
+                                    &[],
+                                    &mut motion,
+                                    &ctx,
+                                );
+                            })
+                            .unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    fn flat_summary_test_fixture() -> Arc<flat::FlatSummary> {
+        use camembert_core::flat::{GroupTotal, PatternKind, RestTotal, TopFile};
+        Arc::new(flat::FlatSummary {
+            groups: vec![GroupTotal {
+                label: "node_modules".to_owned(),
+                kind: PatternKind::Dir,
+                apparent: 100,
+                disk: 100,
+                entries: 2,
+            }],
+            rest: RestTotal {
+                apparent: 50,
+                disk: 50,
+                entries: 1,
+            },
+            top_files: vec![
+                TopFile {
+                    node: NodeId::from_raw(1),
+                    name: "file1".into(),
+                    disk: 900,
+                    hardlink: false,
+                },
+                TopFile {
+                    node: NodeId::from_raw(2),
+                    name: "file2".into(),
+                    disk: 500,
+                    hardlink: true,
+                },
+            ],
+            truncated: true,
+            provisional: false,
+            epoch: 0,
+        })
     }
 
     /// Wide terminal: the full side wheel panel renders half-block
@@ -2529,6 +3266,7 @@ mod tests {
                     draw(
                         frame,
                         &ui,
+                        &Phase::Transitioning,
                         &mut table_state,
                         '⠋',
                         None,
@@ -2633,6 +3371,7 @@ mod tests {
                 geometry = draw(
                     frame,
                     &ui,
+                    &Phase::Transitioning,
                     &mut table_state,
                     '⠋',
                     None,
@@ -2659,6 +3398,7 @@ mod tests {
                 geometry = draw(
                     frame,
                     &ui,
+                    &Phase::Transitioning,
                     &mut table_state,
                     '⠋',
                     None,
@@ -2698,6 +3438,7 @@ mod tests {
                 draw(
                     frame,
                     &ui,
+                    &Phase::Transitioning,
                     &mut table_state,
                     '|',
                     None,
@@ -2729,6 +3470,7 @@ mod tests {
                 draw(
                     frame,
                     ui,
+                    &Phase::Transitioning,
                     &mut table_state,
                     '⠋',
                     flash,
@@ -2817,6 +3559,7 @@ mod tests {
                     draw(
                         frame,
                         &ui,
+                        &Phase::Transitioning,
                         &mut table_state,
                         '⠋',
                         None,
@@ -2853,6 +3596,7 @@ mod tests {
                     draw(
                         frame,
                         &ui,
+                        &Phase::Transitioning,
                         &mut table_state,
                         '⠋',
                         None,
@@ -2958,6 +3702,181 @@ mod tests {
         );
         assert!(ui.review().is_none(), "D closed the review list");
         assert!(ui.confirm().is_some(), "D opened the confirm modal");
+    }
+
+    // ---- D3 flat view + pattern breakdown: mode/Esc state machine,
+    // epoch recompute on delete, flat-row jump mapping ----
+
+    /// A `Phase::Done` UI over a tempdir with two files of very different
+    /// sizes ("big", "small"), cursor at the top — ready for flat-view
+    /// tests that need a real arena (jump-to-dir, marking, epoch
+    /// recompute).
+    /// Returns the `TempDir` guard too (unlike `done_ui_with_one_file`,
+    /// which never actually executes a real deletion in its callers): a
+    /// test that presses `y` for real needs the directory to still exist
+    /// on disk at that point, and `TempDir` removes it on `Drop` — so the
+    /// guard must outlive the whole test, not just this constructor.
+    fn done_ui_with_two_files() -> (UiState, Phase, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("big"), vec![0u8; 8192]).expect("write big");
+        std::fs::write(tmp.path().join("small"), vec![0u8; 16]).expect("write small");
+        let outcome = scan_dir(tmp.path());
+        let stats = view::scan_stats(outcome.tree(), outcome.root(), outcome.elapsed);
+        let snapshot = view::build_snapshot(
+            outcome.tree(),
+            outcome.root(),
+            1,
+            stats,
+            outcome.hardlink_inodes,
+            false,
+        );
+        let ui = UiState::new(Arc::new(snapshot));
+        (ui, Phase::Done(Box::new(outcome)), tmp)
+    }
+
+    /// `t`/`b` toggle into and back out of their modes through the real
+    /// key handler, and `Esc` is contextual: it leaves a flat/breakdown
+    /// mode instead of quitting, but still quits from tree view (D3).
+    #[test]
+    fn t_b_and_contextual_esc_state_machine_through_handle_key() {
+        let (mut ui, mut phase) = done_ui_with_one_file();
+        let (mut generation, mut flash, mut toasts) = (1u64, Flash::new(), ToastQueue::new());
+        let mut press_code = |code, ui: &mut UiState, phase: &mut Phase| {
+            press(code, ui, phase, &mut generation, &mut flash, &mut toasts)
+        };
+
+        assert_eq!(ui.mode(), ViewMode::Tree);
+        press_code(KeyCode::Char('t'), &mut ui, &mut phase);
+        assert_eq!(ui.mode(), ViewMode::FlatTop);
+
+        // Esc leaves the mode — does not quit.
+        let action = press_code(KeyCode::Esc, &mut ui, &mut phase);
+        assert!(matches!(action, Action::Continue), "Esc did not quit");
+        assert_eq!(ui.mode(), ViewMode::Tree, "Esc left the mode");
+
+        // From tree view, Esc quits.
+        let action = press_code(KeyCode::Esc, &mut ui, &mut phase);
+        assert!(matches!(action, Action::Quit), "Esc quits from tree view");
+
+        // `b` toggles breakdown the same way; `q` always quits, mode or
+        // not (D3: "q always quits").
+        press_code(KeyCode::Char('b'), &mut ui, &mut phase);
+        assert_eq!(ui.mode(), ViewMode::Breakdown);
+        let action = press_code(KeyCode::Char('q'), &mut ui, &mut phase);
+        assert!(matches!(action, Action::Quit), "q quits even mid-mode");
+    }
+
+    /// Sort keys the active mode has no column for are refused with a
+    /// flash instead of silently reordering nothing (D3): `m` (mtime) in
+    /// breakdown mode, where a group total has no mtime.
+    #[test]
+    fn sort_key_not_applicable_in_a_mode_flashes_instead_of_applying() {
+        let (mut ui, mut phase) = done_ui_with_one_file();
+        let (mut generation, mut flash, mut toasts) = (1u64, Flash::new(), ToastQueue::new());
+        ui.toggle_breakdown();
+        let before = ui.sort();
+
+        press(
+            KeyCode::Char('m'),
+            &mut ui,
+            &mut phase,
+            &mut generation,
+            &mut flash,
+            &mut toasts,
+        );
+        assert_eq!(ui.sort(), before, "mtime sort did not apply in breakdown");
+        assert_eq!(flash.current(), Some(SORT_NOT_APPLICABLE));
+    }
+
+    /// The attack's exact scenario (finding 1): mark a flat row, delete it
+    /// *from within* flat mode, and confirm the very next render-time
+    /// check recomputes the summary — the deleted file must never appear
+    /// as still occupying space.
+    #[test]
+    fn epoch_recompute_removes_a_file_deleted_from_within_flat_mode() {
+        let (mut ui, mut phase, _tmp) = done_ui_with_two_files();
+        let flat_config = FlatConfig::default();
+        let (mut generation, mut flash, mut toasts) = (1u64, Flash::new(), ToastQueue::new());
+        let mut press_code = |code, ui: &mut UiState, phase: &mut Phase| {
+            press(code, ui, phase, &mut generation, &mut flash, &mut toasts)
+        };
+
+        press_code(KeyCode::Char('t'), &mut ui, &mut phase);
+        assert_eq!(ui.mode(), ViewMode::FlatTop);
+        ensure_flat_summary_fresh(&phase, &flat_config, &mut ui);
+        let summary = ui.flat_summary().expect("summary computed post-scan");
+        assert!(!summary.provisional);
+        assert_eq!(summary.top_files.len(), 2, "both files present up front");
+
+        // Default sort is disk descending: the cursor starts on "big".
+        // Mark it, delete it, all without ever leaving flat mode.
+        press_code(KeyCode::Char(' '), &mut ui, &mut phase);
+        assert_eq!(ui.marked_summary().map(|(n, _)| n), Some(1));
+        press_code(KeyCode::Char('D'), &mut ui, &mut phase);
+        assert!(ui.confirm().is_some(), "confirm modal opened");
+        press_code(KeyCode::Char('y'), &mut ui, &mut phase);
+        assert!(ui.confirm().is_none(), "deletion executed");
+
+        // The render-time epoch check (`event_loop` step 3.5) must
+        // recompute before the very next frame draws.
+        ensure_flat_summary_fresh(&phase, &flat_config, &mut ui);
+        let summary = ui
+            .flat_summary()
+            .expect("summary recomputed after the delete");
+        assert_eq!(
+            summary.top_files.len(),
+            1,
+            "the deleted file is gone from the very next frame"
+        );
+        assert!(!summary.provisional, "authoritative, not a stale snapshot");
+    }
+
+    /// Enter on a flat top-files row jumps to its containing directory,
+    /// cursor on the file itself (D3) — exercised over a real nested
+    /// arena so the ancestor-chain walk and the node lookup are both real.
+    #[test]
+    fn enter_on_a_flat_row_jumps_to_its_containing_directory() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(tmp.path().join("sub")).expect("mkdir sub");
+        std::fs::write(tmp.path().join("sub/big"), vec![0u8; 8192]).expect("write big");
+        std::fs::write(tmp.path().join("tiny"), vec![0u8; 4]).expect("write tiny");
+        let outcome = scan_dir(tmp.path());
+        let stats = view::scan_stats(outcome.tree(), outcome.root(), outcome.elapsed);
+        let snapshot = view::build_snapshot(
+            outcome.tree(),
+            outcome.root(),
+            1,
+            stats,
+            outcome.hardlink_inodes,
+            false,
+        );
+        let mut ui = UiState::new(Arc::new(snapshot));
+        let mut phase = Phase::Done(Box::new(outcome));
+        let flat_config = FlatConfig::default();
+        let (mut generation, mut flash, mut toasts) = (1u64, Flash::new(), ToastQueue::new());
+        let mut press_code = |code, ui: &mut UiState, phase: &mut Phase| {
+            press(code, ui, phase, &mut generation, &mut flash, &mut toasts)
+        };
+
+        press_code(KeyCode::Char('t'), &mut ui, &mut phase);
+        ensure_flat_summary_fresh(&phase, &flat_config, &mut ui);
+        // Disk-desc default: "sub/big" is the cursor's row.
+        press_code(KeyCode::Enter, &mut ui, &mut phase);
+        assert_eq!(ui.mode(), ViewMode::Tree, "jumping leaves the mode");
+
+        // Resolve the pending nav the same way `event_loop` step 3 would.
+        let dir = ui.pending_nav().expect("jump requested a nav");
+        serve_local(&phase, dir, &mut generation, &mut ui);
+        assert_eq!(
+            ui.snapshot().path.file_name().and_then(|n| n.to_str()),
+            Some("sub"),
+            "landed in the containing directory"
+        );
+        assert_eq!(
+            &*ui.selected().expect("cursor on a row").name,
+            b"big",
+            "cursor on the file itself, not the top of the listing"
+        );
     }
 
     /// `?` opens the cheatsheet from the main view; `?`/`Esc` closes it.
@@ -3285,6 +4204,7 @@ mod tests {
                     draw(
                         frame,
                         ui,
+                        &Phase::Transitioning,
                         &mut table_state,
                         '⠋',
                         None,

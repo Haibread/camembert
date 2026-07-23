@@ -7,11 +7,26 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use camembert_core::flat::FlatSummary;
 use camembert_core::freeable::Ledger;
 use camembert_core::tree::{DirId, NodeId};
 use camembert_core::view::{Row, ViewSnapshot};
 
 use super::freeable_panel::{FreeableGroup, OpenWarning};
+
+/// Which table mode is active (D3, `docs/design/flat-view-decisions.md`):
+/// the tree browser, or one of the two flat-view modes toggled by `t`/`b`.
+/// Cards, gauge, basket and footer stay in place across all three — only
+/// the table (and the donut's data source) change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ViewMode {
+    #[default]
+    Tree,
+    /// `t`: flat top files across the whole scan.
+    FlatTop,
+    /// `b`: pattern breakdown (disjoint groups + uncategorized rest, D1).
+    Breakdown,
+}
 
 /// Column a view is sorted by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -273,6 +288,14 @@ pub struct UiState {
     pending_nav: Option<DirId>,
     /// Cursor to adopt when the pending snapshot arrives.
     pending_cursor: usize,
+    /// Node to put the cursor on once the pending nav resolves, when it
+    /// isn't just `pending_cursor`'s position 0 — set by
+    /// [`Self::jump_to_directory`] (Enter on a flat row, D3: "jumps to its
+    /// containing directory... cursor on the file"). Cleared the instant
+    /// it is consumed or superseded by an unrelated snapshot arriving
+    /// first (see [`Self::apply_snapshot`]) so it can never misapply to
+    /// the wrong directory's rows.
+    pending_focus_node: Option<NodeId>,
     /// Directories descended through: `(dir, cursor within it)`, so going
     /// back up restores the cursor.
     stack: Vec<(DirId, usize)>,
@@ -333,6 +356,23 @@ pub struct UiState {
     /// same feedback idiom `set_geometry` already uses for mouse
     /// hit-testing.
     freeable_cursor: usize,
+    /// Active table mode (D3): tree, flat top files, or pattern breakdown.
+    mode: ViewMode,
+    /// Current flat-view summary: the live provisional accumulator
+    /// snapshot while scanning, the authoritative post-scan fold once
+    /// done — `ui.rs` decides which and calls [`Self::set_flat_summary`]
+    /// (during a scan: every frame, mirroring the tree snapshot; post-scan:
+    /// only when [`Self::flat_epoch`] disagrees with the cached summary's
+    /// own `epoch`, i.e. a render-time check, never "on first `t`/`b`" —
+    /// see the attack finding this exists to close). `None` before the
+    /// first summary of either kind has arrived.
+    flat: Option<Arc<FlatSummary>>,
+    /// Bumped by [`Self::bump_flat_epoch`] after every successful deletion
+    /// (D2/D3): the flat/breakdown summary is recomputed whenever this
+    /// disagrees with the cached summary's `epoch`, so a delete performed
+    /// *from within* a flat/breakdown mode can never leave a stale,
+    /// already-deleted row on screen past the very next frame.
+    flat_epoch: u64,
 }
 
 impl UiState {
@@ -345,6 +385,7 @@ impl UiState {
             order_key: None,
             pending_nav: None,
             pending_cursor: 0,
+            pending_focus_node: None,
             stack: Vec::new(),
             show_apparent: true,
             marks: Vec::new(),
@@ -361,6 +402,9 @@ impl UiState {
             freeable_groups_built: false,
             freeable_open: false,
             freeable_cursor: 0,
+            mode: ViewMode::default(),
+            flat: None,
+            flat_epoch: 0,
         };
         state.ensure_sorted();
         state
@@ -441,16 +485,30 @@ impl UiState {
     /// re-sort when the generation/dir/sort changed, clamp the cursor.
     pub fn apply_snapshot(&mut self, snapshot: Arc<ViewSnapshot>) {
         let dir_changed = snapshot.dir != self.snapshot.dir;
+        let mut focus = None;
         if self.pending_nav == Some(snapshot.dir) {
             self.pending_nav = None;
             self.cursor = self.pending_cursor;
+            focus = self.pending_focus_node.take();
         } else if dir_changed {
             // A dir change we did not ask for (stale pending overwritten
-            // by a later request): start at the top.
+            // by a later request): start at the top. Any focus request
+            // belonged to a *different* pending nav than the one that
+            // just resolved — discard it rather than misapplying it to
+            // these rows.
             self.cursor = 0;
+            self.pending_focus_node = None;
         }
         self.snapshot = snapshot;
         self.ensure_sorted();
+        if let Some(node) = focus
+            && let Some(position) = self
+                .order
+                .iter()
+                .position(|&i| self.snapshot.rows[i].node == node)
+        {
+            self.cursor = position;
+        }
         self.clamp_cursor();
         // The row set may have changed shape entirely; a stale hover
         // position would describe the wrong row until the mouse moves
@@ -493,7 +551,7 @@ impl UiState {
     }
 
     pub fn move_down(&mut self) {
-        if self.cursor + 1 < self.order.len() {
+        if self.cursor + 1 < self.row_count() {
             self.cursor += 1;
         }
         self.clear_hover();
@@ -510,20 +568,29 @@ impl UiState {
     }
 
     pub fn move_bottom(&mut self) {
-        self.cursor = self.order.len().saturating_sub(1);
+        self.cursor = self.row_count().saturating_sub(1);
         self.clear_hover();
     }
 
-    /// Number of rows in the active (sorted) view.
+    /// Number of rows in the active view: the sorted tree rows in
+    /// [`ViewMode::Tree`], or the flat/breakdown summary's row count in
+    /// the other two modes (top files; groups + the trailing uncategorized
+    /// row) — `0` before the first summary of the relevant kind has
+    /// arrived. Every cursor-bound method below goes through this so mode
+    /// switches never need their own clamping logic.
     pub fn row_count(&self) -> usize {
-        self.order.len()
+        match self.mode {
+            ViewMode::Tree => self.order.len(),
+            ViewMode::FlatTop => self.flat.as_ref().map_or(0, |f| f.top_files.len()),
+            ViewMode::Breakdown => self.flat.as_ref().map_or(0, |f| f.groups.len() + 1),
+        }
     }
 
     /// Move the cursor directly to a display-order position (a mouse
     /// click) — clamped defensively in case the row count changed since
     /// the frame the click's geometry came from.
     pub fn select_at(&mut self, position: usize) {
-        self.cursor = position.min(self.order.len().saturating_sub(1));
+        self.cursor = position.min(self.row_count().saturating_sub(1));
         self.clear_hover();
     }
 
@@ -898,7 +965,153 @@ impl UiState {
     }
 
     fn clamp_cursor(&mut self) {
-        self.cursor = self.cursor.min(self.order.len().saturating_sub(1));
+        self.cursor = self.cursor.min(self.row_count().saturating_sub(1));
+    }
+
+    // ---- flat view + pattern breakdown modes (D3) ----
+
+    pub fn mode(&self) -> ViewMode {
+        self.mode
+    }
+
+    /// Switch modes, resetting the cursor to the top (like a fresh view)
+    /// and clearing the mouse hover — the same "new view" treatment a tree
+    /// navigation gets. A no-op switch to the mode already active leaves
+    /// the cursor alone (so `t` while already in `FlatTop` — handled by
+    /// [`Self::toggle_flat_top`] as a switch *back to Tree* — never
+    /// silently resets position for nothing).
+    pub fn set_mode(&mut self, mode: ViewMode) {
+        if self.mode == mode {
+            return;
+        }
+        self.mode = mode;
+        self.cursor = 0;
+        self.clear_hover();
+        // A mode switch changes every row and slice on screen just like a
+        // navigation or a sort — worth the same reveal/morph flourish
+        // (design slice 5).
+        self.view_change_seq += 1;
+    }
+
+    /// `t`: flat top files. Pressing it again while already in that mode
+    /// returns to the tree (D3's "`t`/`b` toggle back to tree").
+    pub fn toggle_flat_top(&mut self) {
+        let target = if self.mode == ViewMode::FlatTop {
+            ViewMode::Tree
+        } else {
+            ViewMode::FlatTop
+        };
+        self.set_mode(target);
+    }
+
+    /// `b`: pattern breakdown. Pressing it again while already in that
+    /// mode returns to the tree.
+    pub fn toggle_breakdown(&mut self) {
+        let target = if self.mode == ViewMode::Breakdown {
+            ViewMode::Tree
+        } else {
+            ViewMode::Breakdown
+        };
+        self.set_mode(target);
+    }
+
+    /// Contextual Esc's mode-leaving step (D3/attack): back to the tree
+    /// from either flat mode. A no-op from the tree itself — the caller
+    /// only calls this after checking [`Self::mode`] is not already
+    /// [`ViewMode::Tree`] (that case quits instead).
+    pub fn leave_mode(&mut self) {
+        self.set_mode(ViewMode::Tree);
+    }
+
+    /// The flat/breakdown summary currently held (provisional during a
+    /// scan, authoritative post-scan — see the field doc on
+    /// [`Self::flat`]).
+    pub fn flat_summary(&self) -> Option<&FlatSummary> {
+        self.flat.as_deref()
+    }
+
+    /// Adopt a fresh flat-view summary — called every frame during a scan
+    /// (mirroring [`Self::apply_snapshot`]) and, post-scan, only when
+    /// [`Self::flat_epoch`] disagrees with the cached summary (the
+    /// render-time epoch check `ui.rs` performs before drawing a
+    /// flat/breakdown frame).
+    pub fn set_flat_summary(&mut self, summary: Arc<FlatSummary>) {
+        self.flat = Some(summary);
+    }
+
+    /// The deletion epoch marks/deletes have advanced to (see
+    /// [`Self::bump_flat_epoch`]) — compared against the cached summary's
+    /// own `epoch` to decide whether a recompute is due.
+    pub fn flat_epoch(&self) -> u64 {
+        self.flat_epoch
+    }
+
+    /// Advance the deletion epoch (called once per successful deletion,
+    /// regardless of which mode it was performed from) so the very next
+    /// render-time check in `ui.rs` recomputes the flat/breakdown summary
+    /// before drawing — never showing a just-deleted row as still
+    /// occupying space (attack finding 1).
+    pub fn bump_flat_epoch(&mut self) {
+        self.flat_epoch += 1;
+    }
+
+    /// Jump straight to `dir` (Enter on a flat row, D3: "jumps to its
+    /// containing directory in tree view, cursor on the file") — unlike
+    /// [`Self::jump_to_ancestor`], `dir` need not be on the current
+    /// descend stack at all (a flat row can live anywhere in the tree), so
+    /// the caller supplies the *full* root-first ancestor chain above it
+    /// (walked from the frozen arena) to rebuild the breadcrumb stack from
+    /// scratch. `focus` is the node the cursor should land on once the
+    /// directory's rows arrive (resolved in [`Self::apply_snapshot`]).
+    /// Refused (returns `None`), like every other nav request, while
+    /// another one is already in flight.
+    pub fn jump_to_directory(
+        &mut self,
+        dir: DirId,
+        ancestors: Vec<DirId>,
+        focus: NodeId,
+    ) -> Option<DirId> {
+        if self.pending_nav.is_some() {
+            return None;
+        }
+        self.stack = ancestors.into_iter().map(|d| (d, 0)).collect();
+        self.pending_cursor = 0;
+        self.pending_focus_node = Some(focus);
+        self.pending_nav = Some(dir);
+        Some(dir)
+    }
+
+    /// Mark/unmark a flat top-files row by its resolved node/path/disk
+    /// size (D3: "marks work on flat rows — real NodeIds, shared basket").
+    /// Same guard and toggle mechanics as [`Self::toggle_mark`], just fed
+    /// from the caller-resolved flat row instead of a tree [`Row`] (a flat
+    /// row's `NodeId`/path/size only exist once the arena is readable,
+    /// i.e. the caller already has a [`camembert_core::scan::ScanOutcome`]
+    /// in hand). Regular files only (D3), so there is no mount-point
+    /// refusal to make here.
+    pub fn toggle_mark_flat(
+        &mut self,
+        node: NodeId,
+        path: PathBuf,
+        disk: u64,
+    ) -> Result<(), MarkRefusal> {
+        if !self.snapshot.stats.root_complete {
+            return Err(MarkRefusal::ScanRunning);
+        }
+        let entry = MarkedEntry {
+            node,
+            path,
+            is_dir: false,
+            disk,
+        };
+        if self.marked_set.remove(&entry.node) {
+            self.marks.retain(|mark| mark.node != entry.node);
+        } else {
+            self.marked_set.insert(entry.node);
+            self.marks.push(entry);
+        }
+        self.move_down();
+        Ok(())
     }
 }
 
@@ -1701,5 +1914,236 @@ mod tests {
         state.cancel_confirm();
         assert!(state.open_confirm(0, None));
         assert!(state.confirm().unwrap().open_warning.is_none());
+    }
+
+    // ---- `t`/`b` flat view modes + pattern breakdown (D3) ----
+
+    fn flat_summary_fixture() -> Arc<FlatSummary> {
+        use camembert_core::flat::{GroupTotal, PatternKind, RestTotal, TopFile};
+        Arc::new(FlatSummary {
+            groups: vec![GroupTotal {
+                label: "node_modules".to_owned(),
+                kind: PatternKind::Dir,
+                apparent: 100,
+                disk: 100,
+                entries: 2,
+            }],
+            rest: RestTotal {
+                apparent: 50,
+                disk: 50,
+                entries: 1,
+            },
+            top_files: vec![
+                TopFile {
+                    node: NodeId::from_raw(10),
+                    name: "file10".into(),
+                    disk: 900,
+                    hardlink: false,
+                },
+                TopFile {
+                    node: NodeId::from_raw(11),
+                    name: "file11".into(),
+                    disk: 500,
+                    hardlink: true,
+                },
+                TopFile {
+                    node: NodeId::from_raw(12),
+                    name: "file12".into(),
+                    disk: 100,
+                    hardlink: false,
+                },
+            ],
+            truncated: false,
+            provisional: true,
+            epoch: 0,
+        })
+    }
+
+    #[test]
+    fn mode_defaults_to_tree_and_t_b_toggle_back() {
+        let mut state = UiState::new(snapshot(1, 0, None, Vec::new(), true));
+        assert_eq!(state.mode(), ViewMode::Tree);
+
+        state.toggle_flat_top();
+        assert_eq!(state.mode(), ViewMode::FlatTop);
+        state.toggle_flat_top();
+        assert_eq!(state.mode(), ViewMode::Tree, "t again returns to tree");
+
+        state.toggle_breakdown();
+        assert_eq!(state.mode(), ViewMode::Breakdown);
+        state.toggle_breakdown();
+        assert_eq!(state.mode(), ViewMode::Tree, "b again returns to tree");
+
+        // Switching directly from one flat mode to the other (t while in
+        // breakdown) lands on the other mode, not tree.
+        state.toggle_breakdown();
+        state.toggle_flat_top();
+        assert_eq!(state.mode(), ViewMode::FlatTop);
+    }
+
+    #[test]
+    fn leave_mode_is_the_esc_step_and_is_a_no_op_from_tree() {
+        let mut state = UiState::new(snapshot(1, 0, None, Vec::new(), true));
+        state.leave_mode(); // already Tree: no-op
+        assert_eq!(state.mode(), ViewMode::Tree);
+
+        state.toggle_breakdown();
+        state.leave_mode();
+        assert_eq!(
+            state.mode(),
+            ViewMode::Tree,
+            "contextual Esc leaves the mode"
+        );
+    }
+
+    #[test]
+    fn mode_switch_resets_cursor_and_bumps_view_change_seq() {
+        let mut state = UiState::new(snapshot(
+            1,
+            0,
+            None,
+            vec![file_row(b"a", 3, 3, 0), file_row(b"b", 2, 2, 0)],
+            true,
+        ));
+        state.move_down();
+        assert_eq!(state.cursor(), 1);
+        let baseline = state.view_change_seq();
+
+        state.set_flat_summary(flat_summary_fixture());
+        state.toggle_flat_top();
+        assert_eq!(state.cursor(), 0, "fresh view starts at the top");
+        assert!(state.view_change_seq() > baseline);
+    }
+
+    #[test]
+    fn row_count_and_cursor_bounds_follow_the_active_mode() {
+        let mut state = UiState::new(snapshot(1, 0, None, vec![file_row(b"a", 3, 3, 0)], true));
+        assert_eq!(state.row_count(), 1, "tree mode: one row");
+
+        state.set_flat_summary(flat_summary_fixture());
+        state.toggle_flat_top();
+        assert_eq!(state.row_count(), 3, "flat mode: three top files");
+        state.move_bottom();
+        assert_eq!(state.cursor(), 2);
+        state.move_down(); // clamped: no fourth row
+        assert_eq!(state.cursor(), 2);
+
+        state.toggle_flat_top(); // back to tree
+        state.toggle_breakdown();
+        assert_eq!(
+            state.row_count(),
+            2,
+            "breakdown mode: one group + the trailing rest row"
+        );
+    }
+
+    #[test]
+    fn row_count_is_zero_before_any_flat_summary_arrives() {
+        let mut state = UiState::new(snapshot(1, 0, None, Vec::new(), true));
+        state.toggle_flat_top();
+        assert_eq!(state.row_count(), 0);
+        state.move_down(); // must not panic/underflow with nothing to show
+        assert_eq!(state.cursor(), 0);
+    }
+
+    #[test]
+    fn toggle_mark_flat_marks_a_real_node_and_shares_the_basket() {
+        let mut state = UiState::new(snapshot(1, 0, None, Vec::new(), true));
+        assert_eq!(state.marked_summary(), None);
+        assert_eq!(
+            state.toggle_mark_flat(NodeId::from_raw(42), PathBuf::from("/x/big.bin"), 900),
+            Ok(())
+        );
+        assert!(state.is_marked(NodeId::from_raw(42)));
+        assert_eq!(state.marked_summary(), Some((1, 900)));
+        let mark = &state.marks()[0];
+        assert!(!mark.is_dir, "flat rows are always regular files");
+        assert_eq!(mark.path, PathBuf::from("/x/big.bin"));
+
+        // Toggling again unmarks it — same basket the tree/review/delete
+        // flow already reads from.
+        assert_eq!(
+            state.toggle_mark_flat(NodeId::from_raw(42), PathBuf::from("/x/big.bin"), 900),
+            Ok(())
+        );
+        assert!(!state.is_marked(NodeId::from_raw(42)));
+        assert_eq!(state.marked_summary(), None);
+    }
+
+    #[test]
+    fn toggle_mark_flat_is_locked_while_the_scan_runs() {
+        let mut state = UiState::new(snapshot(1, 0, None, Vec::new(), false));
+        assert_eq!(
+            state.toggle_mark_flat(NodeId::from_raw(1), PathBuf::from("/x/f"), 10),
+            Err(MarkRefusal::ScanRunning)
+        );
+        assert!(state.marks().is_empty());
+    }
+
+    #[test]
+    fn jump_to_directory_rebuilds_the_stack_and_focuses_the_node() {
+        // Start somewhere unrelated to the jump target (dir 99): the
+        // ancestor chain the caller supplies fully replaces the stack.
+        let mut state = UiState::new(snapshot(1, 0, None, Vec::new(), true));
+        let target = state.jump_to_directory(
+            DirId::from_raw(5),
+            vec![DirId::from_raw(0), DirId::from_raw(2)],
+            NodeId::from_raw(77),
+        );
+        assert_eq!(target, Some(DirId::from_raw(5)));
+        assert_eq!(state.pending_nav(), Some(DirId::from_raw(5)));
+        assert_eq!(
+            state.stack_dirs().collect::<Vec<_>>(),
+            vec![DirId::from_raw(0), DirId::from_raw(2)]
+        );
+
+        // Refused while another nav is already pending.
+        assert_eq!(
+            state.jump_to_directory(DirId::from_raw(6), vec![], NodeId::from_raw(1)),
+            None
+        );
+
+        // The target directory's snapshot arrives with the focus node as
+        // its second row: cursor lands there, not at position 0.
+        let mut a = file_row(b"a", 5, 5, 0);
+        a.node = NodeId::from_raw(1);
+        let mut focus_row = file_row(b"big", 200, 200, 0);
+        focus_row.node = NodeId::from_raw(77);
+        state.apply_snapshot(snapshot(2, 5, Some(2), vec![a, focus_row], true));
+        assert_eq!(state.pending_nav(), None);
+        assert_eq!(
+            &*state.selected().unwrap().name,
+            b"big",
+            "cursor on the file"
+        );
+    }
+
+    #[test]
+    fn jump_to_directory_focus_is_discarded_on_a_stale_snapshot() {
+        let mut state = UiState::new(snapshot(1, 0, None, Vec::new(), true));
+        state.jump_to_directory(DirId::from_raw(5), vec![], NodeId::from_raw(77));
+        // A snapshot for a *different* directory arrives first (a stale
+        // publish overtaken by the request): the focus must not leak into
+        // whatever directory happens to resolve next.
+        state.apply_snapshot(snapshot(2, 9, None, vec![file_row(b"x", 1, 1, 0)], true));
+        assert_eq!(state.cursor(), 0);
+        // The real target's snapshot then arrives with no row matching
+        // the old focus node: falls back to the top, not a panic.
+        state.jump_to_directory(DirId::from_raw(5), vec![], NodeId::from_raw(77));
+        state.apply_snapshot(snapshot(3, 5, None, vec![file_row(b"y", 1, 1, 0)], true));
+        assert_eq!(state.cursor(), 0);
+    }
+
+    #[test]
+    fn flat_epoch_bumps_independently_of_the_cached_summary() {
+        let mut state = UiState::new(snapshot(1, 0, None, Vec::new(), true));
+        assert_eq!(state.flat_epoch(), 0);
+        state.bump_flat_epoch();
+        state.bump_flat_epoch();
+        assert_eq!(state.flat_epoch(), 2);
+        assert!(
+            state.flat_summary().is_none(),
+            "epoch and summary are independent"
+        );
     }
 }

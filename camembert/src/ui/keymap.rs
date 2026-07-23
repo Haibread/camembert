@@ -18,6 +18,15 @@
 //! neighbors), which drive each one through the real key handler and
 //! check it does what its entry claims.
 //!
+//! The six sort keys (`d`/`a`/`n`/`m`/`c`/`e`) join that hand-written set
+//! for the same reason (D3, `docs/design/flat-view-decisions.md`): which
+//! keys are meaningful now depends on the active table mode (a pattern
+//! group has no mtime or error count to sort by) and refusing one needs
+//! the flash queue to say so — context `dispatch_simple` doesn't carry.
+//! `t`/`b` (switch to the flat/breakdown modes) stay in [`SIMPLE`]
+//! instead: the toggle itself is unconditional and needs nothing beyond
+//! [`UiState`].
+//!
 //! [`MOUSE`] documents the slice-3 mouse map the same way (no dispatch
 //! table to generate from — mouse routing depends on frame geometry, not
 //! a static key code — so it is doc-only, cross-checked by hand against
@@ -25,7 +34,7 @@
 
 use crossterm::event::KeyCode;
 
-use super::state::{SortKey, UiState};
+use super::state::UiState;
 
 /// One keyboard shortcut whose entire effect is a call into [`UiState`].
 pub struct SimpleKey {
@@ -72,42 +81,6 @@ pub const SIMPLE: &[SimpleKey] = &[
         apply: UiState::move_bottom,
     },
     SimpleKey {
-        codes: &[KeyCode::Char('d')],
-        keys: "d",
-        action: "sort by real (disk) size [default]",
-        apply: |ui| ui.press_sort(SortKey::Disk),
-    },
-    SimpleKey {
-        codes: &[KeyCode::Char('a')],
-        keys: "a",
-        action: "sort by apparent size",
-        apply: |ui| ui.press_sort(SortKey::Apparent),
-    },
-    SimpleKey {
-        codes: &[KeyCode::Char('n')],
-        keys: "n",
-        action: "sort by name",
-        apply: |ui| ui.press_sort(SortKey::Name),
-    },
-    SimpleKey {
-        codes: &[KeyCode::Char('m')],
-        keys: "m",
-        action: "sort by modification time",
-        apply: |ui| ui.press_sort(SortKey::Mtime),
-    },
-    SimpleKey {
-        codes: &[KeyCode::Char('c')],
-        keys: "c",
-        action: "sort by item count",
-        apply: |ui| ui.press_sort(SortKey::Items),
-    },
-    SimpleKey {
-        codes: &[KeyCode::Char('e')],
-        keys: "e",
-        action: "sort by subtree error count",
-        apply: |ui| ui.press_sort(SortKey::Errors),
-    },
-    SimpleKey {
         codes: &[KeyCode::Char('p')],
         keys: "p",
         action: "toggle the apparent-size column",
@@ -131,6 +104,18 @@ pub const SIMPLE: &[SimpleKey] = &[
         action: "toggle zen mode (table only: no cards, gauge or wheel)",
         apply: UiState::toggle_zen,
     },
+    SimpleKey {
+        codes: &[KeyCode::Char('t')],
+        keys: "t",
+        action: "flat top files across the whole scan (t again returns to tree)",
+        apply: UiState::toggle_flat_top,
+    },
+    SimpleKey {
+        codes: &[KeyCode::Char('b')],
+        keys: "b",
+        action: "pattern breakdown (b again returns to tree)",
+        apply: UiState::toggle_breakdown,
+    },
 ];
 
 /// Dispatch `code` against [`SIMPLE`]; `true` if a row matched (and its
@@ -147,16 +132,40 @@ pub fn dispatch_simple(code: KeyCode, ui: &mut UiState) -> bool {
 
 pub const EXTRA: &[ExtraKey] = &[
     ExtraKey {
+        keys: "d",
+        action: "sort by real (disk) size [default; tree/flat/breakdown]",
+    },
+    ExtraKey {
+        keys: "a",
+        action: "sort by apparent size [tree/flat/breakdown]",
+    },
+    ExtraKey {
+        keys: "n",
+        action: "sort by name [tree/flat/breakdown]",
+    },
+    ExtraKey {
+        keys: "m",
+        action: "sort by modification time [tree only]",
+    },
+    ExtraKey {
+        keys: "c",
+        action: "sort by item count [tree: subtree items; breakdown: group entries]",
+    },
+    ExtraKey {
+        keys: "e",
+        action: "sort by subtree error count [tree only]",
+    },
+    ExtraKey {
         keys: "⏎/l/→",
-        action: "open the directory under the cursor",
+        action: "open the directory under the cursor (flat: jump to its containing directory)",
     },
     ExtraKey {
         keys: "⌫/h/←",
-        action: "go back up to the parent",
+        action: "go back up to the parent [tree only]",
     },
     ExtraKey {
         keys: "Space",
-        action: "mark/unmark the row under the cursor for deletion",
+        action: "mark/unmark the row under the cursor for deletion [tree/flat]",
     },
     ExtraKey {
         keys: "v",
@@ -171,7 +180,11 @@ pub const EXTRA: &[ExtraKey] = &[
         action: "freeable files: deleted-but-open files holding disk space (f/Esc closes)",
     },
     ExtraKey {
-        keys: "q, Esc, Ctrl-C",
+        keys: "Esc",
+        action: "close a modal, else leave the flat/breakdown mode, else quit [from tree]",
+    },
+    ExtraKey {
+        keys: "q, Ctrl-C",
         action: "quit (cancels a running scan)",
     },
 ];
@@ -282,9 +295,6 @@ mod tests {
         assert!(dispatch_simple(KeyCode::Char('g'), &mut ui));
         assert_eq!(ui.cursor(), 0);
 
-        assert!(dispatch_simple(KeyCode::Char('n'), &mut ui));
-        assert_eq!(ui.sort().key, SortKey::Name);
-
         assert!(ui.show_apparent);
         assert!(dispatch_simple(KeyCode::Char('p'), &mut ui));
         assert!(!ui.show_apparent);
@@ -293,9 +303,19 @@ mod tests {
         assert!(dispatch_simple(KeyCode::Char('?'), &mut ui));
         assert!(ui.cheatsheet_open());
 
+        assert_eq!(ui.mode(), crate::ui::state::ViewMode::Tree);
+        assert!(dispatch_simple(KeyCode::Char('t'), &mut ui));
+        assert_eq!(ui.mode(), crate::ui::state::ViewMode::FlatTop);
+        assert!(dispatch_simple(KeyCode::Char('b'), &mut ui));
+        assert_eq!(ui.mode(), crate::ui::state::ViewMode::Breakdown);
+
         assert!(
             !dispatch_simple(KeyCode::Char('D'), &mut ui),
             "not in SIMPLE"
+        );
+        assert!(
+            !dispatch_simple(KeyCode::Char('n'), &mut ui),
+            "sort keys are hand-written now (mode-aware), not in SIMPLE"
         );
     }
 

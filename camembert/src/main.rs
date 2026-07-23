@@ -14,6 +14,7 @@ use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use camembert_core::diff::{self, DiffOptions, DiffReport};
 use camembert_core::dump::read::DumpReader;
 use camembert_core::dump::{self, DumpMeta, encode_name};
+use camembert_core::flat;
 use camembert_core::ncdu;
 use camembert_core::scan::{ScanOptions, Scanner};
 use camembert_core::size::{HumanSize, SignedHumanSize, parse_size};
@@ -70,8 +71,12 @@ struct ScanArgs {
     #[arg(long, env = "CROSS_FILESYSTEMS")]
     cross_filesystems: bool,
 
-    /// Number of directories in the "top directories by real size" list,
-    /// summary mode only (env: TOP)
+    /// Number of entries in the "top directories" and "top files" (D5)
+    /// lists, summary mode only (env: TOP)
+    ///
+    /// One flag governs both lists; the interactive `t` mode's own cap is
+    /// the separate `flat_cap` config-file key (default 1000) and is not
+    /// affected by this flag.
     #[arg(long, env = "TOP", default_value_t = 20)]
     top: usize,
 
@@ -233,7 +238,9 @@ Modes:
   --log-file (env: LOG_FILE) points them at a file.
 
   Summary (--no-ui, env NO_UI, or stdout not a terminal): scan to
-  completion, then print totals and the --top largest directories.
+  completion, then print totals, the --top largest directories, and the
+  --top largest files (D5; same flag, both lists) -- suppressed like the
+  rest of the summary text when --output - streams the dump to stdout.
 
 Look & feel (interactive mode):
   Colors and glyphs adapt to the terminal: truecolor -> 256 -> 16 -> mono
@@ -276,14 +283,37 @@ Config file (camembert.toml):
     theme = \"tokyo-night\" | \"light\" | \"high-contrast\"
     color = \"auto\" | \"always\" | \"never\"
     no_motion = true | false
+    flat_cap = 1000        # flat top-files cap (t mode); default shown
 
-  Precedence for each key: the matching CLI flag > its env var > this
-  file > the built-in default (tokyo-night/auto/motion enabled) — except
-  `theme`, where the OSC 11 query above still gets a turn between the
-  config file and the default. An unparseable file, or one with unknown
-  keys, is never fatal: invalid TOML or an invalid value falls back to
-  defaults, and unrecognized keys are ignored — both cases log a warning
-  (see --log-file) rather than failing the scan.
+    [patterns]             # label = \"glob\"; file order = precedence,
+    logs = \"*.log\"         # after the built-in presets (node_modules/,
+    build = \"dist/\"        # .git/, target/, __pycache__/, .cache/,
+                            # .venv/, *.log, *.tmp); reusing a preset's
+                            # label replaces it in place (D1/D4).
+
+  Pattern syntax: a basename glob matched against one path component
+  (never a full path). Only * (zero or more bytes) and ? (exactly one
+  byte) are special; every other character -- including { } [ ] -- is
+  literal, not a brace/character class. A trailing / marks a directory
+  pattern, which claims its whole matched subtree (D1); without one, the
+  pattern matches non-directory entries only.
+
+  Precedence for theme/color/no_motion: the matching CLI flag > its env
+  var > this file > the built-in default (tokyo-night/auto/motion
+  enabled) — except `theme`, where the OSC 11 query above still gets a
+  turn between the config file and the default. flat_cap and [patterns]
+  are config-file only, no CLI flag or env var.
+
+  Parsing is per-key resilient: broken TOML *syntax* falls back to
+  every default (unchanged from before flat_cap/[patterns] existed), but
+  a bad individual value -- an invalid theme, a non-numeric flat_cap, a
+  [patterns] entry whose value isn't a string, or a [patterns] table
+  that isn't a table at all -- is warned about and defaulted on its own,
+  never resetting the other keys or the other pattern entries. An
+  invalid glob spec is skipped the same way. Every case logs a warning
+  (see --log-file); the interactive UI additionally shows a one-time
+  startup toast (\"N invalid patterns ignored — see log\") when any
+  pattern was dropped either way.
 
 Dump:
   --output FILE (env: OUTPUT) writes a camembert-dump v1 (.cmbt) after
@@ -296,20 +326,32 @@ Dump:
 
 Keys (interactive mode):
   Down/j, Up/k     move the cursor
-  Enter, l, Right  open the directory under the cursor
-  Backspace, h, Left  go back up to the parent
+  Enter, l, Right  open the directory under the cursor (tree mode); in
+                   flat mode, jump to the row's containing directory in
+                   tree view instead (cursor lands on the file); a no-op
+                   in breakdown mode for now (see Flat view below)
+  Backspace, h, Left  go back up to the parent (tree mode only)
   g / G            jump to the top / bottom
   d                sort by real (disk) size [default, descending]
   a                sort by apparent size
-  n                sort by name (raw bytes, ascending)
-  m                sort by modification time
-  c                sort by item count
-  e                sort by subtree error count (find what was unreadable)
-                   (pressing the active sort key reverses the direction)
+  n                sort by name (tree: raw bytes; flat: basename; breakdown:
+                   label)
+  m                sort by modification time (tree mode only)
+  c                sort by item count (tree: subtree items; breakdown:
+                   group entry count; not applicable in flat mode)
+  e                sort by subtree error count (tree mode only)
+                   (pressing the active sort key reverses the direction;
+                   a key with no meaning in the active mode flashes
+                   \"not available in this view\" instead of applying)
   p                show/hide the apparent-size column
+  t                flat top files across the whole scan (see Flat view
+                   below); press t again to return to the tree
+  b                pattern breakdown (see Flat view below); press b again
+                   to return to the tree
   Space            mark/unmark the row under the cursor for deletion,
                    then move down (a marked directory implies its whole
-                   subtree; marks persist across navigation)
+                   subtree; marks persist across navigation; works in
+                   tree and flat mode, not breakdown mode)
   u                clear all marks
   v                review marked entries: a scrollable floating list of
                    every marked path with its size; Space unmarks the row
@@ -324,13 +366,31 @@ Keys (interactive mode):
   z                toggle zen mode: table only (no metric cards, disk
                    gauge or donut wheel) — header, table, footer and the
                    basket strip stay
-  q, Esc, Ctrl-C   quit (cancels the scan if still running)
+  Esc              contextual: closes an open modal first; else leaves a
+                   flat/breakdown mode back to the tree; only quits when
+                   already in tree view with nothing open
+  q, Ctrl-C        quit unconditionally (cancels the scan if still
+                   running), regardless of mode or open modal
 
   While any of these floating panels (delete confirmation, review list,
   freeable panel, cheatsheet) is open, every key belongs to it alone;
   precedence when more than one could apply is confirmation > review
   list > freeable panel > cheatsheet, though in practice only one is
   ever open at a time.
+
+Flat view & pattern breakdown (t/b, docs/design/flat-view-decisions.md):
+  Two extra in-place table modes; cards/gauge/basket/footer stay put.
+  't' lists the largest regular files across the whole scan (path,
+  size, a hardlink badge), capped at flat_cap entries (config file,
+  default 1000) with a footer note when the cap was hit. 'b' lists
+  pattern groups (basename globs; see Config file below) with total
+  size, entry count and % of scan, plus a trailing \"(uncategorized)\"
+  row. Groups are a DISJOINT partition (D1): a directory matching a
+  dir-pattern claims its whole subtree, so nothing nested re-counts
+  into its own group, and the list/donut never sum past 100%. Both
+  modes work during the scan (badged \"provisional\", live accumulator);
+  post-scan figures are exact and recompute immediately after every
+  deletion, including one performed from inside the mode itself.
 
 Mouse (interactive mode):
   The mouse is additive: every key above still works, nothing requires
@@ -524,6 +584,34 @@ fn run_scan(cli: &Cli) -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // camembert.toml is loaded unconditionally now (unlike before flat view
+    // landed): --no-ui's summary needs `[patterns]`/`flat_cap` (D5) just as
+    // much as the interactive UI needs theme/color/motion, so the one read
+    // that used to be interactive-only now serves both modes.
+    let file_config = config::load();
+    let (flat_config, pattern_warnings) = config::build_flat_config(&file_config);
+    // D4: every invalid-pattern reason is already `tracing::warn!`-logged
+    // individually (config-level structural issues in `config::parse`,
+    // glob-compile issues in `PatternSet::push`) — this is only the
+    // one-time combined count the interactive UI surfaces as a startup
+    // toast; --no-ui runs have no toast queue, so the log is the whole
+    // story there.
+    if !pattern_warnings.is_empty() {
+        tracing::warn!(
+            count = pattern_warnings.len(),
+            "invalid flat-view patterns ignored at startup"
+        );
+    }
+    let startup_toasts = if pattern_warnings.is_empty() {
+        Vec::new()
+    } else {
+        vec![format!(
+            "{} invalid pattern{} ignored — see log",
+            pattern_warnings.len(),
+            if pattern_warnings.len() == 1 { "" } else { "s" }
+        )]
+    };
+
     let scanner = Scanner::new(ScanOptions {
         threads: args.threads,
         cross_filesystems: args.cross_filesystems,
@@ -531,11 +619,7 @@ fn run_scan(cli: &Cli) -> ExitCode {
 
     if interactive {
         // camembert.toml sits below the CLI flag/env var in precedence
-        // for all three of its keys (design slice 6); loading it here
-        // (rather than unconditionally at the top of main) keeps a
-        // filesystem read out of --no-ui/summary runs, which never look
-        // at theme/color/motion at all.
-        let file_config = config::load();
+        // for all three of theme/color/motion's keys (design slice 6).
         let color = config::resolve_color(args.color, file_config.color);
         let theme_choice = config::resolve_theme(args.theme, file_config.theme);
         let no_motion = config::resolve_no_motion(
@@ -555,10 +639,15 @@ fn run_scan(cli: &Cli) -> ExitCode {
             ?theme_choice,
             no_motion,
             no_proc_sweep,
+            flat_cap = flat_config.cap,
             "resolved color/theme/motion/proc-sweep (CLI > env > camembert.toml, no-proc-sweep: CLI > env only)"
         );
         let caps = ui::caps::Caps::detect(&ui::caps::TermEnv::from_env(), color);
         let animate = !no_motion;
+        // D2: only the interactive UI accumulates a live flat-view summary
+        // during the scan (browse-during-scan); --no-ui folds once, after
+        // the scan, in `summary` below.
+        let scanner = scanner.with_flat(flat_config.clone());
         return match ui::run(
             scanner,
             &args.path,
@@ -567,6 +656,8 @@ fn run_scan(cli: &Cli) -> ExitCode {
             animate,
             theme_choice,
             no_proc_sweep,
+            flat_config,
+            startup_toasts,
         ) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
@@ -579,12 +670,14 @@ fn run_scan(cli: &Cli) -> ExitCode {
             }
         };
     }
-    summary(args, &scanner)
+    summary(args, &scanner, &flat_config)
 }
 
 /// Non-interactive mode: scan to completion, then print the summary on
-/// stdout (diagnostics stay on stderr via tracing).
-fn summary(args: &ScanArgs, scanner: &Scanner) -> ExitCode {
+/// stdout (diagnostics stay on stderr via tracing). `flat_config` (D2/D4)
+/// is folded once, after the scan, for the top-files section (D5) — no
+/// live accumulator here, this run was never browsed.
+fn summary(args: &ScanArgs, scanner: &Scanner, flat_config: &flat::FlatConfig) -> ExitCode {
     // Progress line on stderr (via tracing) roughly every second while the
     // scan blocks this thread. The poller waits on a channel, not a plain
     // sleep, so a scan that finishes in milliseconds isn't held hostage by
@@ -658,6 +751,31 @@ fn summary(args: &ScanArgs, scanner: &Scanner) -> ExitCode {
                 "  {:>10}  {}",
                 HumanSize(meta.td).to_string(),
                 outcome.path_of(dir).display()
+            );
+        }
+
+        // D5: the flat-view top files, right beside the top-dirs list,
+        // reusing --top/TOP the same way (attack finding 8: one flag, two
+        // lists, the interactive view's own cap is independent — see
+        // --help). Folded once over the finalized tree (canonical hardlink
+        // attribution, same as everything above); `-o -` (dump to stdout)
+        // already skips this whole branch, so the dump stream is never at
+        // risk (attack finding 7).
+        println!();
+        println!("Top {} files by real size:", args.top);
+        let flat_summary = flat::fold(outcome.tree(), &flat_config.patterns, flat_config.cap, 0);
+        for file in flat_summary.top_files.iter().take(args.top) {
+            let badge = if file.hardlink { " \u{26d3}" } else { "" };
+            println!(
+                "  {:>10}  {}{badge}",
+                HumanSize(file.disk).to_string(),
+                outcome.tree().path_of_node(file.node).display()
+            );
+        }
+        if flat_summary.truncated {
+            println!(
+                "  (top {} of more eligible files shown; flat_cap in camembert.toml)",
+                flat_config.cap
             );
         }
     }

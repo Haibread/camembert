@@ -25,8 +25,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 
+use crate::flat::{Accumulator, FlatSummary};
 use crate::tree::{DirId, DirState, NodeFlags, NodeId, Tree};
 
 /// Normal snapshot publication cadence (D5: ≈30 fps).
@@ -261,6 +262,11 @@ pub fn children_count(tree: &Tree, dir: DirId) -> usize {
 #[derive(Debug)]
 pub struct ViewBus {
     snapshot: ArcSwap<ViewSnapshot>,
+    /// Provisional flat-view summary (D2), published alongside `snapshot`
+    /// on the owner's cadence when the flat view is enabled. `None` until
+    /// the first flat publish, and always `None` when the scan ran without
+    /// [`crate::scan::Scanner::with_flat`].
+    flat: ArcSwapOption<FlatSummary>,
     /// Capacity-1 latest-wins nav cell: `NAV_EMPTY` or a `DirId` index.
     nav: AtomicU64,
     cancel: AtomicBool,
@@ -270,6 +276,7 @@ impl ViewBus {
     pub(crate) fn new(root_path: PathBuf) -> Self {
         Self {
             snapshot: ArcSwap::from_pointee(ViewSnapshot::initial(root_path)),
+            flat: ArcSwapOption::empty(),
             nav: AtomicU64::new(NAV_EMPTY),
             cancel: AtomicBool::new(false),
         }
@@ -278,6 +285,12 @@ impl ViewBus {
     /// Current snapshot, wait-free. Safe to call every frame.
     pub fn load(&self) -> Arc<ViewSnapshot> {
         self.snapshot.load_full()
+    }
+
+    /// Current provisional flat-view summary, wait-free. `None` until the
+    /// first flat publish (or always, when the flat view is disabled).
+    pub fn load_flat(&self) -> Option<Arc<FlatSummary>> {
+        self.flat.load_full()
     }
 
     /// Ask the owner to view `dir`. Never blocks; if a previous request is
@@ -306,6 +319,10 @@ impl ViewBus {
 
     pub(crate) fn publish(&self, snapshot: ViewSnapshot) {
         self.snapshot.store(Arc::new(snapshot));
+    }
+
+    pub(crate) fn publish_flat(&self, summary: FlatSummary) {
+        self.flat.store(Some(Arc::new(summary)));
     }
 }
 
@@ -339,7 +356,16 @@ impl ViewPublisher {
 
     /// One owner tick: serve a nav request immediately, otherwise
     /// republish when the cadence for the viewed directory elapsed (D5).
-    pub(crate) fn tick(&mut self, tree: &Tree, root: DirId, hardlink_inodes: u64) {
+    /// When the flat view is enabled, the provisional flat summary is
+    /// published on the same tick (D2), so its cost — `O(groups + heap)` —
+    /// is paid per cadence tick, never per integrated node.
+    pub(crate) fn tick(
+        &mut self,
+        tree: &Tree,
+        root: DirId,
+        hardlink_inodes: u64,
+        flat: Option<&Accumulator>,
+    ) {
         let mut viewed = *self.viewed.get_or_insert(root);
         let mut force = false;
         if let Some(requested) = self.bus.take_request() {
@@ -382,6 +408,11 @@ impl ViewPublisher {
         self.published_complete = root_complete;
         self.last_publish = Some(Instant::now());
         self.bus.publish(snapshot);
+        // Flat view (D2): provisional snapshot alongside the view snapshot,
+        // epoch 0 (no deletions during the scan).
+        if let Some(accum) = flat {
+            self.bus.publish_flat(accum.snapshot(0));
+        }
     }
 }
 
@@ -515,18 +546,18 @@ mod tests {
         let mut publisher = ViewPublisher::new(Arc::clone(&bus));
 
         assert_eq!(bus.load().generation, 0, "initial placeholder");
-        publisher.tick(&tree, root, 0);
+        publisher.tick(&tree, root, 0, None);
         assert_eq!(bus.load().generation, 1, "first tick publishes");
 
         // Within the cadence and without a nav request: no republish
         // (the sample tree's root is complete, and the one forced
         // completion publish already went out with the first tick)...
-        publisher.tick(&tree, root, 0);
+        publisher.tick(&tree, root, 0, None);
         assert_eq!(bus.load().generation, 1);
 
         // ...but a nav request publishes immediately, cadence or not.
         bus.request(sub);
-        publisher.tick(&tree, root, 0);
+        publisher.tick(&tree, root, 0, None);
         let snap = bus.load();
         assert_eq!(snap.generation, 2);
         assert_eq!(snap.dir, sub);
@@ -539,13 +570,13 @@ mod tests {
         let bus = Arc::new(ViewBus::new(PathBuf::from("/scan")));
         let mut publisher = ViewPublisher::new(Arc::clone(&bus));
 
-        publisher.tick(&tree, root, 0);
+        publisher.tick(&tree, root, 0, None);
         let first = bus.load();
         assert!(first.stats.root_complete);
 
         // Root already complete: exactly one forced completion publish;
         // further ticks inside the cadence stay quiet.
-        publisher.tick(&tree, root, 0);
+        publisher.tick(&tree, root, 0, None);
         assert_eq!(bus.load().generation, first.generation);
     }
 
@@ -583,7 +614,7 @@ mod tests {
 
         let bus = Arc::new(ViewBus::new(PathBuf::from("/big")));
         let mut publisher = ViewPublisher::new(Arc::clone(&bus));
-        publisher.tick(&tree, root, 0);
+        publisher.tick(&tree, root, 0, None);
         let snap = bus.load();
         assert!(snap.degraded, ">20k children publish degraded (D5)");
         assert_eq!(snap.rows.len(), n);
