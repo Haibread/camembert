@@ -83,3 +83,14 @@ with the wheel as identity centerpiece:
 4. Basket strip + `v` review; toasts; `?` cheatsheet.
 5. Animations + `--no-motion`; responsive collapse + zen mode.
 6. Themes + config file + OSC 11 light detection.
+
+## README hero image
+
+`docs/images/tui.png` is a static render of this design (not a live
+terminal capture — no real tree matches the illustrative numbers), built
+as an HTML/CSS mockup using the exact palette from `ui/theme.rs` (rank
+order: amber → blue → green → mauve → sky) and the same half-block donut
+math as `ui/wheel.rs`, screenshotted with headless Chromium at 2x scale
+and autocropped. Regenerate it whenever this design doc changes in a way
+that would make the image misleading (new panels, changed palette,
+changed layout) — it does not need to track every code change.

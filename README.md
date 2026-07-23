@@ -36,22 +36,9 @@ camembert never counts it), mount boundaries.
 A **dashboard cockpit** you can navigate *while the scan runs* — totals
 fill in and re-sort live, and the donut wheel's slices grow in real time:
 
-```text
-▞ camembert · / ▸ var                                        ⠹ scanning
-╭──────────────╮ ╭──────────────╮ ╭──────────────╮ ╭──────────────╮
-│ 22.4 GiB real│ │ 683,751 items│ │ 27 errors    │ │ 7,307 links  │
-╰──────────────╯ ╰──────────────╯ ╰──────────────╯ ╰──────────────╯
-disk: ▰▰▰▰▰▰▰▰▱▱▱ 78% occupied · this scan covers 61% of it
-
-   9.2 GiB ████████▍░░  lib/          ⣶⣿⣿⣿⣶
-   5.8 GiB █████▎░░░░░  log/        ⣾⣿      ⣿⣷
-   3.1 GiB ██▊░░░░░░░░  cache/      ⣿⣿      ⣿⣿
-   1.4 GiB █▎░░░░░░░░░  ⠧ spool/    ⢿⣿      ⣿⡿
-      —    ···········  ! named/      ⠻⣿⣿⣿⠟
-
-selection: log/ · modified 3 min ago · 8,442 items · 26.5% of parent
-jk/wheel · ⏎ open · Space mark · D delete · d/a/n/m/c/e sort · q quit
-```
+<div align="center">
+  <img src="docs/images/tui.png" alt="camembert's interactive TUI: a dashboard with metric cards, a disk gauge, a sortable directory table with proportion bars, and a live donut wheel of the current directory's children" width="820">
+</div>
 
 The wheel is a real pie chart drawn in your terminal with sub-cell
 pixels — sextants (2×3 per cell) on modern terminals, half-blocks
