@@ -33,6 +33,10 @@ pitch.
     capability ladders, identity colors, design reservations for the
     diff skin / freeable segment / sunburst / kitty-graphics opt-in, and
     the remaining implementation slices).
+  - [freeable-decisions.md](docs/design/freeable-decisions.md) (D1–D8:
+    sweep-ledger shape, root-fs scoping, nlink==0 ground truth, scan-end
+    + pre-deletion lifecycle, gauge/panel/toast UI, advisory warning,
+    `--no-proc-sweep`, no dump keys, module isolation).
 - The dump format spec is [docs/format/dump-v1.md](docs/format/dump-v1.md);
   writer AND reader implement it. Major-version changes are near-taboo
   (they invalidate every stored dump).
@@ -45,7 +49,7 @@ pitch.
   identity is `Haibread <haibread@users.noreply.github.com>` (set
   repo-locally).
 
-## What is implemented (all merged on main, ~220 tests green)
+## What is implemented (all merged on main, ~260 tests green)
 
 - **Scan engine** (`camembert-core/src/scan/`): work-stealing,
   fd-relative `openat`/`getdents64`/`statx` (fstatat fallback), mount
@@ -82,6 +86,18 @@ pitch.
 - **ncdu import** (`ncdu.rs`, `camembert import`): hand-rolled streaming
   JSON lexer (handles non-UTF-8 pre-2.5 exports), rebuilds the arena,
   canonical hardlinks, emits ordered dumps. Import→self-diff = zero.
+- **Freeable phase 1** (`camembert-core/src/freeable.rs`,
+  `camembert/src/ui/freeable_panel.rs`): post-scan `/proc` sweep ledger
+  per [freeable-decisions.md](docs/design/freeable-decisions.md) D1–D8
+  — deleted-but-open files (`st_nlink == 0` ground truth, `(dev,ino)`
+  dedup, `st_blocks` sizing, memfd/shm classified out by path prefix),
+  root-filesystem-scoped gauge suffix, `f` evidence panel (guilty
+  PIDs/comm, display-only ancestor grouping, coverage + RAM-backed +
+  cross-device honesty lines), thresholded scan-end toast (≥ 100 MiB
+  and ≥ 1 % capacity), advisory open-file warning in the delete confirm
+  (marked files by `(dev,ino)` + files *inside* marked dirs by path
+  containment, coverage-honest), `--no-proc-sweep`/`NO_PROC_SWEEP`.
+  Nothing in tree/dump/diff (D8 isolation).
 - **Infra**: pre-commit (fmt, clippy -D warnings, actionlint, hygiene),
   GitHub workflows `quality` + `release` (SHA-pinned), Dependabot,
   dual MIT/Apache-2.0, repository metadata. The GitHub repo is live at
@@ -106,6 +122,12 @@ pitch.
   (clap subcommand precedence).
 - Scanning-a-kernfs-root is allowed (explicit user intent); only mounts
   *inside* a scan are excluded.
+- Freeable: mmap-only holders invisible without CAP_SYS_ADMIN
+  (`map_files`); btrfs multi-subvolume layouts under-count (root-subvol
+  `st_dev` scoping, stated in the panel); directory-containment
+  open-file warning matches by path text — mount-namespace divergence
+  gives false negatives (advisory only); unprivileged sweeps see ~28 %
+  of processes on a desktop (coverage line says so).
 - TUI: the design's "excluded mounts dim italic" styling is not
   implemented (no excluded-row rendering exists yet — the theme
   mechanism has a slot for it); the header mini-donut is decorative,
@@ -115,16 +137,17 @@ pitch.
 
 ## Suggested next steps, in value order
 
-1. **Freeable column, phase 1**: deleted-but-open files via
-   `/proc/*/fd` + `(deleted)` symlinks with guilty PID; reuse it for
-   the deletion open-file warning. Phase 2: btrfs
-   `FIEMAP_EXTENT_SHARED`. (ZFS: show nothing rather than invent.)
-2. **Flat view + pattern aggregation** (`node_modules` = 14 GiB
+1. **Flat view + pattern aggregation** (`node_modules` = 14 GiB
    cumulative): same aggregation machinery over the frozen arena;
    rayon-friendly (see option C's frozen-structure idea in the
    scan-tree dossier).
-3. **Filter query language + Ctrl-K palette** (they ship together —
+2. **Filter query language + Ctrl-K palette** (they ship together —
    the palette is the language's UI, reserved in the design).
+3. **Freeable phase 2**: btrfs `FIEMAP_EXTENT_SHARED` + hardlink
+   siblings — needs its own per-entry channel design (non-additive
+   inclusion-exclusion; see freeable-attack-b.md for why the phase-1
+   ledger deliberately did not pre-build it) and the reserved in-bar
+   bright segment. (ZFS: show nothing rather than invent.)
 4. **io_uring batched statx** with runtime detection + fallback (spec'd
    in the original handoff §3; the completion invariant it needs is
    already documented in owner.rs).
@@ -136,7 +159,7 @@ pitch.
 ## How to work on this repo
 
 ```bash
-cargo test --workspace                                  # ~220 tests
+cargo test --workspace                                  # ~260 tests
 cargo clippy --workspace --all-targets -- -D warnings   # zero tolerance
 pre-commit run --all-files
 ```
