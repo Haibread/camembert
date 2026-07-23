@@ -114,29 +114,35 @@ fn nav_request_over_the_bus_is_served() {
     loop {
         let snap = bus.load();
         if snap.dir == target {
-            assert_eq!(snap.rows.len(), 64);
+            // Liveness proven: the in-flight request was served. The live
+            // snapshot is legitimately PARTIAL while workers are still
+            // integrating this directory (browse-during-scan), so row
+            // completeness is only asserted on the frozen outcome below.
+            assert!(
+                snap.rows.len() <= 64,
+                "live snapshot cannot exceed the real child count"
+            );
             break;
         }
         if live.is_finished() {
             // Scan finished before the request was served: the owner is
-            // gone, which is the documented hand-over point. Serve it from
-            // the outcome instead.
-            let outcome = live.join().unwrap();
-            let snap = view::build_snapshot(
-                outcome.tree(),
-                target,
-                1,
-                view::scan_stats(outcome.tree(), outcome.root(), outcome.elapsed),
-                0,
-                false,
-            );
-            assert_eq!(snap.rows.len(), 64);
-            return;
+            // gone, which is the documented hand-over point; completeness
+            // is asserted from the outcome below either way.
+            break;
         }
         assert!(Instant::now() < deadline, "nav request never served");
         std::thread::sleep(Duration::from_millis(1));
     }
-    live.join().unwrap();
+    let outcome = live.join().unwrap();
+    let snap = view::build_snapshot(
+        outcome.tree(),
+        target,
+        1,
+        view::scan_stats(outcome.tree(), outcome.root(), outcome.elapsed),
+        0,
+        false,
+    );
+    assert_eq!(snap.rows.len(), 64);
 }
 
 #[test]
