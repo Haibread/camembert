@@ -5,7 +5,6 @@ use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use clap::{Args, Parser, Subcommand};
@@ -587,30 +586,28 @@ fn run_scan(cli: &Cli) -> ExitCode {
 /// stdout (diagnostics stay on stderr via tracing).
 fn summary(args: &ScanArgs, scanner: &Scanner) -> ExitCode {
     // Progress line on stderr (via tracing) roughly every second while the
-    // scan blocks this thread.
+    // scan blocks this thread. The poller waits on a channel, not a plain
+    // sleep, so a scan that finishes in milliseconds isn't held hostage by
+    // a 1 s nap at join time (a bench-visible stall on small trees).
     let progress = scanner.progress();
-    let done = Arc::new(AtomicBool::new(false));
-    let poller = {
-        let done = Arc::clone(&done);
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(Duration::from_millis(1000));
-                if done.load(Ordering::Acquire) {
-                    break;
-                }
-                info!(
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let poller = std::thread::spawn(move || {
+        loop {
+            match done_rx.recv_timeout(Duration::from_millis(1000)) {
+                Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => info!(
                     entries = progress.entries(),
                     dirs = progress.dirs(),
                     errors = progress.errors(),
                     disk = %HumanSize(progress.disk_bytes()),
                     "scanning"
-                );
+                ),
             }
-        })
-    };
+        }
+    });
 
     let outcome = scanner.scan(&args.path);
-    done.store(true, Ordering::Release);
+    let _ = done_tx.send(());
     let _ = poller.join();
 
     let mut outcome = match outcome {

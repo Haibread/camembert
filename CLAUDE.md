@@ -20,6 +20,34 @@ output formats) must be documented in the same change:
 No undocumented feature lands, even experimental ones — mark them as
 experimental instead.
 
+## Benchmarks (regression guard + external comparison)
+
+Any change touching the scan hot path (`camembert-core/src/scan/`,
+`tree.rs`, owner-side accumulators) must be benchmarked **before and
+after** with:
+
+```bash
+scripts/bench-compare.sh              # warm cache, 200k-file synthetic tree
+scripts/bench-compare.sh --cold       # page cache dropped (sudo), the real contest
+```
+
+The script builds `--release`, generates a deterministic synthetic tree
+(cached under `target/`), and compares camembert (`--no-ui`) against
+every known disk-usage tool it finds: `du` (always), plus `diskus`,
+`dust`, `dua`, `pdu` from `target/bench-tools/bin` — populate once with
+
+```bash
+cargo install --locked --root target/bench-tools hyperfine du-dust dua-cli parallel-disk-usage diskus
+```
+
+(`ncdu`/`gdu` are C/Go: install system-wide if wanted; the script picks
+up whatever exists.) Results are printed and exported to
+`target/bench-results/<timestamp>.{md,json}` (+ `latest.*`), kept out
+of git — compare `latest.md` against the previous run's file. A
+camembert slowdown against its own previous local run, or falling
+behind `gdu`/`dust`-class scanners on the same tree, is a regression:
+fix it or explain it in the change that introduces it.
+
 ## Agents and model selection
 
 Delegate work to subagents (Agent tool) whenever it helps, and pick the model
