@@ -353,11 +353,14 @@ impl Owner {
         self.progress.add_dirs(u64::from(batch.child_dirs));
 
         if batch.is_last_section {
-            // Self-token release. Invariant (binding amendment): this must
-            // also gate on outstanding-statx == 0 once stats become
-            // asynchronous (io_uring path); in this thread-pool
-            // implementation every stat result is already inside a section
-            // when the last section arrives, so is_last_section suffices.
+            // Self-token release. Invariant (binding amendment): release
+            // also gates on outstanding-statx == 0. Both stat engines
+            // uphold it worker-side, before any section is sent — the
+            // sync path trivially, the io_uring path by reap-to-zero
+            // bursts with explicit in-flight accounting
+            // (`uring::StatxBatcher::stat_burst`) — so every stat result
+            // is already inside a section when the last section arrives,
+            // and is_last_section suffices here.
             self.tree.release_token(dir);
         }
         new_tokens

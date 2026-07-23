@@ -5,9 +5,13 @@
 //! `statx`, no absolute paths, no `PATH_MAX`), pre-sum per-directory
 //! sections and send them over **one bounded channel** to a single owner
 //! that is the sole writer of a plain, non-concurrent arena
-//! ([`crate::tree::Tree`]). No async runtime, no io_uring in this
-//! increment (the statx-completion invariant it will need is documented in
-//! [`message`] and `owner.rs`).
+//! ([`crate::tree::Tree`]). No async runtime; per-entry metadata is
+//! fetched either with plain `statx` syscalls or batched through a
+//! per-worker io_uring ring ([`uring`]), probed once at scan start and
+//! falling back to the sync path wherever io_uring is unavailable
+//! (seccomp'd containers, gVisor, old kernels, `io_uring_disabled`).
+//! Both engines resolve every stat before a section is sent, preserving
+//! the completion invariant documented in [`message`] and `owner.rs`.
 //!
 //! The owner runs on the **calling thread**: [`Scanner::scan`] blocks
 //! until the scan completes, which keeps the API synchronous and saves a
@@ -22,6 +26,7 @@ mod hardlink;
 mod media;
 mod message;
 mod owner;
+mod uring;
 mod worker;
 
 use std::io;
@@ -32,7 +37,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_deque::{Injector, Worker as WorkerQueue};
 use rustix::fs::{Mode, OFlags};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::flat::{Accumulator, FlatConfig, FlatSummary};
 use crate::size::Size;
@@ -52,6 +57,39 @@ const CHANNEL_CAP: usize = 32;
 /// no batches arrive. Matches the D5 snapshot cadence.
 const RECV_TIMEOUT: Duration = Duration::from_millis(33);
 
+/// How per-entry metadata (`statx`) is fetched during a scan.
+///
+/// **Experimental**: this knob exists to force one engine for tests,
+/// benchmarks, and diagnostics; it may change or disappear once the
+/// automatic choice has proven itself. Results are identical either way
+/// — only speed can differ.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StatxEngine {
+    /// Pick per scan (the default): io_uring for low-parallelism scans
+    /// (≤ 2 workers — the rotational-media policy — where the kernel's
+    /// io-wq punting adds useful parallelism, measured −12…−21 % warm),
+    /// sync otherwise (io_uring batching measured slower once the scan
+    /// workers already saturate the cores). Probes io_uring before using
+    /// it and falls back to sync on any denial.
+    #[default]
+    Auto,
+    /// Always use the sync path (`statx` syscalls, `fstatat` fallback).
+    Sync,
+    /// Prefer io_uring-batched statx. Still falls back to the sync path
+    /// if the probe fails — a scan never fails because io_uring is
+    /// unavailable.
+    IoUring,
+}
+
+/// The stat engine a scan actually ran with (after the probe).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatxBackend {
+    /// io_uring-batched statx (per-worker rings).
+    IoUring,
+    /// Plain `statx` syscalls (with the `fstatat` fallback).
+    Sync,
+}
+
 /// Scan configuration.
 #[derive(Debug, Clone, Default)]
 pub struct ScanOptions {
@@ -64,6 +102,8 @@ pub struct ScanOptions {
     /// Descend into other filesystems instead of recording the mount
     /// point as an excluded directory.
     pub cross_filesystems: bool,
+    /// Stat engine selection (experimental, see [`StatxEngine`]).
+    pub statx_engine: StatxEngine,
 }
 
 impl ScanOptions {
@@ -295,6 +335,58 @@ impl Scanner {
             "scan starting"
         );
 
+        // Stat-engine probe: once per scan, before workers start. A
+        // denial (seccomp, gVisor, `io_uring_disabled`, kernel < 5.6)
+        // falls back to the sync path — never a scan failure.
+        //
+        // `Auto` only picks io_uring for low-parallelism scans. Measured
+        // on the 200k-entry warm-cache bench tree (2026-07): the kernel
+        // punts most statx SQEs to io-wq worker threads, which is extra
+        // parallelism when scan workers are scarce (threads=1: −21 %,
+        // threads=2 — the rotational-media policy: −12 %) but pure
+        // contention once the workers already saturate the cores
+        // (threads=16: +25 %, context switches ×18). The threshold is
+        // warm-cache-derived and provisional: cold-cache and real-HDD
+        // runs may move it — hence the forced `IoUring` escape hatch.
+        const URING_AUTO_MAX_THREADS: usize = 2;
+        let statx_backend = match self.options.statx_engine {
+            StatxEngine::Sync => {
+                info!(statx = "sync", reason = "forced", "stat engine selected");
+                StatxBackend::Sync
+            }
+            StatxEngine::Auto if threads > URING_AUTO_MAX_THREADS => {
+                info!(
+                    statx = "sync",
+                    reason = "auto: workers saturate cores, io_uring batching measured slower",
+                    threads,
+                    "stat engine selected"
+                );
+                StatxBackend::Sync
+            }
+            preference @ (StatxEngine::Auto | StatxEngine::IoUring) => match uring::probe() {
+                Ok(()) => {
+                    info!(statx = "io_uring", "stat engine selected");
+                    StatxBackend::IoUring
+                }
+                Err(reason) => {
+                    if preference == StatxEngine::IoUring {
+                        warn!(
+                            statx = "sync",
+                            %reason,
+                            "io_uring requested but unavailable; falling back to sync statx"
+                        );
+                    } else {
+                        info!(
+                            statx = "sync",
+                            %reason,
+                            "stat engine selected (io_uring unavailable)"
+                        );
+                    }
+                    StatxBackend::Sync
+                }
+            },
+        };
+
         let (tx, rx) = crossbeam_channel::bounded::<message::Batch>(CHANNEL_CAP);
         let queues: Vec<WorkerQueue<Job>> = (0..threads).map(|_| WorkerQueue::new_fifo()).collect();
         let shared = WorkerShared {
@@ -303,6 +395,7 @@ impl Scanner {
             pending_jobs: AtomicUsize::new(1),
             next_token: AtomicU64::new(ROOT_TOKEN + 1),
             statx_supported: AtomicBool::new(true),
+            use_uring: statx_backend == StatxBackend::IoUring,
             cross_filesystems: self.options.cross_filesystems,
             abort: AtomicBool::new(false),
         };
@@ -430,6 +523,7 @@ impl Scanner {
             hardlink_extra_links,
             elapsed,
             cancelled,
+            statx_backend: Some(statx_backend),
             root_path: path.to_path_buf(),
             root,
             tree,
@@ -539,6 +633,10 @@ pub struct ScanOutcome {
     /// The scan was cancelled ([`ViewBus::cancel`]): the tree and every
     /// counter above are partial (whatever integrated before the stop).
     pub cancelled: bool,
+    /// The stat engine the scan actually ran with, after the io_uring
+    /// probe ([`StatxEngine`] is the *preference*; this is the outcome).
+    /// `None` for trees not produced by a scan (imports).
+    pub statx_backend: Option<StatxBackend>,
 }
 
 impl ScanOutcome {
@@ -574,6 +672,8 @@ impl ScanOutcome {
             hardlink_extra_links,
             elapsed,
             cancelled: false,
+            // Imported trees never ran a stat engine.
+            statx_backend: None,
             root_path,
             root,
             tree,

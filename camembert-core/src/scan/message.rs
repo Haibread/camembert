@@ -68,10 +68,12 @@ pub(crate) struct Batch {
     pub sums: SectionSums,
     /// Completion protocol: the directory's self token drops only when its
     /// last section is integrated AND all its stat results are included in
-    /// sections. In this thread-pool implementation stats are synchronous,
-    /// so `is_last_section` alone suffices; the future io_uring path must
-    /// additionally gate on outstanding-statx == 0 (binding amendment,
-    /// Option B's lesson).
+    /// sections (outstanding-statx == 0 at send — binding amendment,
+    /// Option B's lesson). Both stat engines guarantee the second half
+    /// worker-side before any send: the sync path trivially, the io_uring
+    /// path by reaping every submitted statx SQE before its burst returns
+    /// (explicit in-flight accounting in `uring::StatxBatcher`). So
+    /// `is_last_section` alone remains sufficient for the owner.
     pub is_last_section: bool,
     /// Child dirs discovered in this section (== entries with
     /// `child_token`); carried explicitly so the owner can bump the

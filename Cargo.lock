@@ -191,6 +191,7 @@ dependencies = [
  "crossbeam-channel",
  "crossbeam-deque",
  "hashbrown 0.17.1",
+ "io-uring",
  "rustc-hash",
  "rustix",
  "serde_json",
@@ -706,6 +707,17 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "io-uring"
+version = "0.7.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9080b15e63775b9a2ac7dca720f7050a8b955e092ea0f6020a4a80f69998cdc0"
+dependencies = [
+ "bitflags 2.13.1",
+ "cfg-if",
+ "libc",
 ]
 
 [[package]]

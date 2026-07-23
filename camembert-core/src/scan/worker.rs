@@ -5,8 +5,17 @@
 //! [`rustix::fs::RawDir`] + `statx`/`fstatat`): absolute paths are never
 //! reconstructed, so there is no `PATH_MAX` limit and hostile symlink
 //! swaps cannot redirect the walk (`O_NOFOLLOW` below the root).
+//!
+//! Per-entry metadata comes from one of two engines, chosen once per
+//! scan (see `scan.rs`): the sync path (`stat_at`: `statx` with an
+//! `fstatat` fallback) or io_uring-batched `statx`
+//! ([`super::uring::StatxBatcher`]). Both feed the same
+//! [`handle_entry`], so per-entry semantics and error taxonomy are
+//! shared by construction, and both fully resolve every stat before a
+//! section is sent — the owner's completion invariant (`owner.rs`) never
+//! sees an outstanding stat.
 
-use std::ffi::{CStr, OsStr};
+use std::ffi::{CStr, CString, OsStr};
 use std::mem::MaybeUninit;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Arc;
@@ -24,6 +33,7 @@ use crate::size::Size;
 use crate::tree::{ExcludedReason, Kind};
 
 use super::message::{Batch, BatchEntry, SECTION_CAP, SectionSums};
+use super::uring::{STAT_BURST, StatxBatcher};
 
 /// getdents64 buffer size per job. Comfortably above the largest single
 /// dirent (~280 bytes); 32 KiB amortizes syscalls on big directories.
@@ -31,6 +41,15 @@ const DIRENT_BUF: usize = 32 * 1024;
 
 /// Backoff while the queues are empty but jobs are still in flight.
 const IDLE_BACKOFF: Duration = Duration::from_micros(200);
+
+/// The statx field mask both stat engines request — extracted so the
+/// sync path and the io_uring path cannot drift apart.
+pub(crate) const STATX_MASK: StatxFlags = StatxFlags::TYPE
+    .union(StatxFlags::SIZE)
+    .union(StatxFlags::BLOCKS)
+    .union(StatxFlags::MTIME)
+    .union(StatxFlags::NLINK)
+    .union(StatxFlags::INO);
 
 /// How a job reaches its directory fd.
 pub(crate) enum JobFd {
@@ -127,6 +146,11 @@ pub(crate) struct WorkerShared {
     /// statx availability, flipped off on the first `ENOSYS` (seccomp,
     /// gVisor, old kernels) — all workers then use `fstatat`.
     pub statx_supported: AtomicBool,
+    /// The scan-level engine decision (`scan.rs` probe): workers batch
+    /// statx through a per-worker io_uring ring. Per-worker ring setup can
+    /// still fail (e.g. `RLIMIT_MEMLOCK` on pre-5.12 kernels); that worker
+    /// alone falls back to the sync path.
+    pub use_uring: bool,
     /// Descend into other filesystems instead of marking them excluded.
     pub cross_filesystems: bool,
     /// Owner-side failure: drop everything and exit.
@@ -142,6 +166,21 @@ pub(crate) fn run(
     tx: &Sender<Batch>,
 ) {
     debug!(worker_id, "scan worker started");
+    let mut batcher = if shared.use_uring {
+        match StatxBatcher::new() {
+            Ok(batcher) => Some(batcher),
+            Err(err) => {
+                warn!(
+                    worker_id,
+                    %err,
+                    "per-worker io_uring setup failed; this worker uses sync statx"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     loop {
         if shared.abort.load(Ordering::Acquire) {
             break;
@@ -153,7 +192,7 @@ pub(crate) fn run(
             std::thread::sleep(IDLE_BACKOFF);
             continue;
         };
-        let ok = process_job(job, &local, shared, tx);
+        let ok = process_job(job, &local, shared, tx, batcher.as_mut());
         shared.pending_jobs.fetch_sub(1, Ordering::AcqRel);
         if !ok {
             // Channel gone: owner bailed out. abort is set; unwind.
@@ -176,6 +215,40 @@ fn find_job(local: &WorkerQueue<Job>, shared: &WorkerShared) -> Option<Job> {
     })
 }
 
+/// Per-job context shared by both enumeration paths.
+struct JobCtx<'a> {
+    /// The directory being enumerated (also the parent fd of child jobs).
+    fd: Arc<OwnedFd>,
+    /// `st_dev` of the directory (mount-boundary reference).
+    dev: u64,
+    /// The directory's token (section identity).
+    token: u64,
+    local: &'a WorkerQueue<Job>,
+    shared: &'a WorkerShared,
+}
+
+/// Accumulator for the section being built: entries, pre-sums, child
+/// count. One per directory at a time; flushed at [`SECTION_CAP`].
+#[derive(Default)]
+struct Section {
+    entries: Vec<BatchEntry>,
+    sums: SectionSums,
+    child_dirs: u32,
+}
+
+impl Section {
+    fn take(&mut self, dir_token: u64, is_last_section: bool) -> Batch {
+        Batch {
+            dir_token,
+            entries: std::mem::take(&mut self.entries),
+            sums: std::mem::take(&mut self.sums),
+            is_last_section,
+            child_dirs: std::mem::take(&mut self.child_dirs),
+            dir_error: None,
+        }
+    }
+}
+
 /// Enumerate one directory, streaming sections to the owner. Returns false
 /// only when the owner is gone (send failed).
 fn process_job(
@@ -183,9 +256,9 @@ fn process_job(
     local: &WorkerQueue<Job>,
     shared: &WorkerShared,
     tx: &Sender<Batch>,
+    batcher: Option<&mut StatxBatcher>,
 ) -> bool {
     let token = job.token;
-    let job_dev = job.dev;
     let fd = match job.fd {
         JobFd::Opened(fd) => Arc::new(fd),
         JobFd::At(parent, name) => {
@@ -203,21 +276,48 @@ fn process_job(
             }
         }
     };
+    let ctx = JobCtx {
+        fd,
+        dev: job.dev,
+        token,
+        local,
+        shared,
+    };
 
     let mut buf = [MaybeUninit::<u8>::uninit(); DIRENT_BUF];
-    let mut iter = RawDir::new(fd.as_fd(), &mut buf);
-    let mut entries: Vec<BatchEntry> = Vec::new();
-    let mut sums = SectionSums::default();
-    let mut child_dirs: u32 = 0;
+    let mut iter = RawDir::new(ctx.fd.as_fd(), &mut buf);
+    let mut section = Section::default();
 
+    let ok = match batcher {
+        Some(batcher) => enumerate_uring(&ctx, &mut iter, &mut section, batcher, tx),
+        None => enumerate_sync(&ctx, &mut iter, &mut section, tx),
+    };
+    if !ok {
+        return false;
+    }
+
+    // Final (possibly empty) section: carries the self-token release.
+    // Both engines have fully resolved every stat by now (the sync path
+    // trivially, the io_uring path by reap-to-zero bursts), so the owner
+    // never sees a section with an outstanding stat.
+    send_batch(tx, shared, section.take(token, true))
+}
+
+/// Sync enumeration: one `stat_at` per entry, interleaved with getdents.
+fn enumerate_sync(
+    ctx: &JobCtx<'_>,
+    iter: &mut RawDir<'_, BorrowedFd<'_>>,
+    section: &mut Section,
+    tx: &Sender<Batch>,
+) -> bool {
     while let Some(dirent) = iter.next() {
         let dirent = match dirent {
             Ok(dirent) => dirent,
             Err(errno) => {
                 // getdents failed mid-listing; keep what we have, count
                 // the directory as partially errored.
-                warn!(token, %errno, "getdents failed mid-directory");
-                sums.errors += 1;
+                warn!(token = ctx.token, %errno, "getdents failed mid-directory");
+                section.sums.errors += 1;
                 break;
             }
         };
@@ -226,139 +326,198 @@ fn process_job(
         if name == b"." || name == b".." {
             continue;
         }
+        let stat = stat_at(ctx.fd.as_fd(), name_c, &ctx.shared.statx_supported);
+        handle_entry(ctx, section, name_c, dirent.file_type(), stat);
+        if section.entries.len() >= SECTION_CAP
+            && !send_batch(tx, ctx.shared, section.take(ctx.token, false))
+        {
+            return false;
+        }
+    }
+    true
+}
 
-        let entry = match stat_at(fd.as_fd(), name_c, &shared.statx_supported) {
-            Ok(stat) => {
-                trace!(
-                    name = %String::from_utf8_lossy(name),
-                    apparent = stat.size.apparent,
-                    disk = stat.size.real,
-                    "stat"
-                );
-                let kind = kind_of(stat.file_type);
-                let mut entry = BatchEntry {
-                    name: name.to_vec(),
-                    kind,
-                    apparent: stat.size.apparent,
-                    disk: stat.size.real,
-                    mtime: stat.mtime,
-                    nlink: stat.nlink,
-                    ino: stat.ino,
-                    dev: stat.dev,
-                    error: false,
-                    child_token: None,
-                    excluded: None,
-                };
-                if kind == Kind::Dir {
-                    let mut descend_via: Option<JobFd> = None;
-                    if stat.dev != job_dev {
-                        // Mount point: classify before deciding.
-                        match classify_mount(fd.as_fd(), name_c) {
-                            MountKind::KernFs => {
-                                debug!(
-                                    name = %String::from_utf8_lossy(name),
-                                    "kernel pseudo-filesystem: not descending"
-                                );
-                                entry.excluded = Some(ExcludedReason::KernFs);
-                            }
-                            MountKind::Real(child_fd) if shared.cross_filesystems => {
-                                descend_via = Some(JobFd::Opened(child_fd));
-                            }
-                            MountKind::Real(_) => {
-                                debug!(
-                                    name = %String::from_utf8_lossy(name),
-                                    dev = stat.dev,
-                                    "mount boundary: not descending"
-                                );
-                                entry.excluded = Some(ExcludedReason::OtherFs);
-                            }
-                            MountKind::Unreadable(errno) if shared.cross_filesystems => {
-                                debug!(
-                                    name = %String::from_utf8_lossy(name),
-                                    %errno,
-                                    "mount point unreadable"
-                                );
-                                sums.errors += 1;
-                                entry.error = true;
-                            }
-                            MountKind::Unreadable(_) => {
-                                // We were not going to descend anyway.
-                                entry.excluded = Some(ExcludedReason::OtherFs);
-                            }
-                        }
-                    } else {
-                        descend_via = Some(JobFd::At(fd.clone(), name.to_vec()));
+/// io_uring enumeration: collect up to [`STAT_BURST`] names per getdents
+/// sweep, stat them in one batched submit, then integrate the results in
+/// enumeration order — identical entries, sums, and section boundaries
+/// as the sync path (`SECTION_CAP` is a multiple of the burst size).
+fn enumerate_uring(
+    ctx: &JobCtx<'_>,
+    iter: &mut RawDir<'_, BorrowedFd<'_>>,
+    section: &mut Section,
+    batcher: &mut StatxBatcher,
+    tx: &Sender<Batch>,
+) -> bool {
+    // Owned copies: dirent names borrow the getdents buffer, which is
+    // reused across bursts, while the kernel needs each name alive until
+    // its statx CQE is reaped (see `StatxBatcher::stat_burst`).
+    let mut names: Vec<CString> = Vec::with_capacity(STAT_BURST);
+    let mut dtypes: Vec<FileType> = Vec::with_capacity(STAT_BURST);
+    let mut results = Vec::with_capacity(STAT_BURST);
+    let mut done = false;
+    while !done {
+        names.clear();
+        dtypes.clear();
+        while names.len() < STAT_BURST {
+            match iter.next() {
+                Some(Ok(dirent)) => {
+                    let name_c = dirent.file_name();
+                    let name = name_c.to_bytes();
+                    if name == b"." || name == b".." {
+                        continue;
                     }
-                    if let Some(job_fd) = descend_via {
-                        let child_token = shared.next_token.fetch_add(1, Ordering::Relaxed);
-                        entry.child_token = Some(child_token);
-                        child_dirs += 1;
-                        shared.pending_jobs.fetch_add(1, Ordering::AcqRel);
-                        local.push(Job {
-                            fd: job_fd,
-                            token: child_token,
-                            dev: stat.dev,
-                        });
-                    }
+                    names.push(name_c.to_owned());
+                    dtypes.push(dirent.file_type());
                 }
-                entry
-            }
-            Err(errno) => {
-                debug!(
-                    name = %String::from_utf8_lossy(name),
-                    %errno,
-                    "stat failed"
-                );
-                sums.errors += 1;
-                BatchEntry {
-                    name: name.to_vec(),
-                    kind: kind_of(dirent.file_type()),
-                    apparent: 0,
-                    disk: 0,
-                    mtime: 0,
-                    nlink: 0,
-                    ino: 0,
-                    dev: 0,
-                    error: true,
-                    child_token: None,
-                    excluded: None,
+                Some(Err(errno)) => {
+                    // Same taxonomy as the sync path: entries already
+                    // enumerated are kept, the directory is counted as
+                    // partially errored.
+                    warn!(token = ctx.token, %errno, "getdents failed mid-directory");
+                    section.sums.errors += 1;
+                    done = true;
+                    break;
+                }
+                None => {
+                    done = true;
+                    break;
                 }
             }
-        };
-        sums.apparent += entry.apparent;
-        sums.disk += entry.disk;
-        sums.count += 1;
-        entries.push(entry);
-
-        if entries.len() >= SECTION_CAP {
-            // Giant directory: flush a full section (D2 — one run each).
-            let batch = Batch {
-                dir_token: token,
-                entries: std::mem::take(&mut entries),
-                sums: std::mem::take(&mut sums),
-                is_last_section: false,
-                child_dirs: std::mem::take(&mut child_dirs),
-                dir_error: None,
+        }
+        batcher.stat_burst(ctx.fd.as_fd(), &names, &mut results);
+        for (i, name_c) in names.iter().enumerate() {
+            let stat = match results[i] {
+                Some(stat) => stat,
+                // io_uring could not run this entry (broken ring or a
+                // refused op): resolve it synchronously so the recorded
+                // outcome always comes from a real statx/fstatat answer.
+                None => stat_at(ctx.fd.as_fd(), name_c, &ctx.shared.statx_supported),
             };
-            if !send_batch(tx, shared, batch) {
+            handle_entry(ctx, section, name_c, dtypes[i], stat);
+            if section.entries.len() >= SECTION_CAP
+                && !send_batch(tx, ctx.shared, section.take(ctx.token, false))
+            {
                 return false;
             }
         }
     }
+    true
+}
 
-    // Final (possibly empty) section: carries the self-token release.
-    send_batch(
-        tx,
-        shared,
-        Batch {
-            dir_token: token,
-            entries,
-            sums,
-            is_last_section: true,
-            child_dirs,
-            dir_error: None,
-        },
-    )
+/// Integrate one enumerated entry into the section: `BatchEntry`
+/// construction, mount classification, child-job push, pre-sums. The
+/// single definition of per-entry semantics — both stat engines feed it,
+/// so their recorded results and error taxonomy cannot drift apart.
+fn handle_entry(
+    ctx: &JobCtx<'_>,
+    section: &mut Section,
+    name_c: &CStr,
+    d_type: FileType,
+    stat: Result<EntryStat, Errno>,
+) {
+    let name = name_c.to_bytes();
+    let entry = match stat {
+        Ok(stat) => {
+            trace!(
+                name = %String::from_utf8_lossy(name),
+                apparent = stat.size.apparent,
+                disk = stat.size.real,
+                "stat"
+            );
+            let kind = kind_of(stat.file_type);
+            let mut entry = BatchEntry {
+                name: name.to_vec(),
+                kind,
+                apparent: stat.size.apparent,
+                disk: stat.size.real,
+                mtime: stat.mtime,
+                nlink: stat.nlink,
+                ino: stat.ino,
+                dev: stat.dev,
+                error: false,
+                child_token: None,
+                excluded: None,
+            };
+            if kind == Kind::Dir {
+                let mut descend_via: Option<JobFd> = None;
+                if stat.dev != ctx.dev {
+                    // Mount point: classify before deciding.
+                    match classify_mount(ctx.fd.as_fd(), name_c) {
+                        MountKind::KernFs => {
+                            debug!(
+                                name = %String::from_utf8_lossy(name),
+                                "kernel pseudo-filesystem: not descending"
+                            );
+                            entry.excluded = Some(ExcludedReason::KernFs);
+                        }
+                        MountKind::Real(child_fd) if ctx.shared.cross_filesystems => {
+                            descend_via = Some(JobFd::Opened(child_fd));
+                        }
+                        MountKind::Real(_) => {
+                            debug!(
+                                name = %String::from_utf8_lossy(name),
+                                dev = stat.dev,
+                                "mount boundary: not descending"
+                            );
+                            entry.excluded = Some(ExcludedReason::OtherFs);
+                        }
+                        MountKind::Unreadable(errno) if ctx.shared.cross_filesystems => {
+                            debug!(
+                                name = %String::from_utf8_lossy(name),
+                                %errno,
+                                "mount point unreadable"
+                            );
+                            section.sums.errors += 1;
+                            entry.error = true;
+                        }
+                        MountKind::Unreadable(_) => {
+                            // We were not going to descend anyway.
+                            entry.excluded = Some(ExcludedReason::OtherFs);
+                        }
+                    }
+                } else {
+                    descend_via = Some(JobFd::At(ctx.fd.clone(), name.to_vec()));
+                }
+                if let Some(job_fd) = descend_via {
+                    let child_token = ctx.shared.next_token.fetch_add(1, Ordering::Relaxed);
+                    entry.child_token = Some(child_token);
+                    section.child_dirs += 1;
+                    ctx.shared.pending_jobs.fetch_add(1, Ordering::AcqRel);
+                    ctx.local.push(Job {
+                        fd: job_fd,
+                        token: child_token,
+                        dev: stat.dev,
+                    });
+                }
+            }
+            entry
+        }
+        Err(errno) => {
+            debug!(
+                name = %String::from_utf8_lossy(name),
+                %errno,
+                "stat failed"
+            );
+            section.sums.errors += 1;
+            BatchEntry {
+                name: name.to_vec(),
+                kind: kind_of(d_type),
+                apparent: 0,
+                disk: 0,
+                mtime: 0,
+                nlink: 0,
+                ino: 0,
+                dev: 0,
+                error: true,
+                child_token: None,
+                excluded: None,
+            }
+        }
+    };
+    section.sums.apparent += entry.apparent;
+    section.sums.disk += entry.disk;
+    section.sums.count += 1;
+    section.entries.push(entry);
 }
 
 fn error_batch(token: u64, errno: Errno) -> Batch {
@@ -390,13 +549,30 @@ fn send_batch(tx: &Sender<Batch>, shared: &WorkerShared, batch: Batch) -> bool {
     }
 }
 
-struct EntryStat {
-    file_type: FileType,
-    size: Size,
-    mtime: i64,
-    nlink: u32,
-    ino: u64,
-    dev: u64,
+#[derive(Clone, Copy)]
+pub(crate) struct EntryStat {
+    pub file_type: FileType,
+    pub size: Size,
+    pub mtime: i64,
+    pub nlink: u32,
+    pub ino: u64,
+    pub dev: u64,
+}
+
+impl EntryStat {
+    /// Field extraction from a `statx` result — shared verbatim by the
+    /// sync path and the io_uring completion path (which also share
+    /// [`STATX_MASK`]), so the recorded fields cannot diverge.
+    pub(crate) fn from_statx(x: &rustix::fs::Statx) -> Self {
+        Self {
+            file_type: FileType::from_raw_mode(u32::from(x.stx_mode)),
+            size: Size::new(x.stx_size, x.stx_blocks),
+            mtime: x.stx_mtime.tv_sec,
+            nlink: x.stx_nlink,
+            ino: x.stx_ino,
+            dev: rustix::fs::makedev(x.stx_dev_major, x.stx_dev_minor),
+        }
+    }
 }
 
 /// `statx` with a runtime fallback to `fstatat` when the kernel (or a
@@ -409,23 +585,8 @@ fn stat_at(
     statx_supported: &AtomicBool,
 ) -> Result<EntryStat, Errno> {
     if statx_supported.load(Ordering::Relaxed) {
-        let mask = StatxFlags::TYPE
-            | StatxFlags::SIZE
-            | StatxFlags::BLOCKS
-            | StatxFlags::MTIME
-            | StatxFlags::NLINK
-            | StatxFlags::INO;
-        match rustix::fs::statx(dirfd, name, AtFlags::SYMLINK_NOFOLLOW, mask) {
-            Ok(x) => {
-                return Ok(EntryStat {
-                    file_type: FileType::from_raw_mode(u32::from(x.stx_mode)),
-                    size: Size::new(x.stx_size, x.stx_blocks),
-                    mtime: x.stx_mtime.tv_sec,
-                    nlink: x.stx_nlink,
-                    ino: x.stx_ino,
-                    dev: rustix::fs::makedev(x.stx_dev_major, x.stx_dev_minor),
-                });
-            }
+        match rustix::fs::statx(dirfd, name, AtFlags::SYMLINK_NOFOLLOW, STATX_MASK) {
+            Ok(x) => return Ok(EntryStat::from_statx(&x)),
             Err(Errno::NOSYS) => {
                 debug!("statx unsupported (ENOSYS), falling back to fstatat for this scan");
                 statx_supported.store(false, Ordering::Relaxed);

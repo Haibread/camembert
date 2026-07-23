@@ -16,7 +16,7 @@ use camembert_core::dump::read::DumpReader;
 use camembert_core::dump::{self, DumpMeta, encode_name};
 use camembert_core::flat;
 use camembert_core::ncdu;
-use camembert_core::scan::{ScanOptions, Scanner};
+use camembert_core::scan::{ScanOptions, Scanner, StatxEngine};
 use camembert_core::size::{HumanSize, SignedHumanSize, parse_size};
 
 /// Disk usage analyzer: what grew, what is freeable, what is cold.
@@ -86,6 +86,23 @@ struct ScanArgs {
     /// Cross filesystem boundaries instead of stopping at mount points (env: CROSS_FILESYSTEMS)
     #[arg(long, env = "CROSS_FILESYSTEMS")]
     cross_filesystems: bool,
+
+    /// Stat engine for the scan: auto, sync, io_uring — experimental (env: STATX_ENGINE)
+    ///
+    /// Per-entry metadata (statx) is fetched either with plain syscalls
+    /// (`sync`) or batched through per-worker io_uring rings (`io_uring`,
+    /// kernel 5.6+; unavailable under default-seccomp Docker, gVisor, and
+    /// the io_uring_disabled sysctl). `auto` uses io_uring only for
+    /// low-parallelism scans (2 workers or fewer, the rotational-media
+    /// policy) where its batching measurably helps, and plain syscalls
+    /// otherwise; it probes io_uring once at scan start and falls back to
+    /// sync when it is denied. A forced `io_uring` also falls back rather
+    /// than fail the scan. Scan results are identical whichever engine
+    /// runs — only speed can differ. The choice is logged at info level
+    /// (`statx=io_uring` / `statx=sync`). Experimental: this knob and the
+    /// auto heuristic may change once cold-cache data is in.
+    #[arg(long, env = "STATX_ENGINE", value_enum, default_value_t = StatxEngineArg::Auto)]
+    statx_engine: StatxEngineArg,
 
     /// Number of entries in the "top directories" and "top files" (D5)
     /// lists, summary mode only (env: TOP)
@@ -166,6 +183,40 @@ struct ScanArgs {
     /// README's Freeable section).
     #[arg(long = "no-proc-sweep")]
     no_proc_sweep: bool,
+}
+
+/// CLI face of [`StatxEngine`] (experimental knob, see `--statx-engine`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
+enum StatxEngineArg {
+    /// io_uring for scans with ≤ 2 workers (probed, sync fallback),
+    /// plain syscalls otherwise.
+    #[default]
+    Auto,
+    /// Plain statx syscalls (with the fstatat fallback). Always works.
+    Sync,
+    /// io_uring-batched statx (still falls back if the probe fails).
+    #[value(name = "io_uring")]
+    IoUring,
+}
+
+impl std::fmt::Display for StatxEngineArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Auto => "auto",
+            Self::Sync => "sync",
+            Self::IoUring => "io_uring",
+        })
+    }
+}
+
+impl From<StatxEngineArg> for StatxEngine {
+    fn from(arg: StatxEngineArg) -> Self {
+        match arg {
+            StatxEngineArg::Auto => Self::Auto,
+            StatxEngineArg::Sync => Self::Sync,
+            StatxEngineArg::IoUring => Self::IoUring,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -631,6 +682,7 @@ fn run_scan(cli: &Cli) -> ExitCode {
     let scanner = Scanner::new(ScanOptions {
         threads: args.threads,
         cross_filesystems: args.cross_filesystems,
+        statx_engine: args.statx_engine.into(),
     });
 
     if interactive {

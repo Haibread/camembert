@@ -3626,7 +3626,7 @@ mod tests {
     fn scan_dir(path: &Path) -> ScanOutcome {
         let mut outcome = Scanner::new(ScanOptions {
             threads: 2,
-            cross_filesystems: false,
+            ..ScanOptions::default()
         })
         .scan(path)
         .expect("scan of a tempdir never fails");

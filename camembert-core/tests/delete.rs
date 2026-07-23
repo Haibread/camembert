@@ -12,7 +12,7 @@ use camembert_core::tree::{NodeFlags, NodeId};
 fn scan(path: &Path) -> ScanOutcome {
     Scanner::new(ScanOptions {
         threads: 2,
-        cross_filesystems: false,
+        ..ScanOptions::default()
     })
     .scan(path)
     .expect("scan succeeds")

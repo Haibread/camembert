@@ -204,6 +204,7 @@ fn stress_scan_is_deterministic_across_runs() {
     let scanner = Scanner::new(ScanOptions {
         threads: 8,
         cross_filesystems: false,
+        ..ScanOptions::default()
     });
     let mut reference: Option<(u64, u64, u64, u64, u64)> = None;
     for run in 0..4 {
@@ -242,6 +243,7 @@ fn kernfs_mounts_are_excluded_even_when_crossing() {
     let scanner = Scanner::new(ScanOptions {
         threads: 4,
         cross_filesystems: true,
+        ..ScanOptions::default()
     });
     let outcome = scanner.scan(Path::new("/sys/kernel")).unwrap();
     assert!(
@@ -270,6 +272,7 @@ fn error_report_uses_direct_counts() {
     let scanner = Scanner::new(ScanOptions {
         threads: 2,
         cross_filesystems: false,
+        ..ScanOptions::default()
     });
     let outcome = scanner.scan(root).unwrap();
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();

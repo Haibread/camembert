@@ -120,7 +120,7 @@ camembert diff old.cmbt today.cmbt
 ```
 
 Every option is also an environment variable (`THREADS`,
-`CROSS_FILESYSTEMS`, `TOP`, `NO_UI`, `OUTPUT`, `THRESHOLD`, `COLOR`,
+`CROSS_FILESYSTEMS`, `STATX_ENGINE`, `TOP`, `NO_UI`, `OUTPUT`, `THRESHOLD`, `COLOR`,
 `THEME`, `NO_MOTION`, `NO_PROC_SWEEP`, `LOG_FILTER`, `LOG_FILE`, …) — see
 `camembert --help` and `camembert <subcommand> --help` for the full
 reference, including the interactive key map and the diff JSON schema.
@@ -129,6 +129,7 @@ reference, including the interactive key map and the diff JSON schema.
 | --- | --- | --- |
 | `--threads` | `THREADS` | scan worker threads (`0` = auto, media-adaptive: see below) |
 | `--cross-filesystems` | `CROSS_FILESYSTEMS` | descend into other mounted filesystems instead of stopping at them |
+| `--statx-engine` | `STATX_ENGINE` | **experimental** — stat engine: `auto` (io_uring for ≤ 2-worker scans, probed, sync otherwise), `sync`, `io_uring` (see below) |
 | `--top` | `TOP` | entries in the summary's "top directories" **and** "top files" (D5) lists — one flag, two lists; the interactive `t` mode's own cap is the separate `flat_cap` config key |
 | `--no-ui` | `NO_UI` | summary mode: scan to completion, print totals, top directories, top files, no TUI |
 | `-o`/`--output` | `OUTPUT` | write a `.cmbt` dump once the scan completes (`-` = stdout) |
@@ -162,6 +163,33 @@ An explicit `--threads`/`THREADS` value always overrides this and skips
 detection. The decision is logged at `info` level (`media=ssd`,
 `media=hdd (sda rotational)`, `media=ssd (btrfs via /dev/nvme0n1p2)`,
 `media=unknown (...)`).
+
+Per-entry metadata (`statx`) is fetched by one of two engines, chosen
+once per scan and logged at `info` level (`statx=io_uring` /
+`statx=sync`):
+
+- **io_uring** (kernel ≥ 5.6): each worker batches up to 1024 `statx`
+  calls per `io_uring_enter` through its own ring. The kernel services
+  most of them on its io-wq worker threads, which is extra parallelism
+  when scan workers are scarce — measured 12–21 % faster warm-cache
+  scans at 1–2 workers — but pure scheduler contention once the workers
+  already saturate the cores (measured ~25 % *slower* at 16 workers);
+- **sync**: one `statx` syscall per entry (with an `fstatat` fallback on
+  kernels without `statx`). Always available, supported forever.
+
+`--statx-engine auto` (the default) therefore uses io_uring only for
+low-parallelism scans (2 workers or fewer — notably the rotational-media
+thread policy) and plain syscalls otherwise; the heuristic is
+warm-cache-derived and may be retuned as cold-cache data comes in. Auto
+probes io_uring once at scan start and falls back to `sync` wherever it
+is denied — default-seccomp Docker, gVisor, the
+`kernel.io_uring_disabled` sysctl, kernels older than 5.6. A scan never
+fails because io_uring is unavailable, and results are identical
+whichever engine runs; only speed can differ. Forcing `io_uring` on a
+machine that denies it also falls back (with a warning) rather than
+fail. **This knob is experimental**: it exists for tests, benchmarks,
+and diagnostics, and may change or disappear once the automatic choice
+has proven itself.
 
 ## Keys (interactive mode)
 
@@ -424,11 +452,12 @@ not gigabytes.
 
 ## Roadmap
 
-Scan engine, live TUI, dump v1, diff, ncdu import, guarded deletion, and
-freeable phase 1 (deleted-but-open files) are implemented. Next: freeable
-phase 2 (btrfs shared extents, hardlink siblings), flat view and pattern
+Scan engine (including io_uring-batched statx with a sync fallback),
+live TUI, dump v1, diff, ncdu import, guarded deletion, and freeable
+phase 1 (deleted-but-open files) are implemented. Next: freeable phase 2
+(btrfs shared extents, hardlink siblings), flat view and pattern
 aggregation, the filter query language with a command palette, per-owner
-views, io_uring statx, remote scan over ssh, and an HTML report export.
+views, remote scan over ssh, and an HTML report export.
 The full design trail lives in [`docs/design/`](docs/design/).
 
 ## Development
