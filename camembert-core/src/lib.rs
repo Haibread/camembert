@@ -5,6 +5,7 @@
 pub mod delete;
 pub mod diff;
 pub mod dump;
+pub mod freeable;
 pub mod ncdu;
 pub mod scan;
 pub mod size;

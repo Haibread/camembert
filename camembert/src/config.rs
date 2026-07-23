@@ -144,6 +144,14 @@ pub fn resolve_no_motion(cli_flag: bool, env_set: bool, file: Option<bool>) -> b
     cli_flag || env_set || file.unwrap_or(false)
 }
 
+/// Whether the freeable `/proc` sweep ends up disabled (freeable phase 1,
+/// D7): `--no-proc-sweep`/`NO_PROC_SWEEP`, presence semantics like
+/// `NO_MOTION` — but, unlike motion/color/theme, deliberately **no**
+/// `camembert.toml` key (the decisions doc keeps this flag+env only).
+pub fn resolve_no_proc_sweep(cli_flag: bool, env_set: bool) -> bool {
+    cli_flag || env_set
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,6 +212,20 @@ mod tests {
         assert!(
             resolve_no_motion(true, false, Some(false)),
             "cli disables even if config says false"
+        );
+    }
+
+    #[test]
+    fn resolve_no_proc_sweep_flag_or_env_only_no_config_key() {
+        assert!(
+            !resolve_no_proc_sweep(false, false),
+            "nothing set: sweep stays enabled"
+        );
+        assert!(resolve_no_proc_sweep(true, false), "--no-proc-sweep alone");
+        assert!(resolve_no_proc_sweep(false, true), "NO_PROC_SWEEP alone");
+        assert!(
+            resolve_no_proc_sweep(true, true),
+            "both set: still disabled (OR, not XOR)"
         );
     }
 

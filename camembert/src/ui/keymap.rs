@@ -167,6 +167,10 @@ pub const EXTRA: &[ExtraKey] = &[
         action: "delete the marked entries (confirm with y)",
     },
     ExtraKey {
+        keys: "f",
+        action: "freeable files: deleted-but-open files holding disk space (f/Esc closes)",
+    },
+    ExtraKey {
         keys: "q, Esc, Ctrl-C",
         action: "quit (cancels a running scan)",
     },

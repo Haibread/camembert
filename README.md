@@ -22,8 +22,10 @@ questions you actually have during an incident:
 - **What grew since yesterday?** — `camembert diff` two scans, sorted by
   growth, in streaming constant memory.
 - **What can I actually free?** — freeable ≠ size: hardlinks are counted
-  once and attributed deterministically; deleted-but-open files and btrfs
-  shared extents are on the roadmap.
+  once and attributed deterministically; deleted-but-open files holding
+  disk space are found and shown (see [Freeable](#freeable-deleted-but-open-files)
+  below) — btrfs shared extents and hardlink siblings are phase 2, on the
+  roadmap.
 - **What is big *and* cold?** — size × age, visible at a glance.
 
 And it is **honest about the numbers** other tools get wrong: hardlinks,
@@ -60,6 +62,16 @@ everything then snaps straight to its target value. Below 100 columns
 the side wheel panel has nowhere to go, so a compact mini-donut takes
 over the header line instead (not a click target, unlike the full
 panel); `z` toggles **zen mode** — table only, no cards/gauge/wheel.
+
+Once the scan completes, a quick `/proc` sweep looks for files a process
+is still holding open after every path to them was deleted — space `df`
+counts but no directory tree can show you. When it finds enough to be
+worth mentioning (≥ 100 MiB **and** ≥ 1% of the filesystem), the disk
+gauge grows a clickable "· X.X GiB freeable" suffix and a one-time toast
+points at `f`, which opens a scrollable panel: each file's last-known
+path, the holding process(es), and its size. See
+[Freeable](#freeable-deleted-but-open-files) below for exactly what this
+does and doesn't cover.
 
 Three themes are available with `--theme`/env `THEME`: `tokyo-night`
 (default), `light` (a Tokyo-Night-"day"-style variant for a light
@@ -109,9 +121,22 @@ camembert diff old.cmbt today.cmbt
 
 Every option is also an environment variable (`THREADS`,
 `CROSS_FILESYSTEMS`, `TOP`, `NO_UI`, `OUTPUT`, `THRESHOLD`, `COLOR`,
-`THEME`, `NO_MOTION`, `LOG_FILTER`, `LOG_FILE`, …) — see `camembert
---help` and `camembert <subcommand> --help` for the full reference,
-including the interactive key map and the diff JSON schema.
+`THEME`, `NO_MOTION`, `NO_PROC_SWEEP`, `LOG_FILTER`, `LOG_FILE`, …) — see
+`camembert --help` and `camembert <subcommand> --help` for the full
+reference, including the interactive key map and the diff JSON schema.
+
+| Flag | Env | What it does |
+| --- | --- | --- |
+| `--threads` | `THREADS` | scan worker threads (`0` = auto) |
+| `--cross-filesystems` | `CROSS_FILESYSTEMS` | descend into other mounted filesystems instead of stopping at them |
+| `--no-ui` | `NO_UI` | summary mode: scan to completion, print totals, no TUI |
+| `-o`/`--output` | `OUTPUT` | write a `.cmbt` dump once the scan completes (`-` = stdout) |
+| `--color` | `COLOR` | `auto`/`always`/`never` |
+| `--theme` | `THEME` | `tokyo-night`/`light`/`high-contrast` |
+| `--no-motion` | `NO_MOTION` | disable bar/donut easing animations |
+| `--no-proc-sweep` | `NO_PROC_SWEEP` | disable the freeable `/proc` sweep (gauge suffix, `f` panel, toast, pre-deletion open-file check) |
+| `--log-filter` | `LOG_FILTER` | `tracing` filter directive |
+| `--log-file` | `LOG_FILE` | write diagnostics to a file instead of discarding them |
 
 ## Keys (interactive mode)
 
@@ -122,6 +147,7 @@ including the interactive key map and the diff JSON schema.
 | `p` | toggle the apparent-size column |
 | `Space` `u` `D` | mark for deletion · clear marks · delete (confirm with `y`) |
 | `v` | review marked entries: a scrollable list, `Space` unmarks a row, `D` deletes from there too |
+| `f` | freeable files: deleted-but-open files still holding disk space (`f`/`Esc` closes) |
 | `?` | keyboard/mouse cheatsheet (`?`/`Esc` closes) |
 | `z` | toggle zen mode: table only — no metric cards, disk gauge or donut wheel |
 | `q`/`Esc` | quit (cancels a running scan) |
@@ -129,7 +155,17 @@ including the interactive key map and the diff JSON schema.
 **Deletion is guarded**: mark-then-confirm, mount points refused, every
 entry re-checked (existence, file type, device) immediately before
 removal — anything that changed since the scan is skipped, never
-deleted. Symlinks are removed, never followed.
+deleted. Symlinks are removed, never followed. Before the confirmation
+dialog opens, a fresh (unless `--no-proc-sweep`) `/proc` check looks for
+processes still holding the marked selection open — a marked *file*'s own
+`(dev, ino)`, and for a marked *directory*, any open file found anywhere
+underneath it (so marking a data directory whose individual files are
+what's actually held open still warns, not just marking the file
+directly) — and adds an advisory line naming the busiest few. It never
+blocks `y`, and says so plainly when it could only see part of the
+process table rather than staying silent (the same caveat also covers a
+process in a different mount namespace whose open-file path doesn't
+textually match the marked directory).
 
 While at least one entry is marked, a one-line **basket strip** appears
 above the footer (count + total size) — it disappears again once nothing
@@ -137,8 +173,9 @@ is marked, so browsing without ever marking anything never sees the
 layout shift. **Toasts** in the top-right corner announce things that
 *happened* rather than input being validated — a dump written, a
 deletion finishing (with the space freed), the scan itself finishing
-while you keep browsing — stacking and auto-dismissing after a few
-seconds; they never cover the delete-confirmation dialog. Ordinary
+while you keep browsing, and (once, when it clears the threshold) how
+much is freeable by closing files — stacking and auto-dismissing after a
+few seconds; they never cover the delete-confirmation dialog. Ordinary
 keypress feedback (mark refusals, "nothing marked") stays a quick footer
 note instead, right next to the key hints it explains.
 
@@ -158,6 +195,53 @@ requires the mouse:
 | Move the mouse over a row | update the selection card below the table, without moving the keyboard cursor |
 
 Moving the keyboard cursor reclaims the selection card from the mouse.
+
+## Freeable (deleted-but-open files)
+
+A process can `unlink` a file and keep writing to it: the name is gone,
+`du` (and camembert's own tree) has no path left to attribute the space
+to, but the inode's blocks stay allocated until the last open descriptor
+closes — the classic "`df` says full, `du` says empty" gap. Once the scan
+completes, camembert runs one `/proc` sweep looking for exactly these
+files (skippable with `--no-proc-sweep`/`NO_PROC_SWEEP`, e.g. for
+containers with a masked `/proc`) and surfaces what it finds through the
+disk gauge's suffix, a one-time toast, and the `f` panel (evidence path,
+holder PID(s) and process name, allocated size, grouped display-only
+under the deepest still-existing directory).
+
+**What this covers, precisely — and what it does not** (phase 1; btrfs
+shared extents and hardlink siblings are phase 2):
+
+- **Scope**: only files on the **scan root's own filesystem** count
+  toward the gauge and the toast threshold — the same filesystem the
+  disk gauge itself describes, so the number is always a coherent
+  subset of "used". With `--cross-filesystems`, files held open on
+  *other* crossed devices still appear in the panel, labeled by device,
+  but are never added to the gauge.
+- **btrfs multi-subvolume layouts**: several subvolumes mounted as
+  separate `st_dev`s can share one underlying block pool. Because scope
+  is decided by `st_dev`, a deleted-open file on a sibling subvolume
+  outside the scan root is invisible to this sweep — a known
+  under-count on that layout, not a silent one: the panel says so.
+- **mmap-only holders**: a process that `mmap`ed the file and closed its
+  file descriptor keeps the inode alive with no entry in
+  `/proc/[pid]/fd` — seeing that requires `/proc/[pid]/map_files`, which
+  needs `CAP_SYS_ADMIN`. Phase 1 does not attempt it; such holders are
+  invisible.
+- **RAM-backed, not disk**: `memfd`/POSIX or SysV shared memory/tmpfs
+  inodes are real allocations, but of RAM, not the scanned disk. They
+  are never folded into the freeable total — the panel reports them as
+  one separate "N RAM-backed (memfd/shm), not disk space" line instead,
+  so they read as a distinct fact rather than a suspiciously-round
+  coincidence.
+- **Process-table coverage**: reading another user's `/proc/[pid]/fd` is
+  permission-gated. When the sweep could not read every process, the
+  panel (and the pre-deletion advisory, D6) say "N of M processes
+  readable — run as root for the full view" instead of staying quiet —
+  an absent warning must never be mistaken for a clean bill of health.
+- **Nothing here reaches a dump.** Open-file state is process state,
+  stale the instant the sweep finishes; a `.cmbt` dump loaded later has
+  no ledger at all — the hint lives in the live TUI only.
 
 ## Configuration
 
@@ -224,20 +308,24 @@ not gigabytes.
   descended into, even with `--cross-filesystems`.
 - The disk gauge tells you how much of the *occupied* filesystem your
   scan actually covers — a total without context is half a lie.
+- Freeable (deleted-but-open files) states its scope and its gaps out
+  loud — root-filesystem-only, btrfs multi-subvolume under-counting,
+  mmap-only blind spot, RAM-backed split — see
+  [Freeable](#freeable-deleted-but-open-files).
 
 ## Roadmap
 
-Scan engine, live TUI, dump v1, diff, ncdu import, and guarded deletion
-are implemented. Next: the freeable column (deleted-but-open files,
-btrfs shared extents), flat view and pattern aggregation, the filter
-query language with a command palette, per-owner views, io_uring statx,
-remote scan over ssh, and an HTML report export. The full design trail
-lives in [`docs/design/`](docs/design/).
+Scan engine, live TUI, dump v1, diff, ncdu import, guarded deletion, and
+freeable phase 1 (deleted-but-open files) are implemented. Next: freeable
+phase 2 (btrfs shared extents, hardlink siblings), flat view and pattern
+aggregation, the filter query language with a command palette, per-owner
+views, io_uring statx, remote scan over ssh, and an HTML report export.
+The full design trail lives in [`docs/design/`](docs/design/).
 
 ## Development
 
 ```bash
-cargo test --workspace          # the suite (~130 tests)
+cargo test --workspace          # the suite (~260 tests)
 pre-commit install              # fmt + clippy -D warnings + hygiene hooks
 ```
 

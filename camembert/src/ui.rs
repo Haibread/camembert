@@ -37,6 +37,7 @@
 mod anim;
 pub mod caps;
 mod fmt;
+mod freeable_panel;
 mod keymap;
 mod osc11;
 mod state;
@@ -47,6 +48,8 @@ mod wheel;
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::mpsc::{self, Receiver};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use crossterm::event::{
@@ -64,6 +67,7 @@ use tracing::{debug, error, info, warn};
 
 use camembert_core::delete;
 use camembert_core::dump::{self, DumpMeta};
+use camembert_core::freeable::{self, Ledger};
 use camembert_core::scan::{LiveScan, ScanOutcome, Scanner};
 use camembert_core::size::HumanSize;
 use camembert_core::tree::{DirId, NodeId};
@@ -137,6 +141,11 @@ struct RenderCtx {
     /// `--no-motion`/`NO_MOTION` set this to `false`, in which case bars
     /// and the donut always render at their target value.
     animate: bool,
+    /// `--no-proc-sweep`/`NO_PROC_SWEEP` (freeable phase 1, D7): disables
+    /// both the scan-end `/proc` sweep and the pre-deletion open-file
+    /// index refresh — for paranoid environments and containers with a
+    /// masked `/proc`.
+    no_proc_sweep: bool,
 }
 
 impl RenderCtx {
@@ -201,7 +210,10 @@ enum Phase {
 /// slice 6); `None` means none of them did, in which case an OSC 11
 /// background query — bounded, and skipped outright on a non-tty or
 /// `TERM=dumb` — auto-selects `light` when the terminal answers with a
-/// light background, before the alternate screen opens.
+/// light background, before the alternate screen opens. `no_proc_sweep` is
+/// `--no-proc-sweep`/`NO_PROC_SWEEP` (freeable phase 1, D7): disables both
+/// the scan-end `/proc` sweep and the pre-deletion open-file index
+/// refresh.
 pub fn run(
     scanner: Scanner,
     path: &Path,
@@ -209,11 +221,13 @@ pub fn run(
     caps: Caps,
     animate: bool,
     theme_choice: Option<ThemeName>,
+    no_proc_sweep: bool,
 ) -> io::Result<()> {
     info!(
         ?caps,
         animate,
         ?theme_choice,
+        no_proc_sweep,
         "terminal capabilities detected"
     );
     let theme_name = resolve_theme_name(theme_choice);
@@ -228,6 +242,7 @@ pub fn run(
         theme: Theme::new(theme_name, caps.color),
         disk,
         animate,
+        no_proc_sweep,
     };
     let result = event_loop(&mut terminal, live, output, &ctx);
     disable_mouse_capture();
@@ -380,13 +395,17 @@ fn event_loop(
     // Bar/donut animation state (design slice 5) — see the `anim` module
     // doc. `ctx.animate` is `false` for `--no-motion`/`NO_MOTION`.
     let mut motion = anim::Motion::new(ctx.animate);
+    // Freeable phase 1 (D4): `Some` from scan end until the off-thread
+    // sweep's result lands, polled non-blockingly below (step 2.5) — never
+    // set at all under `--no-proc-sweep`/`NO_PROC_SWEEP`.
+    let mut sweep_rx: Option<Receiver<Ledger>> = None;
 
     loop {
         // 1. Input (drain everything pending; block at most one frame
         //    while something needs a timely redraw of its own accord —
         //    otherwise idle: a quiescent UI costs nothing between
         //    keypresses, design slice 5).
-        let mut deadline = if needs_frequent_polling(&phase, &flash, &toasts, &motion) {
+        let mut deadline = if needs_frequent_polling(&phase, &flash, &toasts, &motion, &sweep_rx) {
             FRAME
         } else {
             IDLE_POLL
@@ -403,6 +422,7 @@ fn event_loop(
                         &mut local_generation,
                         &mut flash,
                         &mut toasts,
+                        ctx.no_proc_sweep,
                     ) {
                         Action::Quit => {
                             if let Phase::Scanning(live) = phase {
@@ -457,12 +477,50 @@ fn event_loop(
                 "scan finished in {}",
                 fmt::humanize_duration(outcome.elapsed)
             ));
+            // Freeable phase 1 (D4): one sweep off the UI thread, scoped to
+            // the scan root's own filesystem — the same `st_dev`
+            // camembert-core already recorded on the root directory for
+            // mount-boundary detection (D2: "the same filesystem the
+            // statvfs disk gauge describes"). Reusing that scanned value
+            // is cheaper and more honest than a fresh `statat` here, which
+            // would race a filesystem that changed underneath since the
+            // scan started.
+            if !ctx.no_proc_sweep {
+                let root_dev = outcome.dir(outcome.root()).dev;
+                sweep_rx = spawn_freeable_sweep(root_dev);
+            }
             local_generation = ui.snapshot().generation;
             phase = Phase::Done(Box::new(outcome));
             // Re-view the current dir so states/totals show final values,
             // resolving any nav request the owner no longer serves.
             let dir = ui.pending_nav().unwrap_or(ui.snapshot().dir);
             serve_local(&phase, dir, &mut local_generation, &mut ui);
+        }
+
+        // 2.5. Freeable sweep result landed? (D4/D5 — polled
+        // non-blockingly; `needs_frequent_polling` above keeps the loop at
+        // FRAME cadence while `sweep_rx` is still pending, so this lands
+        // within a frame or two of the sweep actually finishing.)
+        if let Some(rx) = &sweep_rx {
+            match rx.try_recv() {
+                Ok(ledger) => {
+                    let freeable_bytes = ledger.root_fs_freeable_bytes();
+                    let capacity = ctx.disk.map_or(0, |disk| disk.capacity);
+                    if freeable_panel::should_toast(freeable_bytes, capacity) {
+                        toasts.push(format!(
+                            "{} freeable by closing files — press f",
+                            HumanSize(freeable_bytes)
+                        ));
+                    }
+                    ui.set_freeable_ledger(ledger);
+                    sweep_rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    debug!("freeable sweep thread ended without a result");
+                    sweep_rx = None;
+                }
+            }
         }
 
         // 3. Snapshot for this frame (wait-free).
@@ -510,26 +568,65 @@ fn event_loop(
         })?;
         // Recomputed every frame (design slice 3): mouse events hit-test
         // against exactly what is on screen right now.
+        if let Some(total_rows) = geometry.freeable_rows {
+            // Same feedback idiom as `set_geometry` itself: the freeable
+            // panel's true row count is only known once actually drawn, so
+            // the scroll cursor is reined in here rather than at every
+            // keypress (see `UiState::clamp_freeable_cursor`).
+            ui.clamp_freeable_cursor(total_rows);
+        }
         ui.set_geometry(geometry);
+    }
+}
+
+/// Spawn the scan-end `/proc` sweep (D4) off the UI thread, scoped to
+/// `root_dev`. The sweep is plain data in, plain [`Ledger`] out (~25ms
+/// measured cost, see the `freeable` module doc) — a bare
+/// [`thread::Builder`] + a one-shot channel is the simplest fit, rather
+/// than routing it through the scan's own snapshot/bus machinery (which
+/// exists for the very different job of many incremental updates from a
+/// long-lived scan owner). `try_recv` in the render loop's own poll keeps
+/// this from ever blocking a frame. Returns `None` (logged, never fatal)
+/// if the thread could not be spawned at all — the session simply has no
+/// freeable data this run, same as `--no-proc-sweep`.
+fn spawn_freeable_sweep(root_dev: u64) -> Option<Receiver<Ledger>> {
+    let (tx, rx) = mpsc::channel();
+    match thread::Builder::new()
+        .name("freeable-sweep".to_owned())
+        .spawn(move || {
+            let ledger = freeable::sweep(root_dev);
+            // The receiver may already be gone (process exiting); a failed
+            // send just means nobody is listening anymore.
+            let _ = tx.send(ledger);
+        }) {
+        Ok(_handle) => Some(rx),
+        Err(err) => {
+            warn!(%err, "failed to spawn the freeable sweep thread; no freeable data this session");
+            None
+        }
     }
 }
 
 /// Whether the render loop needs to keep polling at [`FRAME`] cadence
 /// even without new input: a running scan (progress arrives off the
-/// input stream), an in-flight bar/donut animation, or a toast/flash
-/// that still needs to expire on schedule. `false` means nothing on
-/// screen changes until the user does something, so the loop idles at
-/// [`IDLE_POLL`] instead (design slice 5).
+/// input stream), an in-flight bar/donut animation, a toast/flash that
+/// still needs to expire on schedule, or a freeable sweep whose result
+/// hasn't landed yet (D4 — `sweep_rx` is `Some` from scan end until
+/// `try_recv` succeeds). `false` means nothing on screen changes until the
+/// user does something, so the loop idles at [`IDLE_POLL`] instead (design
+/// slice 5).
 fn needs_frequent_polling(
     phase: &Phase,
     flash: &Flash,
     toasts: &ToastQueue,
     motion: &anim::Motion,
+    sweep_rx: &Option<Receiver<Ledger>>,
 ) -> bool {
     matches!(phase, Phase::Scanning(_))
         || motion.is_active()
         || flash.is_set()
         || !toasts.is_empty()
+        || sweep_rx.is_some()
 }
 
 fn spinner_frame(ctx: &RenderCtx, elapsed: Duration) -> char {
@@ -546,12 +643,19 @@ enum Action {
     Quit,
 }
 
-/// Modal precedence (design slice 4): confirm > review > cheatsheet, only
-/// one open at a time, keys route to the open modal only. Each modal
-/// branch below `return`s unconditionally, so the normal-mode match at
-/// the bottom is only ever reached with none of them open — which is
-/// also what keeps that invariant true: opening a modal from normal mode
-/// can never happen while a higher-precedence one is up.
+/// Modal precedence (D5 extends design slice 4's ladder — confirm beats
+/// review beats the freeable panel beats the cheatsheet), only one open at
+/// a time, keys route to the open modal only. Each modal branch below
+/// `return`s unconditionally, so the normal-mode match at the bottom is
+/// only ever reached with none of them open — which is also what keeps
+/// that invariant true: opening a modal from normal mode can never happen
+/// while a higher-precedence one is up. `no_proc_sweep` is
+/// `--no-proc-sweep`/`NO_PROC_SWEEP` (D7): `D` skips the pre-deletion
+/// open-file refresh outright when set.
+// Every parameter is an independent per-keypress input (the key itself,
+// the UI/phase/generation/flash/toast state it can mutate, and the one
+// runtime flag): same shape as `draw`'s own too-many-arguments allowance.
+#[allow(clippy::too_many_arguments)]
 fn handle_key(
     code: KeyCode,
     modifiers: KeyModifiers,
@@ -560,6 +664,7 @@ fn handle_key(
     generation: &mut u64,
     flash: &mut Flash,
     toasts: &mut ToastQueue,
+    no_proc_sweep: bool,
 ) -> Action {
     // The confirmation modal captures every key: `y` confirms, anything
     // else cancels (Ctrl-C keeps quitting — safety hatch).
@@ -583,9 +688,18 @@ fn handle_key(
             // the same confirm modal `D` opens from the main view.
             KeyCode::Char('D') => {
                 ui.close_review();
-                open_delete_confirm(ui, phase, flash);
+                open_delete_confirm(ui, phase, flash, no_proc_sweep);
             }
             KeyCode::Char('v') | KeyCode::Esc => ui.close_review(),
+            _ => {}
+        }
+        return Action::Continue;
+    }
+    if ui.freeable_open() {
+        match code {
+            KeyCode::Down | KeyCode::Char('j') => ui.freeable_move_down(),
+            KeyCode::Up | KeyCode::Char('k') => ui.freeable_move_up(),
+            KeyCode::Char('f') | KeyCode::Esc => ui.close_freeable_panel(),
             _ => {}
         }
         return Action::Continue;
@@ -602,8 +716,9 @@ fn handle_key(
         KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => try_descend(ui, phase),
         KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => try_ascend(ui, phase),
         KeyCode::Char(' ') => try_toggle_mark(ui, phase, flash),
-        KeyCode::Char('D') => open_delete_confirm(ui, phase, flash),
+        KeyCode::Char('D') => open_delete_confirm(ui, phase, flash, no_proc_sweep),
         KeyCode::Char('v') => try_open_review(ui, flash),
+        KeyCode::Char('f') => open_freeable_panel(ui, phase),
         // Every other key (movement, sort, `p`, `u`, `?`) is stateless
         // enough to live in the keymap dispatch table (`ui::keymap`) —
         // the single source the `?` cheatsheet also renders from.
@@ -633,16 +748,17 @@ fn try_ascend(ui: &mut UiState, phase: &Phase) {
 
 /// Route a mouse event against the last frame's [`FrameGeometry`] (mouse
 /// support, design slice 3). Inert while any modal is open — confirm,
-/// review or cheatsheet (design slice 4) — they only listen to the
-/// keyboard; a click through to a hidden row underneath would be
-/// surprising.
+/// review, the freeable panel (D5) or cheatsheet (design slice 4) — they
+/// only listen to the keyboard; a click through to a hidden row
+/// underneath would be surprising.
 fn handle_mouse(
     mouse: MouseEvent,
     ui: &mut UiState,
     phase: &Phase,
     last_click: &mut Option<(Instant, u16, u16)>,
 ) {
-    if ui.confirm().is_some() || ui.review().is_some() || ui.cheatsheet_open() {
+    if ui.confirm().is_some() || ui.review().is_some() || ui.freeable_open() || ui.cheatsheet_open()
+    {
         return;
     }
     match mouse.kind {
@@ -683,6 +799,11 @@ fn handle_click(
     phase: &Phase,
     last_click: &mut Option<(Instant, u16, u16)>,
 ) {
+    if ui.geometry().gauge_freeable_hit(col, row) {
+        open_freeable_panel(ui, phase);
+        *last_click = None;
+        return;
+    }
     if ui.geometry().errors_card_hit(col, row) {
         ui.press_sort(SortKey::Errors);
         *last_click = None;
@@ -773,9 +894,10 @@ fn try_open_review(ui: &mut UiState, flash: &mut Flash) {
     }
 }
 
-/// `D`: open the confirmation modal over the marked entries, computing
-/// the hardlink warning from the frozen arena.
-fn open_delete_confirm(ui: &mut UiState, phase: &Phase, flash: &mut Flash) {
+/// `D`: open the confirmation modal over the marked entries, computing the
+/// hardlink warning from the frozen arena and, unless `no_proc_sweep` (D7),
+/// the D6 pre-deletion open-file advisory.
+fn open_delete_confirm(ui: &mut UiState, phase: &Phase, flash: &mut Flash, no_proc_sweep: bool) {
     let Phase::Done(outcome) = phase else {
         flash.set(DELETION_LOCKED);
         return;
@@ -786,7 +908,123 @@ fn open_delete_confirm(ui: &mut UiState, phase: &Phase, flash: &mut Flash) {
     }
     let nodes: Vec<NodeId> = ui.marks().iter().map(|mark| mark.node).collect();
     let hardlinks = delete::hardlink_files_in(outcome, &nodes);
-    ui.open_confirm(hardlinks);
+    let open_warning = if no_proc_sweep {
+        None
+    } else {
+        pre_deletion_open_warning(ui)
+    };
+    ui.open_confirm(hardlinks, open_warning);
+}
+
+/// D6: refresh the open-file index (unfiltered sweep, same ~25ms cost as
+/// the scan-end one) and match it against the marked selection two ways:
+///
+/// - **marked files**: a fresh `symlink_metadata` supplies each marked
+///   file's own `(dev, ino)`, looked up directly against the index. Tree
+///   nodes don't carry `(dev, ino)` past scan time (D8 keeps `tree.rs`
+///   untouched, and `Node` is a packed 32 bytes with no room for it), so
+///   this mirrors the exact "fresh look, without following a symlink"
+///   guard [`camembert_core::delete`] already takes before touching disk.
+/// - **marked directories** (D6 amendment): a directory has no single
+///   inode whose openness would mean anything about its *contents*, so
+///   instead every indexed open file's evidence path
+///   ([`freeable::OpenFileIndex::iter`]) is checked for path-prefix
+///   containment under the marked directory — the same
+///   [`freeable_panel::is_path_prefix`] rule the panel's ancestor grouping
+///   already established. This is the primary real-world scenario a
+///   files-only check would miss entirely: marking a data directory (say
+///   a database's) whose individual files are what's actually held open,
+///   which is exactly the false reassurance D6 forbids.
+///
+/// Holders from both channels are deduplicated by pid in
+/// [`freeable_panel::build_open_warning`]. Cost stays bounded by
+/// process/fd counts (~25ms), not tree size: the containment check is a
+/// linear scan of the index (a few thousand short paths at most), never a
+/// syscall-per-descendant walk of an arbitrarily large marked directory.
+/// Synchronous: a modal open blocking for one sweep's worth of time
+/// (~25ms, well under the ~50ms a UI action can eat before feeling laggy)
+/// is a fair trade against threading a second off-thread machine through
+/// the UI for what is otherwise a one-shot, on-demand check.
+fn pre_deletion_open_warning(ui: &UiState) -> Option<freeable_panel::OpenWarning> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let index = freeable::open_file_index();
+
+    let marked_file_lookups: Vec<Option<Vec<freeable::Holder>>> = ui
+        .marks()
+        .iter()
+        .filter(|mark| !mark.is_dir)
+        .map(|mark| {
+            std::fs::symlink_metadata(&mark.path)
+                .ok()
+                .and_then(|meta| index.holders(meta.dev(), meta.ino()).map(|s| s.to_vec()))
+        })
+        .collect();
+
+    let marked_dirs: Vec<Vec<u8>> = ui
+        .marks()
+        .iter()
+        .filter(|mark| mark.is_dir)
+        .map(|mark| mark.path.as_os_str().as_bytes().to_vec())
+        .collect();
+    let contained_holders: Vec<Vec<freeable::Holder>> = if marked_dirs.is_empty() {
+        Vec::new()
+    } else {
+        index
+            .iter()
+            .filter(|&(evidence, _, _, _)| {
+                marked_dirs.iter().any(|dir| {
+                    // Strictly *under* the directory, not the directory's
+                    // own inode (that would mean someone's cwd is there,
+                    // not a file inside it) — `is_path_prefix` allows an
+                    // exact-length match, so that case is excluded here.
+                    freeable_panel::is_path_prefix(evidence, dir) && evidence.len() > dir.len()
+                })
+            })
+            .map(|(_, _, _, holders)| holders.to_vec())
+            .collect()
+    };
+
+    freeable_panel::build_open_warning(&marked_file_lookups, &contained_holders, index.coverage())
+}
+
+/// `f` or a gauge-suffix click: open the freeable panel (D5), building and
+/// caching the display grouping (D5: longest-prefix match against the
+/// frozen tree's live directory paths) the first time it's needed for the
+/// current ledger. Always succeeds, even with no ledger yet — the panel
+/// then shows an explanatory empty state rather than refusing to open.
+fn open_freeable_panel(ui: &mut UiState, phase: &Phase) {
+    if !ui.freeable_groups_built()
+        && let Some(ledger) = ui.freeable_ledger()
+    {
+        // Cloned out to end the borrow before `set_freeable_groups` needs
+        // `&mut ui` — the ledger's root-fs entries are typically few
+        // enough (deleted-open files, not the whole tree) for this to be
+        // cheap.
+        let entries = ledger.root_fs_entries().to_vec();
+        let ancestors = match phase {
+            Phase::Done(outcome) => live_dir_paths(outcome),
+            _ => Vec::new(),
+        };
+        let groups = freeable_panel::group_by_ancestor(&entries, &ancestors);
+        ui.set_freeable_groups(groups);
+    }
+    ui.open_freeable_panel();
+}
+
+/// Every still-existing directory's full path, as raw bytes — the
+/// candidate ancestors [`freeable_panel::group_by_ancestor`] longest-prefix
+/// matches evidence paths against (D5). An in-memory walk of the frozen
+/// arena (no syscalls), the same kind of one-time synchronous cost
+/// `delete::hardlink_files_in` already pays for the confirm modal's
+/// hardlink warning.
+fn live_dir_paths(outcome: &ScanOutcome) -> Vec<Vec<u8>> {
+    use std::os::unix::ffi::OsStrExt;
+    let tree = outcome.tree();
+    tree.dir_ids()
+        .filter(|&dir| !tree.is_removed(tree.dir(dir).node))
+        .map(|dir| tree.path_of(dir).as_os_str().as_bytes().to_vec())
+        .collect()
 }
 
 /// Modal confirmed (`y`): delete the marked entries from disk (all guards
@@ -932,9 +1170,11 @@ fn draw(
     } else {
         draw_metric_cards(frame, cards_area, snapshot, ctx)
     };
-    if !ui.zen() {
-        draw_disk_gauge(frame, gauge_area, snapshot, ctx);
-    }
+    let gauge_freeable = if ui.zen() {
+        None
+    } else {
+        draw_disk_gauge(frame, gauge_area, ui, ctx)
+    };
 
     // Main split: table (with selection card) left, wheel right — see
     // `wheel_layout` for the responsive-collapse/zen-mode rules (design
@@ -989,10 +1229,15 @@ fn draw(
         draw_toasts(frame, main_area, toasts, ctx);
     }
 
+    // Modal precedence (D5 extends design slice 4's ladder): confirm >
+    // review > freeable panel > cheatsheet.
+    let mut freeable_rows = None;
     if let Some(confirm) = ui.confirm() {
         draw_confirm_modal(frame, ui, confirm, ctx);
     } else if let Some(review) = ui.review() {
         draw_review_modal(frame, ui, review, ctx);
+    } else if ui.freeable_open() {
+        freeable_rows = Some(draw_freeable_modal(frame, ui, ctx));
     } else if ui.cheatsheet_open() {
         draw_cheatsheet_modal(frame, ctx);
     }
@@ -1003,6 +1248,8 @@ fn draw(
         breadcrumb,
         errors_card,
         wheel,
+        gauge_freeable,
+        freeable_rows,
     }
 }
 
@@ -1155,9 +1402,20 @@ fn card_block(ctx: &RenderCtx) -> Block<'static> {
 /// Disk gauge line: statvfs capacity of the scanned filesystem — how much
 /// is occupied, and how much of the occupied space this scan accounts
 /// for. Coverage is clamped to 100% (mid-scan hardlink attribution and
-/// concurrent writes can transiently overshoot).
-fn draw_disk_gauge(frame: &mut Frame<'_>, area: Rect, snapshot: &ViewSnapshot, ctx: &RenderCtx) {
+/// concurrent writes can transiently overshoot). When the freeable ledger
+/// has root-fs freeable bytes (D5), a clickable " · X.X GiB freeable"
+/// suffix appears and this returns the gauge's screen rect for that
+/// hit-test; `None` when there's nothing to click through to (no ledger
+/// yet, a degraded/zero sweep, `--no-proc-sweep`, or a future dump-loaded
+/// session with no ledger at all, D7).
+fn draw_disk_gauge(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    ui: &UiState,
+    ctx: &RenderCtx,
+) -> Option<(u16, u16, u16, u16)> {
     let theme = &ctx.theme;
+    let snapshot = ui.snapshot();
     let Some(disk) = ctx.disk else {
         frame.render_widget(
             Paragraph::new(Line::from(
@@ -1165,16 +1423,23 @@ fn draw_disk_gauge(frame: &mut Frame<'_>, area: Rect, snapshot: &ViewSnapshot, c
             )),
             area,
         );
-        return;
+        return None;
     };
     let used = disk.used_fraction();
     let coverage = disk.coverage_fraction(snapshot.stats.disk_bytes);
-    let text = format!(
-        " {} · {:.0}% used · this scan covers {:.0}% of used ",
+    let freeable_bytes = ui
+        .freeable_ledger()
+        .map_or(0, Ledger::root_fs_freeable_bytes);
+    let mut text = format!(
+        " {} · {:.0}% used · this scan covers {:.0}% of used",
         HumanSize(disk.capacity),
         used * 100.0,
         coverage * 100.0,
     );
+    if freeable_bytes > 0 {
+        text.push_str(&format!(" · {} freeable", HumanSize(freeable_bytes)));
+    }
+    text.push(' ');
     let label = " disk ";
     let bar_width = area
         .width
@@ -1199,6 +1464,7 @@ fn draw_disk_gauge(frame: &mut Frame<'_>, area: Rect, snapshot: &ViewSnapshot, c
     ];
     spans.push(Span::from(text).fg(theme.color(theme::MUTED)));
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    (freeable_bytes > 0).then_some((area.x, area.y, area.width, area.height))
 }
 
 // Same call as `draw`'s: each parameter is an independent per-frame
@@ -1757,6 +2023,14 @@ fn draw_confirm_modal(
                 .fg(theme.color(theme::ACCENT)),
         ));
     }
+    // D6: advisory only — never blocks `y` — so it just adds a line, same
+    // as the hardlink note above.
+    if let Some(warning) = &confirm.open_warning {
+        lines.push(Line::default());
+        lines.push(Line::from(
+            Span::from(freeable_panel::warning_text(warning)).fg(theme.color(theme::ACCENT)),
+        ));
+    }
     lines.push(Line::default());
     lines.push(Line::from(
         "press y to confirm — any other key cancels".bold(),
@@ -1848,6 +2122,177 @@ fn draw_review_modal(frame: &mut Frame<'_>, ui: &UiState, review: &ReviewState, 
         card_block(ctx)
             .title(" review marked entries ")
             .border_style(Style::new().fg(theme.color(theme::ACCENT))),
+    );
+    frame.render_widget(dialog, modal);
+}
+
+/// Centered, scrollable freeable panel (`f`, D5): deleted-but-open files on
+/// the scan root's filesystem, grouped display-only under their deepest
+/// still-existing ancestor directory (D5 grouping, [`freeable_panel`]),
+/// then — when present — the cross-filesystem section (D2), the
+/// RAM-backed line (D3), and the partial-coverage caveat (D6/D7). Returns
+/// the total content-row count actually laid out this frame, fed back into
+/// [`UiState::clamp_freeable_cursor`] right after the frame is drawn (see
+/// `event_loop`) so the scroll position can never run past what was
+/// rendered — the same feedback idiom [`FrameGeometry`] itself uses for
+/// mouse hit-testing. Only ever drawn when neither the confirm nor the
+/// review modal is open (D5's precedence, see `draw`).
+fn draw_freeable_modal(frame: &mut Frame<'_>, ui: &UiState, ctx: &RenderCtx) -> usize {
+    let theme = &ctx.theme;
+    let area = frame.area();
+    let width = area
+        .width
+        .saturating_sub(4)
+        .clamp(24, 90)
+        .min(area.width.saturating_sub(2));
+    // Reserve: title line, blank, scroll-position note, blank, hint line.
+    const CHROME_LINES: u16 = 5;
+    let visible_rows = area.height.saturating_sub(2 + CHROME_LINES).max(1) as usize;
+
+    let Some(ledger) = ui.freeable_ledger() else {
+        let hint = if ctx.no_proc_sweep {
+            "disabled (--no-proc-sweep/NO_PROC_SWEEP)"
+        } else {
+            "no data yet — the sweep runs once the scan completes"
+        };
+        let lines = vec![
+            Line::from(Span::from("freeable files").bold()),
+            Line::default(),
+            Line::from(Span::from(hint).dim()),
+            Line::default(),
+            Line::from("f/Esc closes".dim()),
+        ];
+        render_floating_modal(frame, ctx, area, width, lines, " freeable ", theme::INFO);
+        return 0;
+    };
+
+    let mut content: Vec<Line<'_>> = Vec::new();
+    for group in ui.freeable_groups() {
+        let heading = match &group.ancestor {
+            Some(path) => format!("under {}", String::from_utf8_lossy(path)),
+            None => "(outside the scan / unknown)".to_owned(),
+        };
+        content.push(Line::from(
+            Span::from(heading).bold().fg(theme.color(theme::INFO)),
+        ));
+        for &index in &group.entries {
+            let Some(entry) = ledger.root_fs_entries().get(index) else {
+                continue;
+            };
+            let holders: Vec<String> = entry
+                .holders
+                .iter()
+                .map(|h| freeable_panel::format_holder(h.pid, &h.comm))
+                .collect();
+            content.push(Line::from(format!(
+                "  {:>9}  {}  [{}]",
+                HumanSize(entry.bytes).to_string(),
+                entry.evidence_lossy(),
+                holders.join(", ")
+            )));
+        }
+    }
+    let other_devices = ledger.other_device_groups();
+    if !other_devices.is_empty() {
+        content.push(Line::from(
+            Span::from("other filesystems (excluded from the gauge, D2)")
+                .bold()
+                .fg(theme.color(theme::MUTED)),
+        ));
+        for group in other_devices {
+            content.push(Line::from(format!("  device {}", group.dev)));
+            for entry in &group.entries {
+                content.push(Line::from(format!(
+                    "    {:>9}  {}",
+                    HumanSize(entry.bytes).to_string(),
+                    entry.evidence_lossy()
+                )));
+            }
+        }
+    }
+    if ledger.ram_backed_count() > 0 {
+        content.push(Line::from(
+            Span::from(format!(
+                "{} RAM-backed (memfd/shm) — {}, not disk space",
+                ledger.ram_backed_count(),
+                HumanSize(ledger.ram_backed_bytes())
+            ))
+            .italic()
+            .dim(),
+        ));
+    }
+    if ledger.coverage().is_partial() {
+        content.push(Line::from(
+            Span::from(format!(
+                "{} of {} processes readable — run as root for the full view",
+                ledger.coverage().readable,
+                ledger.coverage().seen
+            ))
+            .fg(theme.color(theme::ACCENT)),
+        ));
+    }
+    if content.is_empty() {
+        content.push(Line::from("nothing freeable found".dim()));
+    }
+
+    let total = content.len();
+    let offset = if total <= visible_rows {
+        0
+    } else {
+        ui.freeable_cursor()
+            .saturating_sub(visible_rows.saturating_sub(1))
+            .min(total - visible_rows)
+    };
+
+    let mut lines: Vec<Line<'_>> = vec![Line::from(
+        Span::from(format!(
+            "{} freeable on the root filesystem",
+            HumanSize(ledger.root_fs_freeable_bytes())
+        ))
+        .bold(),
+    )];
+    lines.push(Line::default());
+    lines.extend(content.into_iter().skip(offset).take(visible_rows));
+    lines.push(Line::default());
+    if total > visible_rows {
+        lines.push(Line::from(
+            Span::from(format!(
+                "row {} of {} — scroll with ↑↓/jk",
+                ui.freeable_cursor() + 1,
+                total
+            ))
+            .dim(),
+        ));
+    }
+    lines.push(Line::from("f/Esc closes".dim()));
+
+    render_floating_modal(frame, ctx, area, width, lines, " freeable ", theme::INFO);
+    total
+}
+
+/// Shared floating-modal chrome (centered `Clear` + bordered `Paragraph`)
+/// for the freeable panel's two shapes (empty state / populated content).
+fn render_floating_modal(
+    frame: &mut Frame<'_>,
+    ctx: &RenderCtx,
+    area: Rect,
+    width: u16,
+    lines: Vec<Line<'_>>,
+    title: &'static str,
+    border: theme::Slot,
+) {
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let modal = Rect {
+        x: area.width.saturating_sub(width) / 2,
+        y: area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, modal);
+    let dialog = Paragraph::new(lines).block(
+        card_block(ctx)
+            .title(title)
+            .border_style(Style::new().fg(ctx.theme.color(border))),
     );
     frame.render_widget(dialog, modal);
 }
@@ -2012,6 +2457,7 @@ mod tests {
                 used: 40_000,
             }),
             animate: true,
+            no_proc_sweep: false,
         }
     }
 
@@ -2339,7 +2785,7 @@ mod tests {
 
         let mut confirming = UiState::new(markable_snapshot());
         confirming.toggle_mark().unwrap();
-        confirming.open_confirm(0);
+        confirming.open_confirm(0, None);
         let content = render(&confirming, &toasts, None);
         assert!(
             !content.contains("dump written"),
@@ -2479,6 +2925,7 @@ mod tests {
             generation,
             flash,
             toasts,
+            false, // no_proc_sweep: not under test here
         )
     }
 
@@ -2548,7 +2995,7 @@ mod tests {
         let (mut ui, mut phase) = done_ui_with_one_file();
         let (mut generation, mut flash, mut toasts) = (1u64, Flash::new(), ToastQueue::new());
         ui.toggle_mark().expect("marking the only row succeeds");
-        open_delete_confirm(&mut ui, &phase, &mut flash);
+        open_delete_confirm(&mut ui, &phase, &mut flash, false);
         assert!(ui.confirm().is_some());
 
         // `v` is not `y`: the confirm modal treats it as "cancel", not as
@@ -2585,5 +3032,289 @@ mod tests {
         );
         assert!(ui.review().is_some(), "still in the review list");
         assert!(!ui.cheatsheet_open(), "? did not leak through to it");
+    }
+
+    // ---- `f` freeable panel (freeable phase 1) ----
+
+    /// `f` opens the panel from the main view; `f`/`Esc` closes it, same
+    /// shape as the cheatsheet's own open/close test.
+    #[test]
+    fn f_key_opens_and_closes_the_freeable_panel() {
+        let (mut ui, mut phase) = done_ui_with_one_file();
+        let (mut generation, mut flash, mut toasts) = (1u64, Flash::new(), ToastQueue::new());
+
+        press(
+            KeyCode::Char('f'),
+            &mut ui,
+            &mut phase,
+            &mut generation,
+            &mut flash,
+            &mut toasts,
+        );
+        assert!(ui.freeable_open(), "f opened the panel");
+
+        press(
+            KeyCode::Esc,
+            &mut ui,
+            &mut phase,
+            &mut generation,
+            &mut flash,
+            &mut toasts,
+        );
+        assert!(!ui.freeable_open(), "Esc closed it");
+    }
+
+    /// D5's precedence (confirm > review > freeable panel > cheatsheet):
+    /// with the confirm modal open, `f` is just another non-`y` cancel key
+    /// — it never leaks through to open the panel underneath.
+    #[test]
+    fn confirm_modal_captures_f_too() {
+        let (mut ui, mut phase) = done_ui_with_one_file();
+        let (mut generation, mut flash, mut toasts) = (1u64, Flash::new(), ToastQueue::new());
+        ui.toggle_mark().expect("marking the only row succeeds");
+        open_delete_confirm(&mut ui, &phase, &mut flash, false);
+        assert!(ui.confirm().is_some());
+
+        press(
+            KeyCode::Char('f'),
+            &mut ui,
+            &mut phase,
+            &mut generation,
+            &mut flash,
+            &mut toasts,
+        );
+        assert!(ui.confirm().is_none(), "f is treated as a non-y cancel key");
+        assert!(!ui.freeable_open(), "never opened the panel underneath");
+    }
+
+    /// While the freeable panel is open, `?` does not leak through to the
+    /// cheatsheet underneath (same non-leaking guarantee as the review
+    /// list's own test).
+    #[test]
+    fn freeable_panel_does_not_leak_unhandled_keys_to_the_cheatsheet() {
+        let (mut ui, mut phase) = done_ui_with_one_file();
+        let (mut generation, mut flash, mut toasts) = (1u64, Flash::new(), ToastQueue::new());
+        ui.open_freeable_panel();
+
+        press(
+            KeyCode::Char('?'),
+            &mut ui,
+            &mut phase,
+            &mut generation,
+            &mut flash,
+            &mut toasts,
+        );
+        assert!(ui.freeable_open(), "still in the freeable panel");
+        assert!(!ui.cheatsheet_open(), "? did not leak through to it");
+    }
+
+    /// A real deleted-open file (same "gold case" technique as
+    /// `camembert_core::freeable`'s own tests): once swept into the
+    /// ledger, the disk gauge grows a clickable "· X.X GiB freeable"
+    /// suffix, and the `f` panel lists the entry (grouped into the
+    /// catch-all, since it lives outside the scanned tempdir).
+    #[test]
+    fn gauge_suffix_and_panel_show_a_real_deleted_open_file() {
+        if !std::path::Path::new("/proc/self/fd").exists() {
+            eprintln!("skipping: /proc/self/fd unavailable on this host");
+            return;
+        }
+        let (mut ui, phase) = done_ui_with_one_file();
+
+        let freeable_dir = tempfile::tempdir().expect("tempdir");
+        let path = freeable_dir.path().join("gone.bin");
+        let mut file = std::fs::File::create(&path).expect("create");
+        std::io::Write::write_all(&mut file, &[0xABu8; 256 * 1024]).expect("write");
+        std::io::Write::flush(&mut file).expect("flush");
+        let root_dev = {
+            use std::os::unix::fs::MetadataExt;
+            file.metadata().expect("metadata").dev()
+        };
+        std::fs::remove_file(&path).expect("unlink while still open");
+
+        let ledger = freeable::sweep(root_dev);
+        assert!(
+            ledger.root_fs_freeable_bytes() > 0,
+            "our own deleted-open file should be swept up"
+        );
+        ui.set_freeable_ledger(ledger);
+
+        let content = render(&ui, &[], None);
+        assert!(
+            content.contains("freeable"),
+            "gauge suffix visible: {content}"
+        );
+
+        open_freeable_panel(&mut ui, &phase);
+        assert!(ui.freeable_open());
+        let content = render(&ui, &[], None);
+        assert!(
+            content.contains("gone.bin"),
+            "panel lists the entry's evidence path: {content}"
+        );
+        assert!(
+            content.contains("outside the scan"),
+            "grouped into the catch-all: not under the scanned tempdir: {content}"
+        );
+
+        drop(file);
+    }
+
+    /// D6 amendment's primary real-world scenario, with a real open fd:
+    /// marking a *directory* (a database's data directory, in spirit)
+    /// whose own `(dev, ino)` is never open, but a file *inside* it is.
+    /// The original files-only check would show no warning at all here —
+    /// exactly the false reassurance the review verdict flagged. This
+    /// confirms the path-prefix containment channel catches it.
+    #[test]
+    fn marked_directory_containment_finds_a_real_open_file_inside_it() {
+        if !std::path::Path::new("/proc/self/fd").exists() {
+            eprintln!("skipping: /proc/self/fd unavailable on this host");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmp.path().join("data");
+        std::fs::create_dir(&data_dir).expect("mkdir data");
+        let mut file = std::fs::File::create(data_dir.join("hot.bin")).expect("create");
+        std::io::Write::write_all(&mut file, b"still open, never unlinked").expect("write");
+
+        let outcome = scan_dir(tmp.path());
+        let stats = view::scan_stats(outcome.tree(), outcome.root(), outcome.elapsed);
+        let snapshot = view::build_snapshot(
+            outcome.tree(),
+            outcome.root(),
+            1,
+            stats,
+            outcome.hardlink_inodes,
+            false,
+        );
+        let mut ui = UiState::new(Arc::new(snapshot));
+        // The scan root's only child is the "data" directory: cursor
+        // already on it.
+        assert!(
+            ui.selected().expect("one row").is_dir,
+            "the only root row is the data directory"
+        );
+        ui.toggle_mark()
+            .expect("marking the data directory succeeds");
+        assert!(ui.marks()[0].is_dir, "marked the directory, not a file");
+
+        let warning = pre_deletion_open_warning(&ui).expect(
+            "an open file inside the marked directory must produce a warning \
+             even though the directory's own (dev, ino) matches nothing",
+        );
+        assert_eq!(warning.entries_open, 0, "no marked *file* is directly open");
+        assert_eq!(
+            warning.contained_open, 1,
+            "one open file found strictly under the marked directory"
+        );
+        let me = std::process::id();
+        assert!(
+            warning.top_holders.iter().any(|&(pid, _)| pid == me),
+            "our own pid should be named as a holder: {:?}",
+            warning.top_holders
+        );
+
+        drop(file);
+    }
+
+    /// A sibling directory named to collide at the byte level ("data-old"
+    /// starts with "data") must never be treated as contained by a mark on
+    /// "data" — same path-boundary rule as the panel's ancestor grouping,
+    /// exercised here through the real containment code path.
+    #[test]
+    fn marked_directory_containment_respects_path_boundaries() {
+        if !std::path::Path::new("/proc/self/fd").exists() {
+            eprintln!("skipping: /proc/self/fd unavailable on this host");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let marked_dir = tmp.path().join("data");
+        let sibling_dir = tmp.path().join("data-old");
+        std::fs::create_dir(&marked_dir).expect("mkdir data");
+        std::fs::create_dir(&sibling_dir).expect("mkdir data-old");
+        // Open a file only under the byte-colliding sibling, never under
+        // the marked directory itself.
+        let mut file = std::fs::File::create(sibling_dir.join("cold.bin")).expect("create");
+        std::io::Write::write_all(&mut file, b"unrelated").expect("write");
+
+        let outcome = scan_dir(tmp.path());
+        let stats = view::scan_stats(outcome.tree(), outcome.root(), outcome.elapsed);
+        let snapshot = view::build_snapshot(
+            outcome.tree(),
+            outcome.root(),
+            1,
+            stats,
+            outcome.hardlink_inodes,
+            false,
+        );
+        let mut ui = UiState::new(Arc::new(snapshot));
+        // Two rows now ("data", "data-old"); find and mark "data" only.
+        let position = ui
+            .rows_indexed()
+            .position(|(_, row)| &*row.name == b"data")
+            .expect("the data row exists");
+        ui.select_at(position);
+        ui.toggle_mark().expect("marking data succeeds");
+        assert_eq!(ui.marks().len(), 1);
+        assert_eq!(ui.marks()[0].path, marked_dir);
+
+        let warning = pre_deletion_open_warning(&ui);
+        assert!(
+            warning.is_none(),
+            "the open file lives under data-old, not data: no false containment match, got {warning:?}"
+        );
+
+        drop(file);
+    }
+
+    /// Before the sweep lands, the panel shows an explanatory empty state
+    /// rather than nothing — and the message differs when
+    /// `--no-proc-sweep`/`NO_PROC_SWEEP` is why there is no data at all.
+    #[test]
+    fn freeable_panel_empty_state_distinguishes_no_data_yet_from_disabled() {
+        fn render_with(no_proc_sweep: bool, ui: &mut UiState) -> String {
+            ui.open_freeable_panel();
+            let mut ctx = ctx(GlyphLevel::HalfBlock, ColorLevel::Truecolor);
+            ctx.no_proc_sweep = no_proc_sweep;
+            let mut table_state = TableState::default();
+            let mut motion = no_motion();
+            let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw(
+                        frame,
+                        ui,
+                        &mut table_state,
+                        '⠋',
+                        None,
+                        &[],
+                        &mut motion,
+                        &ctx,
+                    );
+                })
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol().to_owned())
+                .collect()
+        }
+
+        let mut enabled_ui = UiState::new(markable_snapshot());
+        let content = render_with(false, &mut enabled_ui);
+        assert!(
+            content.contains("no data yet"),
+            "enabled, nothing swept yet: {content}"
+        );
+
+        let mut disabled_ui = UiState::new(markable_snapshot());
+        let content = render_with(true, &mut disabled_ui);
+        assert!(
+            content.contains("no-proc-sweep") || content.contains("disabled"),
+            "--no-proc-sweep: says so explicitly: {content}"
+        );
     }
 }

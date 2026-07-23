@@ -7,8 +7,11 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use camembert_core::freeable::Ledger;
 use camembert_core::tree::{DirId, NodeId};
 use camembert_core::view::{Row, ViewSnapshot};
+
+use super::freeable_panel::{FreeableGroup, OpenWarning};
 
 /// Column a view is sorted by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,12 +99,17 @@ pub enum MarkRefusal {
 /// State of the delete-confirmation modal, opened by
 /// [`UiState::open_confirm`]. While it exists, every key belongs to the
 /// modal: `y` confirms, anything else cancels.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ConfirmState {
     /// Hardlinked files among the marked selection (incl. inside marked
     /// dirs); when > 0 the dialog warns that freeing depends on deleting
     /// all links.
     pub hardlink_files: u64,
+    /// D6 pre-deletion advisory: which marked entries are currently open,
+    /// by which processes. `None` when nothing marked is open, or the
+    /// check was skipped outright (`--no-proc-sweep`/`NO_PROC_SWEEP`, D7)
+    /// — either way, no warning line at all. Never blocks confirmation.
+    pub open_warning: Option<OpenWarning>,
 }
 
 /// State of the `v` review-list modal, opened by [`UiState::open_review`]:
@@ -134,6 +142,16 @@ pub struct FrameGeometry {
     /// The errors metric card's screen rect `(x, y, width, height)`.
     pub errors_card: Option<(u16, u16, u16, u16)>,
     pub wheel: Option<WheelGeometry>,
+    /// The disk gauge's screen rect `(x, y, width, height)`, when the
+    /// freeable suffix is showing (D5: clickable, opens the `f` panel).
+    /// `None` when there is nothing freeable to click through to.
+    pub gauge_freeable: Option<(u16, u16, u16, u16)>,
+    /// Total content rows the freeable panel drew this frame, when it was
+    /// open — fed back into [`UiState::clamp_freeable_cursor`] right after
+    /// the frame is drawn (same feedback idiom as `set_geometry` itself),
+    /// so the scroll cursor can never run away past what was actually
+    /// rendered. `None` while the panel is closed.
+    pub freeable_rows: Option<usize>,
 }
 
 /// Table body geometry: which screen rows hold which display-order rows.
@@ -220,6 +238,16 @@ impl FrameGeometry {
             Some((x, y, w, h)) if col >= x && col < x + w && row >= y && row < y + h
         )
     }
+
+    /// Whether `(col, row)` falls inside the disk gauge's freeable suffix
+    /// (D5: clicking it opens the `f` panel, same rect as the whole gauge
+    /// line for a generous, simple hit target).
+    pub fn gauge_freeable_hit(&self, col: u16, row: u16) -> bool {
+        matches!(
+            self.gauge_freeable,
+            Some((x, y, w, h)) if col >= x && col < x + w && row >= y && row < y + h
+        )
+    }
 }
 
 /// Cache key for the sorted permutation: re-sort only when any part
@@ -281,6 +309,30 @@ pub struct UiState {
     /// donut animation — a scan's continuous live updates never bump it,
     /// so the morph never fights the live growth (design slice 5).
     view_change_seq: u64,
+    /// The freeable ledger (D1/D4/D8): a scan-level side artifact, never
+    /// tree nodes or view-snapshot data. `None` until the post-scan sweep
+    /// lands (or forever, under `--no-proc-sweep`/`NO_PROC_SWEEP` or a
+    /// dump-loaded session, D7).
+    freeable: Option<Ledger>,
+    /// Root-fs entries grouped display-only under their deepest
+    /// still-existing ancestor (D5) — built lazily the first time the `f`
+    /// panel opens (needs the frozen tree's live directory paths) and
+    /// cached here; invalidated whenever a new ledger lands.
+    freeable_groups: Vec<FreeableGroup>,
+    /// Whether `freeable_groups` reflects the current `freeable` ledger —
+    /// distinct from "groups is empty", which can legitimately happen when
+    /// there are zero root-fs entries.
+    freeable_groups_built: bool,
+    /// Whether the `f` freeable panel is open. Modal precedence (D5) is
+    /// confirm > review > freeable panel > cheatsheet.
+    freeable_open: bool,
+    /// Scroll position in the freeable panel's flat content-row list.
+    /// Clamped every frame from [`FrameGeometry::freeable_rows`] (see
+    /// [`Self::clamp_freeable_cursor`]) rather than at each keypress, so it
+    /// never needs to know the panel's rendered row count itself — the
+    /// same feedback idiom `set_geometry` already uses for mouse
+    /// hit-testing.
+    freeable_cursor: usize,
 }
 
 impl UiState {
@@ -304,6 +356,11 @@ impl UiState {
             geometry: FrameGeometry::default(),
             zen: false,
             view_change_seq: 0,
+            freeable: None,
+            freeable_groups: Vec::new(),
+            freeable_groups_built: false,
+            freeable_open: false,
+            freeable_cursor: 0,
         };
         state.ensure_sorted();
         state
@@ -612,12 +669,19 @@ impl UiState {
     /// Open the delete-confirmation modal. Refused (returns `false`) when
     /// nothing is marked or the scan still runs. `hardlink_files` is
     /// computed by the caller from the tree (see
-    /// [`camembert_core::delete::hardlink_files_in`]).
-    pub fn open_confirm(&mut self, hardlink_files: u64) -> bool {
+    /// [`camembert_core::delete::hardlink_files_in`]); `open_warning` is the
+    /// D6 pre-deletion advisory, computed by the caller from a fresh
+    /// [`camembert_core::freeable::open_file_index`] (`None` when nothing
+    /// marked is open, or `--no-proc-sweep`/`NO_PROC_SWEEP` skipped the
+    /// check outright, D7).
+    pub fn open_confirm(&mut self, hardlink_files: u64, open_warning: Option<OpenWarning>) -> bool {
         if self.marks.is_empty() || !self.snapshot.stats.root_complete {
             return false;
         }
-        self.confirm = Some(ConfirmState { hardlink_files });
+        self.confirm = Some(ConfirmState {
+            hardlink_files,
+            open_warning,
+        });
         true
     }
 
@@ -714,6 +778,88 @@ impl UiState {
 
     pub fn close_cheatsheet(&mut self) {
         self.cheatsheet_open = false;
+    }
+
+    // ---- `f` freeable panel (freeable phase 1, D4/D5) ----
+
+    /// Adopt a freshly-swept ledger (called once the scan-end sweep's
+    /// off-thread result lands, D4). Invalidates any cached grouping — it
+    /// is rebuilt lazily the next time the panel opens.
+    pub fn set_freeable_ledger(&mut self, ledger: Ledger) {
+        self.freeable = Some(ledger);
+        self.freeable_groups = Vec::new();
+        self.freeable_groups_built = false;
+    }
+
+    /// The current ledger, if the sweep has completed (`None` before it
+    /// lands, under `--no-proc-sweep`/`NO_PROC_SWEEP`, or in a session with
+    /// no sweep at all, D7). Drives the gauge suffix (D5) and the panel.
+    pub fn freeable_ledger(&self) -> Option<&Ledger> {
+        self.freeable.as_ref()
+    }
+
+    /// Whether [`Self::freeable_groups`] reflects the current ledger (set
+    /// by [`Self::set_freeable_groups`], cleared on a new
+    /// [`Self::set_freeable_ledger`]) — lets the caller skip rebuilding the
+    /// (tree-walk-dependent) grouping on every `f` press.
+    pub fn freeable_groups_built(&self) -> bool {
+        self.freeable_groups_built
+    }
+
+    /// Cache the display grouping computed by the caller (D5:
+    /// [`super::freeable_panel::group_by_ancestor`] against the frozen
+    /// tree's live directory paths).
+    pub fn set_freeable_groups(&mut self, groups: Vec<FreeableGroup>) {
+        self.freeable_groups = groups;
+        self.freeable_groups_built = true;
+    }
+
+    /// The cached display grouping, largest-entry group first (D5). Empty
+    /// (and not yet "built") until the panel's first open.
+    pub fn freeable_groups(&self) -> &[FreeableGroup] {
+        &self.freeable_groups
+    }
+
+    pub fn freeable_open(&self) -> bool {
+        self.freeable_open
+    }
+
+    /// Open the panel (`f` or a gauge-suffix click), resetting the scroll
+    /// to the top. Always succeeds — even with no ledger yet, the panel
+    /// shows an explanatory empty state rather than refusing to open.
+    pub fn open_freeable_panel(&mut self) {
+        self.freeable_open = true;
+        self.freeable_cursor = 0;
+    }
+
+    /// Close the panel (`f` or `Esc`).
+    pub fn close_freeable_panel(&mut self) {
+        self.freeable_open = false;
+    }
+
+    pub fn freeable_cursor(&self) -> usize {
+        self.freeable_cursor
+    }
+
+    /// Scroll down one row. Unbounded here by design: the true bound
+    /// (how many rows the panel actually rendered) is only known at draw
+    /// time, so [`Self::clamp_freeable_cursor`] reins this in right after
+    /// every frame — well before the next keypress, so it never visibly
+    /// overshoots.
+    pub fn freeable_move_down(&mut self) {
+        self.freeable_cursor = self.freeable_cursor.saturating_add(1);
+    }
+
+    pub fn freeable_move_up(&mut self) {
+        self.freeable_cursor = self.freeable_cursor.saturating_sub(1);
+    }
+
+    /// Clamp the scroll cursor to `total_rows` (from
+    /// [`FrameGeometry::freeable_rows`]) — called once per frame right
+    /// after drawing, the same feedback idiom [`Self::set_geometry`] uses
+    /// for mouse hit-testing.
+    pub fn clamp_freeable_cursor(&mut self, total_rows: usize) {
+        self.freeable_cursor = self.freeable_cursor.min(total_rows.saturating_sub(1));
     }
 
     fn ensure_sorted(&mut self) {
@@ -1242,7 +1388,7 @@ mod tests {
         let mut state = UiState::new(snapshot(1, 0, None, markable_rows(), false));
         assert_eq!(state.toggle_mark(), Err(MarkRefusal::ScanRunning));
         assert!(state.marks().is_empty());
-        assert!(!state.open_confirm(0), "confirm locked out too");
+        assert!(!state.open_confirm(0, None), "confirm locked out too");
         assert!(state.confirm().is_none());
     }
 
@@ -1308,11 +1454,14 @@ mod tests {
     #[test]
     fn confirm_modal_state_machine() {
         let mut state = UiState::new(snapshot(1, 0, None, markable_rows(), true));
-        assert!(!state.open_confirm(0), "nothing marked: refuses to open");
+        assert!(
+            !state.open_confirm(0, None),
+            "nothing marked: refuses to open"
+        );
         assert!(state.take_confirmed_marks().is_none(), "nothing to confirm");
 
         state.toggle_mark().unwrap();
-        assert!(state.open_confirm(2));
+        assert!(state.open_confirm(2, None));
         assert_eq!(state.confirm().unwrap().hardlink_files, 2);
 
         // Esc / any non-y key: cancel, marks intact.
@@ -1321,7 +1470,7 @@ mod tests {
         assert_eq!(state.marks().len(), 1, "cancel keeps the marks");
 
         // Reopen and confirm: marks handed over and cleared.
-        assert!(state.open_confirm(0));
+        assert!(state.open_confirm(0, None));
         let confirmed = state.take_confirmed_marks().expect("modal was open");
         assert_eq!(confirmed.len(), 1);
         assert_eq!(confirmed[0].node, NodeId::from_raw(1));
@@ -1478,5 +1627,79 @@ mod tests {
         snap.degraded = false;
         assert!(!show_hardlink_note(&snap));
         assert!(!show_updating_note(&snap));
+    }
+
+    // ---- `f` freeable panel (freeable phase 1) ----
+
+    #[test]
+    fn freeable_panel_open_close_and_scroll() {
+        let mut state = UiState::new(snapshot(1, 0, None, Vec::new(), true));
+        assert!(!state.freeable_open());
+        state.open_freeable_panel();
+        assert!(state.freeable_open());
+        assert_eq!(state.freeable_cursor(), 0);
+
+        state.freeable_move_down();
+        state.freeable_move_down();
+        assert_eq!(state.freeable_cursor(), 2, "unclamped between frames");
+        // Only 2 rows actually rendered this frame: the post-draw feedback
+        // reins the cursor in onto the last valid row (index 1).
+        state.clamp_freeable_cursor(2);
+        assert_eq!(state.freeable_cursor(), 1);
+
+        state.freeable_move_up();
+        assert_eq!(state.freeable_cursor(), 0);
+        state.freeable_move_up();
+        assert_eq!(state.freeable_cursor(), 0, "saturates, never underflows");
+
+        state.close_freeable_panel();
+        assert!(!state.freeable_open());
+    }
+
+    #[test]
+    fn freeable_ledger_and_groups_round_trip_and_invalidate() {
+        let mut state = UiState::new(snapshot(1, 0, None, Vec::new(), true));
+        assert!(state.freeable_ledger().is_none());
+        assert!(!state.freeable_groups_built());
+
+        // A degenerate root_dev (unlikely to match anything real) is fine
+        // here: this test exercises the Option/cache plumbing, not the
+        // sweep's own classification (covered in camembert-core).
+        state.set_freeable_ledger(camembert_core::freeable::sweep(0));
+        assert!(state.freeable_ledger().is_some());
+        assert!(
+            !state.freeable_groups_built(),
+            "a fresh ledger clears any cached grouping"
+        );
+
+        state.set_freeable_groups(Vec::new());
+        assert!(state.freeable_groups_built());
+        assert!(state.freeable_groups().is_empty());
+
+        state.set_freeable_ledger(camembert_core::freeable::sweep(0));
+        assert!(
+            !state.freeable_groups_built(),
+            "the next ledger invalidates the cache again"
+        );
+    }
+
+    #[test]
+    fn confirm_modal_carries_the_open_file_warning() {
+        let mut state = UiState::new(snapshot(1, 0, None, markable_rows(), true));
+        state.toggle_mark().unwrap();
+        let warning = OpenWarning {
+            entries_open: 1,
+            contained_open: 0,
+            holder_count: 1,
+            top_holders: vec![(123, Some("nginx".to_owned()))],
+            partial_coverage: None,
+        };
+        assert!(state.open_confirm(0, Some(warning.clone())));
+        assert_eq!(state.confirm().unwrap().open_warning, Some(warning));
+
+        // No warning (nothing open, or --no-proc-sweep): no line to show.
+        state.cancel_confirm();
+        assert!(state.open_confirm(0, None));
+        assert!(state.confirm().unwrap().open_warning.is_none());
     }
 }

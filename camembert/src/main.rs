@@ -133,6 +133,19 @@ struct ScanArgs {
     /// neither this flag nor NO_MOTION is set.
     #[arg(long = "no-motion")]
     no_motion: bool,
+
+    /// Disable the freeable `/proc` sweep in the interactive UI (env:
+    /// NO_PROC_SWEEP)
+    ///
+    /// Skips both the scan-end sweep that powers the disk gauge's
+    /// "· X.X GiB freeable" suffix, the `f` panel and its toast, and the
+    /// pre-deletion open-file check `D` normally runs before the delete
+    /// confirmation — for paranoid environments and containers with a
+    /// masked /proc. Like NO_MOTION, any value at all counts as set, even
+    /// the empty string; there is no camembert.toml key for this (see the
+    /// README's Freeable section).
+    #[arg(long = "no-proc-sweep")]
+    no_proc_sweep: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -306,6 +319,8 @@ Keys (interactive mode):
   D                delete the marked entries: opens a confirmation dialog
                    listing count, total size and the first paths;
                    pressing y confirms, any other key cancels
+  f                freeable files: deleted-but-open files still holding
+                   disk space (see Freeable below); f or Esc closes it
   ?                show the keyboard/mouse cheatsheet; ? or Esc closes it
   z                toggle zen mode: table only (no metric cards, disk
                    gauge or donut wheel) — header, table, footer and the
@@ -313,9 +328,10 @@ Keys (interactive mode):
   q, Esc, Ctrl-C   quit (cancels the scan if still running)
 
   While any of these floating panels (delete confirmation, review list,
-  cheatsheet) is open, every key belongs to it alone; precedence when
-  more than one could apply is confirmation > review list > cheatsheet,
-  though in practice only one is ever open at a time.
+  freeable panel, cheatsheet) is open, every key belongs to it alone;
+  precedence when more than one could apply is confirmation > review
+  list > freeable panel > cheatsheet, though in practice only one is
+  ever open at a time.
 
 Mouse (interactive mode):
   The mouse is additive: every key above still works, nothing requires
@@ -343,6 +359,45 @@ Deleting (mark-then-confirm, with guard rails):
   Hardlinks: deleting one link of a multi-link inode only frees space
   when the last link goes; the dialog warns when the selection contains
   hardlinked files. Totals in the header shrink as entries are deleted.
+  Open-file advisory: pressing D also refreshes a /proc check (unless
+  --no-proc-sweep) matched against the marked selection two ways: a
+  marked file's own (dev, ino), and, for a marked directory, any open
+  file found anywhere underneath it — so marking a directory whose
+  individual files are what a process actually holds open still warns,
+  not just marking the file itself. Adds a line naming the busiest few
+  holders — advisory only, it never blocks y. When that check only saw
+  part of the process table (permission-gated /proc/[pid]/fd entries),
+  the line says so rather than staying silent (the same caveat also
+  covers a holder in a different mount namespace whose path doesn't
+  textually match the marked directory), so an absent warning is never
+  mistaken for a clean bill of health on a shared machine.
+
+Freeable (deleted-but-open files):
+  A process can keep a file's blocks allocated after every path to it is
+  unlinked (df counts them, du/camembert's tree cannot see them — no
+  path to attribute them to). Once the scan completes, one /proc sweep
+  (skippable with --no-proc-sweep/NO_PROC_SWEEP) finds such files and,
+  when the root filesystem's freeable total is at least 100 MiB AND at
+  least 1% of that filesystem's capacity, shows a one-time toast (\"X.X
+  GiB freeable by closing files — press f\") and a clickable \"· X.X GiB
+  freeable\" suffix on the disk gauge. f opens the panel: each entry's
+  last-known path, holder PID(s)/process name, and allocated size,
+  grouped display-only under the deepest still-existing directory; a
+  coverage line (\"N of M processes readable — run as root for the full
+  view\") whenever /proc access was partial.
+
+  What phase 1 covers and doesn't: scoped to the scan root's own
+  filesystem only (the same one the disk gauge describes) — a btrfs
+  layout split across several subvolume-mounted `st_dev`s shares one
+  pool underneath, so the count under-reports there; files held open on
+  a *different* crossed filesystem (--cross-filesystems) still show up
+  in the panel, labeled by device, but are never added to the gauge.
+  Holders visible only via mmap (no open file descriptor) are invisible
+  without CAP_SYS_ADMIN and are not counted. memfd/tmpfs/shm-backed
+  inodes are RAM, not disk, and are reported as one separate line rather
+  than folded into the disk total. Nothing here is written to a dump
+  (--output): open-file state is process state, stale the instant the
+  sweep finishes, so a loaded dump simply has no freeable data.
 
 Basket & toasts:
   While at least one entry is marked, a one-line basket strip appears
@@ -351,8 +406,9 @@ Basket & toasts:
   layout shift. Top-right toast notifications announce things that just
   happened rather than input being validated: a dump written, a deletion
   finishing (with the space freed), the scan itself finishing while you
-  keep browsing. Toasts stack and auto-dismiss after a few seconds; they
-  never appear over the delete-confirmation dialog.";
+  keep browsing, and the freeable-sweep toast described above. Toasts
+  stack and auto-dismiss after a few seconds; they never appear over the
+  delete-confirmation dialog.";
 
 const DIFF_AFTER_HELP: &str = "\
 Output (default): a summary line (total disk/apparent/entry delta and
@@ -488,11 +544,19 @@ fn run_scan(cli: &Cli) -> ExitCode {
             std::env::var("NO_MOTION").ok().is_some(),
             file_config.no_motion,
         );
+        // Freeable phase 1, D7: flag + env only, presence semantics like
+        // NO_MOTION — no camembert.toml key (the decisions doc deliberately
+        // keeps this out of the config file).
+        let no_proc_sweep = config::resolve_no_proc_sweep(
+            args.no_proc_sweep,
+            std::env::var("NO_PROC_SWEEP").ok().is_some(),
+        );
         debug!(
             ?color,
             ?theme_choice,
             no_motion,
-            "resolved color/theme/motion (CLI > env > camembert.toml)"
+            no_proc_sweep,
+            "resolved color/theme/motion/proc-sweep (CLI > env > camembert.toml, no-proc-sweep: CLI > env only)"
         );
         let caps = ui::caps::Caps::detect(&ui::caps::TermEnv::from_env(), color);
         let animate = !no_motion;
@@ -503,6 +567,7 @@ fn run_scan(cli: &Cli) -> ExitCode {
             caps,
             animate,
             theme_choice,
+            no_proc_sweep,
         ) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
