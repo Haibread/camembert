@@ -1,6 +1,6 @@
 # camembert — project handoff
 
-State of the project as of 2026-07-22, written for the next agent (or
+State of the project as of 2026-07-23, written for the next agent (or
 human) picking it up. The original ideation document is archived at
 [docs/design/handoff-original.md](docs/design/handoff-original.md); this
 file describes what actually exists.
@@ -45,7 +45,7 @@ pitch.
   identity is `Haibread <haibread@users.noreply.github.com>` (set
   repo-locally).
 
-## What is implemented (all merged on main, ~145 tests green)
+## What is implemented (all merged on main, ~220 tests green)
 
 - **Scan engine** (`camembert-core/src/scan/`): work-stealing,
   fd-relative `openat`/`getdents64`/`statx` (fstatat fallback), mount
@@ -62,7 +62,17 @@ pitch.
   (metric cards, statvfs disk gauge, table + donut wheel with identity
   colors, selection card), capability ladders (truecolor→mono,
   sextants→ASCII, NO_COLOR/--color), guarded mark-then-confirm deletion,
-  log output never touches the terminal (--log-file).
+  log output never touches the terminal (--log-file). **All six design
+  slices of [tui-design.md](docs/design/tui-design.md) are implemented**:
+  mouse everywhere via per-frame `FrameGeometry` hit-testing (clickable
+  rows/slices/breadcrumb/errors-card, hover card), deletion basket strip
+  + `v` review modal + toasts (`toast.rs`) + `?` cheatsheet generated
+  from the `keymap.rs` dispatch table, 150 ms eased animations
+  (`anim.rs`, `--no-motion`/NO_MOTION) with idle-quiescent polling,
+  responsive mini-donut collapse below 100 columns + `z` zen mode,
+  themes tokyo-night/light/high-contrast (`--theme`/THEME), XDG
+  `camembert.toml` (CLI > env > file > default), OSC 11 background
+  detection in a bounded raw-mode termios window (rustix, no thread).
 - **Dump v1** (`dump.rs` + `dump/read.rs`): ordered writer (`-o`,
   `.part`+rename, seekable zstd, `zstdcat|jq`-compatible — verified) and
   streaming reader (torn-frame tolerant, number-or-string u64s).
@@ -74,9 +84,9 @@ pitch.
   canonical hardlinks, emits ordered dumps. Import→self-diff = zero.
 - **Infra**: pre-commit (fmt, clippy -D warnings, actionlint, hygiene),
   GitHub workflows `quality` + `release` (SHA-pinned), Dependabot,
-  dual MIT/Apache-2.0, repository metadata. **The GitHub repo
-  (github.com/Haibread/camembert) does not exist yet — creating and
-  pushing it is the user's own action.**
+  dual MIT/Apache-2.0, repository metadata. The GitHub repo is live at
+  [github.com/Haibread/camembert](https://github.com/Haibread/camembert)
+  (public, `quality` CI green on main).
 
 ## Known limitations (documented in code where they live)
 
@@ -96,36 +106,37 @@ pitch.
   (clap subcommand precedence).
 - Scanning-a-kernfs-root is allowed (explicit user intent); only mounts
   *inside* a scan are excluded.
+- TUI: the design's "excluded mounts dim italic" styling is not
+  implemented (no excluded-row rendering exists yet — the theme
+  mechanism has a slot for it); the header mini-donut is decorative,
+  not clickable; bar fills animate from 0 (no per-row from-value
+  tracking); relative times in the selection card can go stale while
+  the loop idles between events.
 
 ## Suggested next steps, in value order
 
-1. **TUI slices 3–6** of [tui-design.md](docs/design/tui-design.md):
-   mouse + clickable breadcrumb/cards, deletion basket + `v` review,
-   toasts, `?` cheatsheet, animations + `--no-motion`, responsive
-   mini-donut, themes + `camembert.toml` + OSC 11 light detection. The
-   design doc is the spec; slices 1–2 (cockpit + wheel) are done.
-2. **Freeable column, phase 1**: deleted-but-open files via
+1. **Freeable column, phase 1**: deleted-but-open files via
    `/proc/*/fd` + `(deleted)` symlinks with guilty PID; reuse it for
    the deletion open-file warning. Phase 2: btrfs
    `FIEMAP_EXTENT_SHARED`. (ZFS: show nothing rather than invent.)
-3. **Flat view + pattern aggregation** (`node_modules` = 14 GiB
+2. **Flat view + pattern aggregation** (`node_modules` = 14 GiB
    cumulative): same aggregation machinery over the frozen arena;
    rayon-friendly (see option C's frozen-structure idea in the
    scan-tree dossier).
-4. **Filter query language + Ctrl-K palette** (they ship together —
+3. **Filter query language + Ctrl-K palette** (they ship together —
    the palette is the language's UI, reserved in the design).
-5. **io_uring batched statx** with runtime detection + fallback (spec'd
+4. **io_uring batched statx** with runtime detection + fallback (spec'd
    in the original handoff §3; the completion invariant it needs is
    already documented in owner.rs).
-6. **Release engineering**: musl static builds (x86_64 + aarch64) in the
+5. **Release engineering**: musl static builds (x86_64 + aarch64) in the
    release workflow, `--version` embedding, first tag.
-7. Wave 4 per the archived handoff: ssh remote scan, HTML export, watch
+6. Wave 4 per the archived handoff: ssh remote scan, HTML export, watch
    mode (single-mutator design sketched in scan-tree docs), dated cache.
 
 ## How to work on this repo
 
 ```bash
-cargo test --workspace                                  # ~145 tests
+cargo test --workspace                                  # ~220 tests
 cargo clippy --workspace --all-targets -- -D warnings   # zero tolerance
 pre-commit run --all-files
 ```
