@@ -1,3 +1,4 @@
+mod config;
 mod ui;
 
 use std::io::{IsTerminal, Write};
@@ -8,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use clap::{Args, Parser, Subcommand};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use tracing_subscriber::fmt::writer::BoxMakeWriter;
 
 use camembert_core::diff::{self, DiffOptions, DiffReport};
@@ -100,8 +101,26 @@ struct ScanArgs {
     /// to any value, even empty, disables color). always ignores NO_COLOR
     /// but is still capped by what the terminal advertises. never renders
     /// monochrome with ASCII bars (the wheel needs color and is hidden).
-    #[arg(long, env = "COLOR", value_enum, default_value = "auto")]
-    color: ui::caps::ColorMode,
+    /// Defaults to auto when neither this, COLOR, nor camembert.toml's
+    /// `color` key set anything; see the README's Configuration section
+    /// for the full precedence (this flag > COLOR > camembert.toml >
+    /// auto).
+    #[arg(long, env = "COLOR", value_enum)]
+    color: Option<ui::caps::ColorMode>,
+
+    /// Theme for the interactive UI: tokyo-night, light, high-contrast
+    /// (env: THEME)
+    ///
+    /// tokyo-night (default) is the truecolor-first dark palette; light
+    /// is a Tokyo-Night-"day"-style variant for a light background;
+    /// high-contrast maximizes contrast (no mid-greys), usable on either.
+    /// Precedence: this flag > THEME > camembert.toml's `theme` key >
+    /// an OSC 11 terminal background query (bounded to ~150ms, skipped
+    /// outright on a non-tty or TERM=dumb; auto-picks light when the
+    /// terminal reports one) > tokyo-night. See the README's
+    /// Configuration section for camembert.toml's full format and path.
+    #[arg(long, env = "THEME", value_enum)]
+    theme: Option<ui::theme::ThemeName>,
 
     /// Disable micro-animations in the interactive UI (env: NO_MOTION)
     ///
@@ -110,6 +129,8 @@ struct ScanArgs {
     /// `NO_COLOR`, `NO_MOTION` counts if set to any value at all, even
     /// the empty string — this flag and the env var both just mean
     /// "off", so (unlike `--color`) there is no typed value to parse.
+    /// camembert.toml's `no_motion = true` has the same effect when
+    /// neither this flag nor NO_MOTION is set.
     #[arg(long = "no-motion")]
     no_motion: bool,
 }
@@ -216,6 +237,41 @@ Look & feel (interactive mode):
   growth is untouched, it already updates continuously); --no-motion
   (env NO_MOTION, any value counts, even empty, same rule as NO_COLOR)
   disables this and snaps both straight to their target value.
+
+Themes (--theme, env THEME):
+  tokyo-night (default, truecolor-first dark palette), light (a
+  Tokyo-Night-\"day\"-style variant for a light background), high-contrast
+  (maximizes contrast, avoids mid-greys, usable on either background).
+  Errors always render in the same coral family and the amber signature
+  accent stays recognizably amber in every theme (the exact shade may
+  adjust per theme for contrast).
+
+  Precedence: --theme > THEME > camembert.toml's `theme` key > an OSC 11
+  terminal background query > tokyo-night. The OSC 11 step only runs
+  when nothing above it chose a theme: it asks the terminal for its
+  background color at startup (before the alternate screen opens),
+  waits up to ~150ms, and auto-picks light if the reported color's
+  relative luminance is > 0.5; a terminal that never answers, is not a
+  tty, or reports TERM=dumb is treated as dark (today's default,
+  unchanged). This never blocks longer than the timeout and never
+  consumes more than that narrow window of stdin.
+
+Config file (camembert.toml):
+  Path: $XDG_CONFIG_HOME/camembert/camembert.toml, or
+  ~/.config/camembert/camembert.toml when XDG_CONFIG_HOME is unset.
+  A missing file is silently fine. All keys are optional:
+
+    theme = \"tokyo-night\" | \"light\" | \"high-contrast\"
+    color = \"auto\" | \"always\" | \"never\"
+    no_motion = true | false
+
+  Precedence for each key: the matching CLI flag > its env var > this
+  file > the built-in default (tokyo-night/auto/motion enabled) — except
+  `theme`, where the OSC 11 query above still gets a turn between the
+  config file and the default. An unparseable file, or one with unknown
+  keys, is never fatal: invalid TOML or an invalid value falls back to
+  defaults, and unrecognized keys are ignored — both cases log a warning
+  (see --log-file) rather than failing the scan.
 
 Dump:
   --output FILE (env: OUTPUT) writes a camembert-dump v1 (.cmbt) after
@@ -396,15 +452,6 @@ fn init_tracing(cli: &Cli, interactive: bool) -> Result<(), ()> {
 
 // ---- default mode: scan ----
 
-/// Whether animation is disabled: the `--no-motion` flag, or `NO_MOTION`
-/// present in the environment at all — any value, even the empty
-/// string, exactly like `NO_COLOR` (see `ui::caps`). Read directly
-/// rather than through clap's `env` attribute: a plain bool flag's typed
-/// env parsing cannot express "any value at all, including empty".
-fn motion_disabled(cli_flag: bool, env: Option<&str>) -> bool {
-    cli_flag || env.is_some()
-}
-
 fn run_scan(cli: &Cli) -> ExitCode {
     let args = &cli.scan;
     let interactive = !args.no_ui && std::io::stdout().is_terminal();
@@ -428,9 +475,35 @@ fn run_scan(cli: &Cli) -> ExitCode {
     });
 
     if interactive {
-        let caps = ui::caps::Caps::detect(&ui::caps::TermEnv::from_env(), args.color);
-        let animate = !motion_disabled(args.no_motion, std::env::var("NO_MOTION").ok().as_deref());
-        return match ui::run(scanner, &args.path, args.output.clone(), caps, animate) {
+        // camembert.toml sits below the CLI flag/env var in precedence
+        // for all three of its keys (design slice 6); loading it here
+        // (rather than unconditionally at the top of main) keeps a
+        // filesystem read out of --no-ui/summary runs, which never look
+        // at theme/color/motion at all.
+        let file_config = config::load();
+        let color = config::resolve_color(args.color, file_config.color);
+        let theme_choice = config::resolve_theme(args.theme, file_config.theme);
+        let no_motion = config::resolve_no_motion(
+            args.no_motion,
+            std::env::var("NO_MOTION").ok().is_some(),
+            file_config.no_motion,
+        );
+        debug!(
+            ?color,
+            ?theme_choice,
+            no_motion,
+            "resolved color/theme/motion (CLI > env > camembert.toml)"
+        );
+        let caps = ui::caps::Caps::detect(&ui::caps::TermEnv::from_env(), color);
+        let animate = !no_motion;
+        return match ui::run(
+            scanner,
+            &args.path,
+            args.output.clone(),
+            caps,
+            animate,
+            theme_choice,
+        ) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 // The terminal is restored by now; these are the process's
@@ -734,24 +807,4 @@ fn run_import(args: &ImportArgs) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn motion_disabled_matches_the_no_color_truthy_rule() {
-        assert!(
-            !motion_disabled(false, None),
-            "neither set: motion stays on"
-        );
-        assert!(motion_disabled(true, None), "--no-motion alone");
-        assert!(motion_disabled(false, Some("1")), "NO_MOTION=1");
-        assert!(
-            motion_disabled(false, Some("")),
-            "NO_MOTION set to the empty string still counts"
-        );
-        assert!(motion_disabled(true, Some("0")), "both set: still disabled");
-    }
 }

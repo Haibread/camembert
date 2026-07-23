@@ -61,6 +61,16 @@ the side wheel panel has nowhere to go, so a compact mini-donut takes
 over the header line instead (not a click target, unlike the full
 panel); `z` toggles **zen mode** — table only, no cards/gauge/wheel.
 
+Three themes are available with `--theme`/env `THEME`: `tokyo-night`
+(default), `light` (a Tokyo-Night-"day"-style variant for a light
+background) and `high-contrast` (avoids mid-greys, usable on either
+background). Errors stay the same coral family and the amber signature
+accent stays recognizably amber in every theme. Pick a light terminal
+and never say a word about it: an OSC 11 background query at startup
+auto-selects `light` when nothing else chose a theme — see
+[Configuration](#configuration) for the full precedence and the
+`camembert.toml` config file.
+
 ## Install
 
 From source (Rust stable, edition 2024):
@@ -99,9 +109,9 @@ camembert diff old.cmbt today.cmbt
 
 Every option is also an environment variable (`THREADS`,
 `CROSS_FILESYSTEMS`, `TOP`, `NO_UI`, `OUTPUT`, `THRESHOLD`, `COLOR`,
-`NO_MOTION`, `LOG_FILTER`, `LOG_FILE`, …) — see `camembert --help` and
-`camembert <subcommand> --help` for the full reference, including the
-interactive key map and the diff JSON schema.
+`THEME`, `NO_MOTION`, `LOG_FILTER`, `LOG_FILE`, …) — see `camembert
+--help` and `camembert <subcommand> --help` for the full reference,
+including the interactive key map and the diff JSON schema.
 
 ## Keys (interactive mode)
 
@@ -148,6 +158,41 @@ requires the mouse:
 | Move the mouse over a row | update the selection card below the table, without moving the keyboard cursor |
 
 Moving the keyboard cursor reclaims the selection card from the mouse.
+
+## Configuration
+
+Beyond flags and environment variables, the interactive UI reads an
+optional TOML config file at `$XDG_CONFIG_HOME/camembert/camembert.toml`
+(falling back to `~/.config/camembert/camembert.toml` when
+`XDG_CONFIG_HOME` is unset). A missing file is perfectly fine — nothing
+here is required. All keys are optional:
+
+```toml
+theme = "tokyo-night"  # "tokyo-night" | "light" | "high-contrast"
+color = "auto"         # "auto" | "always" | "never"
+no_motion = false      # true disables micro-animations
+```
+
+An unparseable file, an invalid value, or an unrecognized key is never
+fatal: camembert warns (visible with `--log-file`) and falls back to
+defaults for whatever did not parse, then keeps going.
+
+**Precedence**, for each of the three keys independently: the matching
+**CLI flag > its environment variable > `camembert.toml` > built-in
+default** — `--theme`/`--color`/`--no-motion` beat `THEME`/`COLOR`/
+`NO_MOTION`, which beat the config file, which beats `tokyo-night`/
+`auto`/motion-enabled.
+
+`theme` gets one more step between the config file and the default: an
+**OSC 11 terminal background query**. At startup, before the alternate
+screen opens, camembert asks the terminal for its background color and
+waits up to ~150ms for an answer; if the reported color's relative
+luminance is above 0.5, the `light` theme is auto-selected. This only
+ever runs when nothing above it (flag, env var, config file) already
+picked a theme, is skipped outright on a non-terminal or `TERM=dumb`,
+and treats "no answer in time" as dark — the same look as before this
+feature existed. It can never block longer than the timeout and never
+consumes more than that narrow slice of stdin.
 
 ## The dump format
 

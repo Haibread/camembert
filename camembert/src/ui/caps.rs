@@ -24,9 +24,13 @@
 //!   slices cannot be told apart by color is decoration, not data.
 
 use clap::ValueEnum;
+use serde::Deserialize;
 
-/// `--color` (env `COLOR`): when to emit color at all.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+/// `--color` (env `COLOR`; also the config file's `color` key): when to
+/// emit color at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Deserialize)]
+#[value(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case")]
 pub enum ColorMode {
     /// Detect from the environment (`COLORTERM`, `TERM`, `NO_COLOR`).
     Auto,

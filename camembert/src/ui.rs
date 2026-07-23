@@ -38,12 +38,13 @@ mod anim;
 pub mod caps;
 mod fmt;
 mod keymap;
+mod osc11;
 mod state;
-mod theme;
+pub mod theme;
 mod toast;
 mod wheel;
 
-use std::io;
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
@@ -74,7 +75,7 @@ use state::{
     ConfirmState, FrameGeometry, MarkRefusal, ReviewState, SortKey, TableGeometry, UiState,
     WheelGeometry, show_hardlink_note, show_updating_note,
 };
-use theme::Theme;
+use theme::{Theme, ThemeName};
 use toast::ToastQueue;
 
 /// Frame budget: poll timeout of the render loop (~30 fps, D5) while
@@ -195,15 +196,27 @@ enum Phase {
 /// results are dropped). When `output` is set, a dump is written once the
 /// scan completes — never on a mid-scan cancel. `animate` is `false` for
 /// `--no-motion`/`NO_MOTION` (design slice 5): bars and the donut then
-/// always render at their target value, no easing.
+/// always render at their target value, no easing. `theme_choice` is
+/// whatever `--theme`/`THEME`/the config file already decided (design
+/// slice 6); `None` means none of them did, in which case an OSC 11
+/// background query — bounded, and skipped outright on a non-tty or
+/// `TERM=dumb` — auto-selects `light` when the terminal answers with a
+/// light background, before the alternate screen opens.
 pub fn run(
     scanner: Scanner,
     path: &Path,
     output: Option<PathBuf>,
     caps: Caps,
     animate: bool,
+    theme_choice: Option<ThemeName>,
 ) -> io::Result<()> {
-    info!(?caps, animate, "terminal capabilities detected");
+    info!(
+        ?caps,
+        animate,
+        ?theme_choice,
+        "terminal capabilities detected"
+    );
+    let theme_name = resolve_theme_name(theme_choice);
     let disk = disk_space(path);
     let live = scanner.scan_live(path);
     // ratatui::init enters the alternate screen, enables raw mode, and
@@ -212,7 +225,7 @@ pub fn run(
     enable_mouse_capture();
     let ctx = RenderCtx {
         caps,
-        theme: Theme::new(caps.color),
+        theme: Theme::new(theme_name, caps.color),
         disk,
         animate,
     };
@@ -220,6 +233,47 @@ pub fn run(
     disable_mouse_capture();
     ratatui::restore();
     result
+}
+
+/// Theme precedence's last step (design slice 6, design §Color and
+/// capabilities point 5): an explicit choice (CLI/env/config, resolved
+/// by `main`'s `config` module before this ever runs) always wins;
+/// otherwise an OSC 11 query decides between the default dark theme and
+/// `light`. Runs before `ratatui::init` touches the terminal — there is
+/// no alternate screen to protect yet, and the query itself puts stdin
+/// into its own narrow, bounded raw-mode window and restores the
+/// original settings before returning (see
+/// `osc11::query_terminal_background`), so it can never hang, echo
+/// escape garbage to the screen, or swallow more than a sliver of early
+/// user input.
+fn resolve_theme_name(explicit: Option<ThemeName>) -> ThemeName {
+    if let Some(name) = explicit {
+        debug!(?name, "theme: explicit (CLI, THEME, or camembert.toml)");
+        return name;
+    }
+    let term = std::env::var("TERM").ok();
+    if !osc11::should_query(
+        term.as_deref(),
+        io::stdin().is_terminal(),
+        io::stdout().is_terminal(),
+    ) {
+        debug!("theme: OSC 11 query skipped (not a tty, or TERM dumb/unset); defaulting dark");
+        return ThemeName::default();
+    }
+    match osc11::query_terminal_background() {
+        Some((r, g, b)) if osc11::is_light(r, g, b) => {
+            debug!(r, g, b, "theme: OSC 11 reported a light background");
+            ThemeName::Light
+        }
+        Some((r, g, b)) => {
+            debug!(r, g, b, "theme: OSC 11 reported a dark background");
+            ThemeName::default()
+        }
+        None => {
+            debug!("theme: OSC 11 query got no answer in time; assuming dark");
+            ThemeName::default()
+        }
+    }
 }
 
 /// Turn on crossterm mouse reporting and extend the panic hook
@@ -870,7 +924,7 @@ fn draw(
     // snapshot order), shared by the table bars/names and the wheel so
     // they can never disagree.
     let disks: Vec<u64> = snapshot.rows.iter().map(|row| row.disk).collect();
-    let ranks = theme::assign_identity(&disks, theme::IDENTITY.len());
+    let ranks = theme::assign_identity(&disks, theme::IDENTITY_LEN);
 
     let breadcrumb = draw_header(frame, header_area, ui, spinner, ctx);
     let errors_card = if ui.zen() {
@@ -1058,7 +1112,7 @@ fn draw_metric_cards(
     } else {
         theme::MUTED
     };
-    let cards: [(&str, String, theme::PaletteEntry); 4] = [
+    let cards: [(&str, String, theme::Slot); 4] = [
         (
             "total",
             HumanSize(stats.disk_bytes).to_string(),
@@ -1952,7 +2006,7 @@ mod tests {
     fn ctx(glyphs: GlyphLevel, color: ColorLevel) -> RenderCtx {
         RenderCtx {
             caps: Caps { color, glyphs },
-            theme: Theme::new(color),
+            theme: Theme::new(ThemeName::TokyoNight, color),
             disk: Some(DiskSpace {
                 capacity: 100_000,
                 used: 40_000,
