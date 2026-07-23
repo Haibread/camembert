@@ -230,6 +230,18 @@ Keys (interactive mode):
                    pressing y confirms, any other key cancels
   q, Esc, Ctrl-C   quit (cancels the scan if still running)
 
+Mouse (interactive mode):
+  The mouse is additive: every key above still works, nothing requires
+  it. Click a table row to select it; click it again (or double-click
+  any row) to open it, matching Enter. The mouse wheel over the table
+  scrolls the cursor. Click a donut wheel slice to open that child
+  directly. Click a breadcrumb path segment in the header to jump to
+  that ancestor directory, same as Backspace repeated. Click the errors
+  metric card to sort by subtree error count, same as pressing e. Moving
+  the mouse over a table row updates the selection card below the table
+  (mtime, item count, % of parent, errors) without disturbing the
+  keyboard cursor; moving the keyboard cursor reclaims the card.
+
 Deleting (mark-then-confirm, with guard rails):
   Deletion only works once the scan has completed; during the scan the
   mark keys just show a hint. Marks refuse mount points (excluded

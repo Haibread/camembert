@@ -245,20 +245,44 @@ pub fn sextant_char(bits: u8) -> char {
 /// part of `total` not covered by any child (the directory's own size) —
 /// merges into a final `None` (gray) rest slice.
 pub fn build_slices(rows: &[(u64, Option<usize>)], total: u64) -> (Vec<f64>, Vec<Option<usize>>) {
+    let (fracs, ranks, _) = build_slices_indexed(rows, total);
+    (fracs, ranks)
+}
+
+/// Same slice merging as [`build_slices`], but returns each kept slice's
+/// row position in `rows` instead of its color rank — `rows` is expected
+/// to be in the same display order the table/cursor use (position `i` =
+/// cursor position `i`), so this is directly usable to hit-test a donut
+/// click back to a table row. `None` for the merged "rest" slice, which
+/// does not correspond to any single row.
+pub fn build_slice_targets(rows: &[(u64, Option<usize>)], total: u64) -> Vec<Option<usize>> {
+    let (_, _, targets) = build_slices_indexed(rows, total);
+    targets
+}
+
+/// Shared implementation of [`build_slices`] and [`build_slice_targets`]:
+/// the same merge pass, carrying both the color rank and the originating
+/// row position for each kept slice.
+fn build_slices_indexed(
+    rows: &[(u64, Option<usize>)],
+    total: u64,
+) -> (Vec<f64>, Vec<Option<usize>>, Vec<Option<usize>>) {
     if total == 0 {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     }
     let mut fracs = Vec::new();
     let mut ranks = Vec::new();
+    let mut targets = Vec::new();
     let mut accounted = 0.0;
     let mut rest = 0.0;
-    for &(disk, rank) in rows {
+    for (i, &(disk, rank)) in rows.iter().enumerate() {
         let frac = disk as f64 / total as f64;
         accounted += frac;
         match rank {
             Some(rank) if frac >= MIN_SLICE_FRACTION => {
                 fracs.push(frac);
                 ranks.push(Some(rank));
+                targets.push(Some(i));
             }
             _ => rest += frac,
         }
@@ -269,8 +293,9 @@ pub fn build_slices(rows: &[(u64, Option<usize>)], total: u64) -> (Vec<f64>, Vec
     if rest > 1e-9 {
         fracs.push(rest);
         ranks.push(None);
+        targets.push(None);
     }
-    (fracs, ranks)
+    (fracs, ranks, targets)
 }
 
 /// A proportion bar of `width` cells for `frac` in `[0, 1]`, padded with
@@ -500,6 +525,25 @@ mod tests {
         // Rest = 0.015 + 0.1 + 0.085 unaccounted.
         assert!((fracs[2] - 0.2).abs() < 1e-9);
         assert!((fracs.iter().sum::<f64>() - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn build_slice_targets_maps_kept_slices_back_to_rows() {
+        // Same fixture as build_slices_merges_small_and_unranked_into_rest:
+        // rows 0 and 1 survive as their own slices, rows 2 and 3 (plus the
+        // unaccounted remainder) fold into the trailing rest slice.
+        let targets = build_slice_targets(
+            &[(500, Some(0)), (300, Some(1)), (15, Some(2)), (100, None)],
+            1000,
+        );
+        assert_eq!(targets, vec![Some(0), Some(1), None]);
+    }
+
+    #[test]
+    fn build_slice_targets_edge_cases() {
+        assert_eq!(build_slice_targets(&[], 0), Vec::<Option<usize>>::new());
+        // No children: the whole donut is the rest slice — not navigable.
+        assert_eq!(build_slice_targets(&[], 100), vec![None]);
     }
 
     #[test]

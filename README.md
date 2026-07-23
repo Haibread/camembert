@@ -48,6 +48,10 @@ so your eye links them instantly. The palette is Tokyo-Night-family
 truecolor with a full fallback ladder (256 → 16 → mono/ASCII) and
 [`NO_COLOR`](https://no-color.org) support.
 
+Everything you see is also clickable: table rows, wheel slices, the
+breadcrumb, the errors card (see [Mouse](#mouse-interactive-mode) below)
+— the keyboard map stays complete either way.
+
 ## Install
 
 From source (Rust stable, edition 2024):
@@ -104,6 +108,23 @@ interactive key map and the diff JSON schema.
 entry re-checked (existence, file type, device) immediately before
 removal — anything that changed since the scan is skipped, never
 deleted. Symlinks are removed, never followed.
+
+## Mouse (interactive mode)
+
+Mouse support is additive — every key above keeps working, nothing
+requires the mouse:
+
+| | |
+| --- | --- |
+| Click a row | select it |
+| Click it again, or double-click any row | open it (like `⏎`) |
+| Wheel over the table | scroll the cursor |
+| Click a donut slice | open that child directly |
+| Click a breadcrumb segment (header) | jump to that ancestor (like `⌫` repeated) |
+| Click the `errors` metric card | sort by subtree error count (like `e`) |
+| Move the mouse over a row | update the selection card below the table, without moving the keyboard cursor |
+
+Moving the keyboard cursor reclaims the selection card from the mouse.
 
 ## The dump format
 

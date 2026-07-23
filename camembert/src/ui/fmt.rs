@@ -80,6 +80,32 @@ pub fn abbreviate_path(path: &str, max: usize) -> String {
     format!("…{tail}")
 }
 
+/// Char-index spans (start inclusive, end exclusive) of `path`'s non-empty
+/// `/`-separated components, in order — the breadcrumb's clickable
+/// column ranges once offset by where the path starts on screen. Byte
+/// offsets would misalign multi-byte UTF-8 against terminal columns, so
+/// this counts chars; leading/doubled slashes contribute no component
+/// (never a zero-width clickable span).
+pub fn path_segments(path: &str) -> Vec<(usize, usize)> {
+    let mut segments = Vec::new();
+    let mut start: Option<usize> = None;
+    let mut chars = 0usize;
+    for (i, ch) in path.chars().enumerate() {
+        chars = i + 1;
+        if ch == '/' {
+            if let Some(s) = start.take() {
+                segments.push((s, i));
+            }
+        } else if start.is_none() {
+            start = Some(i);
+        }
+    }
+    if let Some(s) = start {
+        segments.push((s, chars));
+    }
+    segments
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,6 +148,35 @@ mod tests {
         };
         assert_eq!(empty.used_fraction(), 0.0);
         assert_eq!(empty.coverage_fraction(5), 0.0);
+    }
+
+    #[test]
+    fn path_segments_absolute() {
+        // "/home/user": chars 0='/',1..5="home",5='/',6..10="user".
+        assert_eq!(path_segments("/home/user"), vec![(1, 5), (6, 10)]);
+    }
+
+    #[test]
+    fn path_segments_edge_cases() {
+        assert_eq!(path_segments(""), Vec::<(usize, usize)>::new());
+        assert_eq!(
+            path_segments("/"),
+            Vec::<(usize, usize)>::new(),
+            "bare root: no component"
+        );
+        assert_eq!(
+            path_segments("//a//b/"),
+            vec![(2, 3), (5, 6)],
+            "doubled slashes collapse"
+        );
+        assert_eq!(
+            path_segments("relative/path"),
+            vec![(0, 8), (9, 13)],
+            "no leading slash"
+        );
+        assert_eq!(path_segments("noslash"), vec![(0, 7)]);
+        // Multi-byte chars count as one char each, not by UTF-8 byte width.
+        assert_eq!(path_segments("/café/日本"), vec![(1, 5), (6, 8)]);
     }
 
     #[test]

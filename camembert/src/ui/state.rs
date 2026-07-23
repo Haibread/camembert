@@ -104,6 +104,113 @@ pub struct ConfirmState {
     pub hardlink_files: u64,
 }
 
+/// Screen geometry of the most recently drawn frame, for mouse
+/// hit-testing. Plain coordinates only (no ratatui types) so this stays
+/// as terminal-free and unit-testable as the rest of this module; `ui.rs`
+/// fills it in from the actual layout on every draw and consults it when
+/// a mouse event arrives. Absent fields (`None`/empty) mean that element
+/// was not drawn this frame (e.g. the wheel below the width threshold).
+#[derive(Debug, Clone, Default)]
+pub struct FrameGeometry {
+    pub table: Option<TableGeometry>,
+    /// Screen row the breadcrumb path is drawn on.
+    pub breadcrumb_row: u16,
+    /// Half-open column range of each path-component span, paired with
+    /// the ancestor directory clicking it jumps to (`None` = the current
+    /// directory's own trailing segment, or a root-prefix segment before
+    /// the first descend — nothing to jump to yet).
+    pub breadcrumb: Vec<(u16, u16, Option<DirId>)>,
+    /// The errors metric card's screen rect `(x, y, width, height)`.
+    pub errors_card: Option<(u16, u16, u16, u16)>,
+    pub wheel: Option<WheelGeometry>,
+}
+
+/// Table body geometry: which screen rows hold which display-order rows.
+#[derive(Debug, Clone, Copy)]
+pub struct TableGeometry {
+    pub x: u16,
+    /// Screen row of the first body row (below the header row).
+    pub y: u16,
+    pub width: u16,
+    /// Number of body rows visible (may be fewer than the table's row
+    /// count if it doesn't fit).
+    pub height: u16,
+    /// Display-order position of the first visible row (`TableState`'s
+    /// scroll offset).
+    pub offset: usize,
+}
+
+impl TableGeometry {
+    /// The display-order position under `(col, row)`, if it falls inside
+    /// the table body — a cursor position, not yet bounds-checked against
+    /// the current row count (the caller re-validates before using it, in
+    /// case rows changed since the frame that produced this geometry).
+    pub fn hit_test(&self, col: u16, row: u16) -> Option<usize> {
+        if col < self.x || col >= self.x + self.width {
+            return None;
+        }
+        if row < self.y || row >= self.y + self.height {
+            return None;
+        }
+        Some(self.offset + (row - self.y) as usize)
+    }
+}
+
+/// Donut geometry: which screen cell holds which slice, and which display
+/// row each slice represents.
+#[derive(Debug, Clone)]
+pub struct WheelGeometry {
+    pub x: u16,
+    pub y: u16,
+    pub width: usize,
+    pub height: usize,
+    /// Slice index per screen cell, row-major (`width` per row); `None`
+    /// outside the disc (the hole, or the wheel's card padding).
+    pub cells: Vec<Option<u16>>,
+    /// Slice index -> display-order row position; `None` for the merged
+    /// "rest" slice (see [`super::wheel::build_slice_targets`]), which
+    /// does not correspond to a single row and is not navigable.
+    pub targets: Vec<Option<usize>>,
+}
+
+impl WheelGeometry {
+    /// The display-order row position a click at `(col, row)` should
+    /// navigate to, if the cell is lit and its slice maps to one.
+    pub fn hit_test(&self, col: u16, row: u16) -> Option<usize> {
+        if col < self.x || row < self.y {
+            return None;
+        }
+        let (x, y) = ((col - self.x) as usize, (row - self.y) as usize);
+        if x >= self.width || y >= self.height {
+            return None;
+        }
+        let slice = self.cells.get(y * self.width + x).copied().flatten()?;
+        self.targets.get(slice as usize).copied().flatten()
+    }
+}
+
+impl FrameGeometry {
+    /// The ancestor directory a click at `(col, row)` on the breadcrumb
+    /// should jump to, if any.
+    pub fn breadcrumb_hit(&self, col: u16, row: u16) -> Option<DirId> {
+        if row != self.breadcrumb_row {
+            return None;
+        }
+        self.breadcrumb
+            .iter()
+            .find(|&&(start, end, _)| col >= start && col < end)
+            .and_then(|&(_, _, dir)| dir)
+    }
+
+    /// Whether `(col, row)` falls inside the errors metric card.
+    pub fn errors_card_hit(&self, col: u16, row: u16) -> bool {
+        matches!(
+            self.errors_card,
+            Some((x, y, w, h)) if col >= x && col < x + w && row >= y && row < y + h
+        )
+    }
+}
+
 /// Cache key for the sorted permutation: re-sort only when any part
 /// changes (new generation, different dir, or different sort).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,6 +245,15 @@ pub struct UiState {
     marked_set: HashSet<NodeId>,
     /// `Some` while the delete-confirmation modal is open.
     confirm: Option<ConfirmState>,
+    /// Display-order position of the row under the mouse cursor, while it
+    /// sits over the table without clicking — the selection card prefers
+    /// this over the keyboard cursor when present. Cleared by any
+    /// keyboard action or click, and whenever the row set changes, so it
+    /// never survives past the frame it was observed in.
+    hover: Option<usize>,
+    /// Hit-testing geometry of the last drawn frame (mouse support,
+    /// design slice 3).
+    geometry: FrameGeometry,
 }
 
 impl UiState {
@@ -155,6 +271,8 @@ impl UiState {
             marks: Vec::new(),
             marked_set: HashSet::new(),
             confirm: None,
+            hover: None,
+            geometry: FrameGeometry::default(),
         };
         state.ensure_sorted();
         state
@@ -188,6 +306,49 @@ impl UiState {
         self.order.get(self.cursor).map(|&i| &self.snapshot.rows[i])
     }
 
+    /// The row the selection card should describe: the mouse-hovered row
+    /// while present, otherwise the keyboard cursor's row (mouse hover
+    /// and keyboard selection both drive the card — design slice 3).
+    pub fn card_row(&self) -> Option<&Row> {
+        let position = self.hover.unwrap_or(self.cursor);
+        self.order.get(position).map(|&i| &self.snapshot.rows[i])
+    }
+
+    /// Row under the mouse, set on `MouseEventKind::Moved` over the table.
+    pub fn hover(&self) -> Option<usize> {
+        self.hover
+    }
+
+    /// Set the hovered row (mouse moved over the table body).
+    pub fn set_hover(&mut self, position: usize) {
+        self.hover = Some(position);
+    }
+
+    /// Clear the hovered row: the mouse left the table, a click landed,
+    /// or a keyboard action moved the cursor (the card should follow
+    /// whichever input the user is actually using).
+    pub fn clear_hover(&mut self) {
+        self.hover = None;
+    }
+
+    /// DirIds of every directory currently open above the viewed one,
+    /// root-first — mirrors the descend/ascend stack. Used to build the
+    /// clickable breadcrumb: each entry is one `ascend()` away in that
+    /// many steps.
+    pub fn stack_dirs(&self) -> impl Iterator<Item = DirId> + '_ {
+        self.stack.iter().map(|&(dir, _)| dir)
+    }
+
+    /// Hit-testing geometry captured from the last drawn frame.
+    pub fn geometry(&self) -> &FrameGeometry {
+        &self.geometry
+    }
+
+    /// Replace the hit-testing geometry after a frame is drawn.
+    pub fn set_geometry(&mut self, geometry: FrameGeometry) {
+        self.geometry = geometry;
+    }
+
     /// Adopt a (possibly unchanged) snapshot: resolve pending navigation,
     /// re-sort when the generation/dir/sort changed, clamp the cursor.
     pub fn apply_snapshot(&mut self, snapshot: Arc<ViewSnapshot>) {
@@ -203,6 +364,10 @@ impl UiState {
         self.snapshot = snapshot;
         self.ensure_sorted();
         self.clamp_cursor();
+        // The row set may have changed shape entirely; a stale hover
+        // position would describe the wrong row until the mouse moves
+        // again, so drop it (it is recomputed on the next `Moved` event).
+        self.clear_hover();
     }
 
     /// Handle a sort keypress; re-sorts immediately.
@@ -210,24 +375,42 @@ impl UiState {
         self.sort.press(key);
         self.ensure_sorted();
         self.clamp_cursor();
+        self.clear_hover(); // order changed under a stale hover position
     }
 
     pub fn move_down(&mut self) {
         if self.cursor + 1 < self.order.len() {
             self.cursor += 1;
         }
+        self.clear_hover();
     }
 
     pub fn move_up(&mut self) {
         self.cursor = self.cursor.saturating_sub(1);
+        self.clear_hover();
     }
 
     pub fn move_top(&mut self) {
         self.cursor = 0;
+        self.clear_hover();
     }
 
     pub fn move_bottom(&mut self) {
         self.cursor = self.order.len().saturating_sub(1);
+        self.clear_hover();
+    }
+
+    /// Number of rows in the active (sorted) view.
+    pub fn row_count(&self) -> usize {
+        self.order.len()
+    }
+
+    /// Move the cursor directly to a display-order position (a mouse
+    /// click) — clamped defensively in case the row count changed since
+    /// the frame the click's geometry came from.
+    pub fn select_at(&mut self, position: usize) {
+        self.cursor = position.min(self.order.len().saturating_sub(1));
+        self.clear_hover();
     }
 
     /// Start descending into the directory under the cursor. Returns the
@@ -264,6 +447,27 @@ impl UiState {
         };
         self.pending_nav = Some(parent);
         Some(parent)
+    }
+
+    /// Jump straight to an open ancestor directory (breadcrumb click):
+    /// equivalent to pressing `ascend` repeatedly until reaching `dir`,
+    /// but resolved as a single navigation request instead of one per
+    /// frame. `dir` must be a directory on the current descend stack (as
+    /// built by [`Self::stack_dirs`]); anything else — a stale click after
+    /// navigating away, the current directory itself, or another
+    /// navigation already pending — is a no-op.
+    pub fn jump_to_ancestor(&mut self, dir: DirId) -> Option<DirId> {
+        if self.pending_nav.is_some() || dir == self.snapshot.dir {
+            return None;
+        }
+        let position = self.stack.iter().position(|&(d, _)| d == dir)?;
+        let (_, cursor) = self.stack[position];
+        // Discard the descends between `dir` and here — they are behind
+        // us now; keep everything above it (its own ancestors).
+        self.stack.truncate(position);
+        self.pending_cursor = cursor;
+        self.pending_nav = Some(dir);
+        Some(dir)
     }
 
     // ---- mark-then-confirm deletion (HANDOFF §5) ----
@@ -580,6 +784,31 @@ mod tests {
     }
 
     #[test]
+    fn select_at_clamps_and_clears_hover() {
+        let mut state = UiState::new(snapshot(
+            1,
+            0,
+            None,
+            vec![
+                file_row(b"a", 3, 3, 0),
+                file_row(b"b", 2, 2, 0),
+                file_row(b"c", 1, 1, 0),
+            ],
+            false,
+        ));
+        assert_eq!(state.row_count(), 3);
+        state.set_hover(2);
+        state.select_at(1);
+        assert_eq!(state.cursor(), 1);
+        assert_eq!(state.hover(), None, "a click reclaims the card too");
+
+        // Out-of-range position (stale geometry from a shrunk view):
+        // clamp instead of pointing past the end.
+        state.select_at(99);
+        assert_eq!(state.cursor(), 2);
+    }
+
+    #[test]
     fn descend_and_ascend_restore_the_cursor() {
         let mut state = UiState::new(snapshot(
             1,
@@ -632,6 +861,176 @@ mod tests {
         ));
         assert_eq!(state.cursor(), 1);
         assert_eq!(&*state.selected().unwrap().name, b"sub");
+    }
+
+    #[test]
+    fn jump_to_ancestor_skips_several_levels_in_one_request() {
+        // root (dir 0) -> a (dir 1) -> b (dir 2) -> c (dir 3), descending
+        // one level at a time like the keyboard path would.
+        let mut state = UiState::new(snapshot(1, 0, None, vec![dir_row(b"a", 1, 10, 1)], false));
+        state.descend();
+        state.apply_snapshot(snapshot(
+            2,
+            1,
+            Some(0),
+            vec![dir_row(b"b", 2, 10, 1)],
+            false,
+        ));
+        state.descend();
+        state.apply_snapshot(snapshot(
+            3,
+            2,
+            Some(1),
+            vec![dir_row(b"c", 3, 10, 1)],
+            false,
+        ));
+        state.descend();
+        state.apply_snapshot(snapshot(
+            4,
+            3,
+            Some(2),
+            vec![file_row(b"leaf", 1, 1, 0)],
+            false,
+        ));
+
+        // Root, a, b are all still open above the current dir.
+        assert_eq!(
+            state.stack_dirs().collect::<Vec<_>>(),
+            vec![DirId::from_raw(0), DirId::from_raw(1), DirId::from_raw(2)]
+        );
+
+        // One breadcrumb click on the root jumps straight there — a
+        // single navigation request, not three.
+        let target = state
+            .jump_to_ancestor(DirId::from_raw(0))
+            .expect("root is on the stack");
+        assert_eq!(target, DirId::from_raw(0));
+        assert_eq!(state.pending_nav(), Some(DirId::from_raw(0)));
+        // The intermediate levels (a, b) are gone from the stack: from
+        // here, ascend() would have nothing left to restore beyond root.
+        assert_eq!(state.stack_dirs().collect::<Vec<_>>(), Vec::new());
+
+        state.apply_snapshot(snapshot(5, 0, None, vec![dir_row(b"a", 1, 10, 1)], false));
+        assert_eq!(state.pending_nav(), None);
+    }
+
+    #[test]
+    fn jump_to_ancestor_refuses_the_current_dir_and_unknown_targets() {
+        let mut state = UiState::new(snapshot(1, 0, None, vec![dir_row(b"a", 1, 10, 1)], false));
+        state.descend();
+        state.apply_snapshot(snapshot(
+            2,
+            1,
+            Some(0),
+            vec![file_row(b"f", 1, 1, 0)],
+            false,
+        ));
+
+        assert_eq!(
+            state.jump_to_ancestor(DirId::from_raw(1)),
+            None,
+            "already there"
+        );
+        assert_eq!(
+            state.jump_to_ancestor(DirId::from_raw(99)),
+            None,
+            "not an open ancestor"
+        );
+        // Neither refusal disturbed the stack.
+        assert_eq!(
+            state.stack_dirs().collect::<Vec<_>>(),
+            vec![DirId::from_raw(0)]
+        );
+    }
+
+    #[test]
+    fn card_row_prefers_hover_then_falls_back_to_cursor() {
+        let mut state = UiState::new(snapshot(
+            1,
+            0,
+            None,
+            vec![file_row(b"a", 20, 20, 0), file_row(b"b", 10, 10, 0)],
+            false,
+        ));
+        // Disk-desc default order: a (cursor 0), b (position 1).
+        assert_eq!(&*state.card_row().unwrap().name, b"a", "no hover: cursor");
+        state.set_hover(1);
+        assert_eq!(&*state.card_row().unwrap().name, b"b", "hover wins");
+        assert_eq!(state.hover(), Some(1));
+
+        // Any keyboard movement reclaims the card for the cursor.
+        state.move_down();
+        assert_eq!(state.hover(), None, "keyboard clears hover");
+        assert_eq!(&*state.card_row().unwrap().name, b"b", "now via cursor");
+    }
+
+    #[test]
+    fn hover_does_not_survive_a_snapshot_change() {
+        let mut state = UiState::new(snapshot(
+            1,
+            0,
+            None,
+            vec![file_row(b"a", 20, 20, 0), file_row(b"b", 10, 10, 0)],
+            false,
+        ));
+        state.set_hover(1);
+        state.apply_snapshot(snapshot(
+            1,
+            0,
+            None,
+            vec![file_row(b"a", 20, 20, 0), file_row(b"b", 10, 10, 0)],
+            false,
+        ));
+        assert_eq!(state.hover(), None, "reapplying a snapshot drops hover");
+    }
+
+    #[test]
+    fn table_geometry_hit_test() {
+        let geometry = TableGeometry {
+            x: 2,
+            y: 5,
+            width: 20,
+            height: 3,
+            offset: 4,
+        };
+        assert_eq!(geometry.hit_test(10, 5), Some(4), "first visible row");
+        assert_eq!(geometry.hit_test(10, 7), Some(6), "third visible row");
+        assert_eq!(geometry.hit_test(10, 8), None, "below the table");
+        assert_eq!(geometry.hit_test(1, 5), None, "left of the table");
+        assert_eq!(geometry.hit_test(22, 5), None, "right of the table");
+    }
+
+    #[test]
+    fn wheel_geometry_hit_test() {
+        // 2x2 grid: slice 0 top-left, slice 1 (rest) top-right, empty
+        // bottom row (outside the disc).
+        let geometry = WheelGeometry {
+            x: 10,
+            y: 3,
+            width: 2,
+            height: 2,
+            cells: vec![Some(0), Some(1), None, None],
+            targets: vec![Some(7), None], // slice 1 is the unnavigable rest
+        };
+        assert_eq!(geometry.hit_test(10, 3), Some(7), "slice 0 -> its row");
+        assert_eq!(geometry.hit_test(11, 3), None, "rest slice: not navigable");
+        assert_eq!(geometry.hit_test(10, 4), None, "outside the disc");
+        assert_eq!(geometry.hit_test(0, 0), None, "outside the wheel area");
+    }
+
+    #[test]
+    fn frame_geometry_breadcrumb_and_card_hit_tests() {
+        let geometry = FrameGeometry {
+            breadcrumb_row: 0,
+            breadcrumb: vec![(1, 5, Some(DirId::from_raw(0))), (6, 9, None)],
+            errors_card: Some((20, 1, 10, 3)),
+            ..Default::default()
+        };
+        assert_eq!(geometry.breadcrumb_hit(2, 0), Some(DirId::from_raw(0)));
+        assert_eq!(geometry.breadcrumb_hit(7, 0), None, "current dir segment");
+        assert_eq!(geometry.breadcrumb_hit(2, 1), None, "wrong row");
+        assert!(geometry.errors_card_hit(25, 2));
+        assert!(!geometry.errors_card_hit(5, 2));
     }
 
     #[test]

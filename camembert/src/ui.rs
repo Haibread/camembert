@@ -19,6 +19,11 @@
 //!
 //! Diagnostics: `tracing` only — stdout/stderr belong to the terminal UI
 //! while it runs (redirect stderr to a file to capture logs).
+//!
+//! Mouse support (design slice 3) is additive to the keyboard map: rows,
+//! wheel slices, the breadcrumb and the errors card are all clickable,
+//! hit-tested against a [`state::FrameGeometry`] recomputed every frame
+//! from the actual layout — see [`draw`] and [`handle_mouse`].
 
 pub mod caps;
 mod fmt;
@@ -31,7 +36,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
@@ -50,11 +58,22 @@ use camembert_core::view::{self, RowState, ViewSnapshot};
 
 use caps::{Caps, GlyphLevel};
 use fmt::DiskSpace;
-use state::{ConfirmState, MarkRefusal, SortKey, UiState, show_hardlink_note, show_updating_note};
+use state::{
+    ConfirmState, FrameGeometry, MarkRefusal, SortKey, TableGeometry, UiState, WheelGeometry,
+    show_hardlink_note, show_updating_note,
+};
 use theme::Theme;
 
 /// Frame budget: poll timeout of the render loop (~30 fps, D5).
 const FRAME: Duration = Duration::from_millis(33);
+
+/// Two clicks on the same cell within this window count as a
+/// double-click (navigate into the row) — independent of the
+/// already-selected-row shortcut, which navigates on a single click.
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+
+/// Rows moved per mouse-wheel notch over the table.
+const SCROLL_STEP: usize = 3;
 
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -138,14 +157,40 @@ pub fn run(scanner: Scanner, path: &Path, output: Option<PathBuf>, caps: Caps) -
     // ratatui::init enters the alternate screen, enables raw mode, and
     // installs a panic hook that restores the terminal first.
     let mut terminal = ratatui::init();
+    enable_mouse_capture();
     let ctx = RenderCtx {
         caps,
         theme: Theme::new(caps.color),
         disk,
     };
     let result = event_loop(&mut terminal, live, output, &ctx);
+    disable_mouse_capture();
     ratatui::restore();
     result
+}
+
+/// Turn on crossterm mouse reporting and extend the panic hook
+/// `ratatui::init` just installed so a mid-session panic disables it
+/// again before the terminal is restored — otherwise the outer terminal
+/// is left capturing the mouse after camembert exits. A failure to enable
+/// is logged and never fatal: the UI degrades to keyboard-only.
+fn enable_mouse_capture() {
+    if let Err(err) = crossterm::execute!(io::stdout(), EnableMouseCapture) {
+        warn!(%err, "failed to enable mouse capture: mouse input stays inactive");
+        return;
+    }
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        disable_mouse_capture();
+        previous(info);
+    }));
+}
+
+/// Inverse of [`enable_mouse_capture`]; safe to call even if enabling
+/// never succeeded (or was never attempted) — worst case, an inert
+/// escape sequence.
+fn disable_mouse_capture() {
+    let _ = crossterm::execute!(io::stdout(), DisableMouseCapture);
 }
 
 /// statvfs on the scan root, for the disk gauge. A failure is logged and
@@ -201,41 +246,48 @@ fn event_loop(
     // invalidates on post-scan navigation.
     let mut local_generation: u64 = 0;
     let mut flash = Flash::new();
+    // Last left-click's time and cell, for double-click detection —
+    // independent of the click-already-selected-row shortcut.
+    let mut last_click: Option<(Instant, u16, u16)> = None;
 
     loop {
         // 1. Input (drain everything pending; block at most one frame).
         let mut deadline = FRAME;
         while event::poll(deadline)? {
             deadline = Duration::ZERO;
-            if let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-            {
-                match handle_key(
-                    key.code,
-                    key.modifiers,
-                    &mut ui,
-                    &mut phase,
-                    &mut local_generation,
-                    &mut flash,
-                ) {
-                    Action::Quit => {
-                        if let Phase::Scanning(live) = phase {
-                            info!("quit during scan: cancelling");
-                            live.cancel();
-                            match live.join() {
-                                Ok(mut outcome) => {
-                                    debug!(cancelled = outcome.cancelled, "scan wound down");
-                                    // Rarely, the scan finished before the
-                                    // cancel landed: honor --output then.
-                                    finish_scan(&mut outcome, output.take());
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    match handle_key(
+                        key.code,
+                        key.modifiers,
+                        &mut ui,
+                        &mut phase,
+                        &mut local_generation,
+                        &mut flash,
+                    ) {
+                        Action::Quit => {
+                            if let Phase::Scanning(live) = phase {
+                                info!("quit during scan: cancelling");
+                                live.cancel();
+                                match live.join() {
+                                    Ok(mut outcome) => {
+                                        debug!(cancelled = outcome.cancelled, "scan wound down");
+                                        // Rarely, the scan finished before the
+                                        // cancel landed: honor --output then.
+                                        finish_scan(&mut outcome, output.take());
+                                    }
+                                    Err(err) => debug!(%err, "scan failed while quitting"),
                                 }
-                                Err(err) => debug!(%err, "scan failed while quitting"),
                             }
+                            return Ok(());
                         }
-                        return Ok(());
+                        Action::Continue => {}
                     }
-                    Action::Continue => {}
                 }
+                Event::Mouse(mouse) => {
+                    handle_mouse(mouse, &mut ui, &phase, &mut last_click);
+                }
+                _ => {}
             }
         }
 
@@ -280,8 +332,9 @@ fn event_loop(
         });
         let spinner = spinner_frame(ctx, started.elapsed());
         let flash_text = flash.current().map(str::to_owned);
+        let mut geometry = FrameGeometry::default();
         terminal.draw(|frame| {
-            draw(
+            geometry = draw(
                 frame,
                 &ui,
                 &mut table_state,
@@ -290,6 +343,9 @@ fn event_loop(
                 ctx,
             );
         })?;
+        // Recomputed every frame (design slice 3): mouse events hit-test
+        // against exactly what is on screen right now.
+        ui.set_geometry(geometry);
     }
 }
 
@@ -335,16 +391,8 @@ fn handle_key(
         KeyCode::Up | KeyCode::Char('k') => ui.move_up(),
         KeyCode::Char('g') => ui.move_top(),
         KeyCode::Char('G') => ui.move_bottom(),
-        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-            if let Some(dir) = ui.descend() {
-                request_nav(phase, dir);
-            }
-        }
-        KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
-            if let Some(dir) = ui.ascend() {
-                request_nav(phase, dir);
-            }
-        }
+        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => try_descend(ui, phase),
+        KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => try_ascend(ui, phase),
         KeyCode::Char('d') => ui.press_sort(SortKey::Disk),
         KeyCode::Char('a') => ui.press_sort(SortKey::Apparent),
         KeyCode::Char('n') => ui.press_sort(SortKey::Name),
@@ -358,6 +406,138 @@ fn handle_key(
         _ => {}
     }
     Action::Continue
+}
+
+/// Start descending into the directory under the cursor — shared by the
+/// keyboard (`Enter`/`l`/`Right`) and every mouse action that opens a row
+/// (double-click, click-on-already-selected, donut slice).
+fn try_descend(ui: &mut UiState, phase: &Phase) {
+    if let Some(dir) = ui.descend() {
+        request_nav(phase, dir);
+    }
+}
+
+/// Start going up to the parent — shared by the keyboard
+/// (`Backspace`/`h`/`Left`) and breadcrumb clicks.
+fn try_ascend(ui: &mut UiState, phase: &Phase) {
+    if let Some(dir) = ui.ascend() {
+        request_nav(phase, dir);
+    }
+}
+
+/// Route a mouse event against the last frame's [`FrameGeometry`] (mouse
+/// support, design slice 3). Inert while the delete-confirmation modal is
+/// open — it only listens to the keyboard.
+fn handle_mouse(
+    mouse: MouseEvent,
+    ui: &mut UiState,
+    phase: &Phase,
+    last_click: &mut Option<(Instant, u16, u16)>,
+) {
+    if ui.confirm().is_some() {
+        return;
+    }
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            handle_click(mouse.column, mouse.row, ui, phase, last_click);
+        }
+        MouseEventKind::Moved => handle_hover(mouse.column, mouse.row, ui),
+        MouseEventKind::ScrollDown if over_table(mouse.column, mouse.row, ui) => {
+            for _ in 0..SCROLL_STEP {
+                ui.move_down();
+            }
+        }
+        MouseEventKind::ScrollUp if over_table(mouse.column, mouse.row, ui) => {
+            for _ in 0..SCROLL_STEP {
+                ui.move_up();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn over_table(col: u16, row: u16, ui: &UiState) -> bool {
+    ui.geometry()
+        .table
+        .as_ref()
+        .is_some_and(|table| table.hit_test(col, row).is_some())
+}
+
+/// Left click: errors card toggles sort-by-errors, a breadcrumb segment
+/// jumps to that ancestor, a donut slice navigates straight into that
+/// child, and a table row selects it — or, matching the keyboard's
+/// descend key, navigates into it when the click double-clicks the same
+/// cell or lands on the row already under the cursor.
+fn handle_click(
+    col: u16,
+    row: u16,
+    ui: &mut UiState,
+    phase: &Phase,
+    last_click: &mut Option<(Instant, u16, u16)>,
+) {
+    if ui.geometry().errors_card_hit(col, row) {
+        ui.press_sort(SortKey::Errors);
+        *last_click = None;
+        return;
+    }
+    if let Some(dir) = ui.geometry().breadcrumb_hit(col, row) {
+        try_ascend_to(ui, phase, dir);
+        *last_click = None;
+        return;
+    }
+    let wheel_target = ui
+        .geometry()
+        .wheel
+        .as_ref()
+        .and_then(|w| w.hit_test(col, row));
+    if let Some(position) = wheel_target {
+        // A slice already summarizes an entire child: click always
+        // navigates, there is no separate "select" step.
+        ui.select_at(position);
+        try_descend(ui, phase);
+        *last_click = None;
+        return;
+    }
+    let table_target = ui
+        .geometry()
+        .table
+        .as_ref()
+        .and_then(|table| table.hit_test(col, row));
+    let Some(position) = table_target else {
+        *last_click = None;
+        return;
+    };
+    let already_selected = ui.selected().is_some() && ui.cursor() == position;
+    let double_click = matches!(*last_click, Some((at, c, r)) if c == col && r == row && at.elapsed() < DOUBLE_CLICK);
+    ui.select_at(position);
+    if already_selected || double_click {
+        try_descend(ui, phase);
+        *last_click = None;
+    } else {
+        *last_click = Some((Instant::now(), col, row));
+    }
+}
+
+/// Breadcrumb click: jump straight to the ancestor `dir`, in one request.
+fn try_ascend_to(ui: &mut UiState, phase: &Phase, dir: DirId) {
+    if let Some(target) = ui.jump_to_ancestor(dir) {
+        request_nav(phase, target);
+    }
+}
+
+/// Mouse moved over the table without clicking: the selection card
+/// follows the hovered row until the mouse leaves the table or a
+/// keyboard action reclaims it.
+fn handle_hover(col: u16, row: u16, ui: &mut UiState) {
+    match ui
+        .geometry()
+        .table
+        .as_ref()
+        .and_then(|table| table.hit_test(col, row))
+    {
+        Some(position) if position < ui.row_count() => ui.set_hover(position),
+        _ => ui.clear_hover(),
+    }
 }
 
 /// `Space`: mark/unmark the row under the cursor. Inactive during the
@@ -466,6 +646,9 @@ fn serve_local(phase: &Phase, dir: DirId, generation: &mut u64, ui: &mut UiState
     ui.apply_snapshot(Arc::new(snapshot));
 }
 
+/// Draws one frame and returns the hit-testing geometry mouse events are
+/// matched against next: recomputed every draw so it always describes
+/// exactly what is on screen (design slice 3).
 fn draw(
     frame: &mut Frame<'_>,
     ui: &UiState,
@@ -473,7 +656,7 @@ fn draw(
     spinner: char,
     flash: Option<&str>,
     ctx: &RenderCtx,
-) {
+) -> FrameGeometry {
     let snapshot = ui.snapshot();
     let [header_area, cards_area, gauge_area, main_area, footer_area] = Layout::vertical([
         Constraint::Length(1),
@@ -490,8 +673,8 @@ fn draw(
     let disks: Vec<u64> = snapshot.rows.iter().map(|row| row.disk).collect();
     let ranks = theme::assign_identity(&disks, theme::IDENTITY.len());
 
-    draw_header(frame, header_area, snapshot, spinner, ctx);
-    draw_metric_cards(frame, cards_area, snapshot, ctx);
+    let breadcrumb = draw_header(frame, header_area, ui, spinner, ctx);
+    let errors_card = draw_metric_cards(frame, cards_area, snapshot, ctx);
     draw_disk_gauge(frame, gauge_area, snapshot, ctx);
 
     // Main split: table (with selection card) left, wheel right — the
@@ -514,30 +697,40 @@ fn draw(
         (left_area, None)
     };
 
-    draw_table(frame, table_area, ui, table_state, spinner, &ranks, ctx);
+    let table = draw_table(frame, table_area, ui, table_state, spinner, &ranks, ctx);
     if let Some(card_area) = card_area {
         draw_selection_card(frame, card_area, ui, ctx);
     }
-    if let Some(wheel_area) = wheel_area {
-        draw_wheel(frame, wheel_area, ui, &ranks, ctx);
-    }
+    let wheel = wheel_area.and_then(|wheel_area| draw_wheel(frame, wheel_area, ui, &ranks, ctx));
 
     draw_footer(frame, footer_area, ui, flash, ctx);
 
     if let Some(confirm) = ui.confirm() {
         draw_confirm_modal(frame, ui, confirm, ctx);
     }
+
+    FrameGeometry {
+        table: Some(table),
+        breadcrumb_row: header_area.y,
+        breadcrumb,
+        errors_card,
+        wheel,
+    }
 }
 
-/// Header line: signature glyph, breadcrumb path (not clickable yet —
-/// slice 3), scan status with spinner.
+/// Header line: signature glyph, clickable breadcrumb path, scan status
+/// with spinner. Returns each path component's screen column range paired
+/// with the ancestor directory clicking it jumps to (`None` for the
+/// current directory's own trailing segment, and for any segment before
+/// the first descend — there is nothing above the scan root to jump to).
 fn draw_header(
     frame: &mut Frame<'_>,
     area: Rect,
-    snapshot: &ViewSnapshot,
+    ui: &UiState,
     spinner: char,
     ctx: &RenderCtx,
-) {
+) -> Vec<(u16, u16, Option<DirId>)> {
+    let snapshot = ui.snapshot();
     let theme = &ctx.theme;
     let signature = if ctx.ascii() { "camembert" } else { SIGNATURE };
     let status: Span<'_> = if snapshot.stats.root_complete {
@@ -545,20 +738,52 @@ fn draw_header(
     } else {
         Span::from(format!("{spinner} scanning")).fg(theme.color(theme::ACCENT))
     };
+    let path = snapshot.path.display().to_string();
     let header = Line::from(vec![
         Span::from(" "),
         Span::from(signature).fg(theme.color(theme::ACCENT)).bold(),
         Span::from("  "),
-        Span::from(snapshot.path.display().to_string()).bold(),
+        Span::from(path.clone()).bold(),
         Span::from("  "),
         status,
     ]);
     frame.render_widget(Paragraph::new(header), area);
+
+    // Path starts right after " " + signature + "  " on the header line.
+    let path_col = area.x + (1 + signature.chars().count() + 2) as u16;
+    let stack: Vec<DirId> = ui.stack_dirs().collect();
+    let segments = fmt::path_segments(&path);
+    let total = segments.len();
+    // Components before the first descend all belong to the scan root's
+    // own (possibly multi-component) path — clicking any of them jumps to
+    // the same place, the root.
+    let root_prefix = total.saturating_sub(stack.len());
+    segments
+        .into_iter()
+        .enumerate()
+        .map(|(i, (start, end))| {
+            let target = if i + 1 == total {
+                None // the current directory's own segment
+            } else if i < root_prefix {
+                stack.first().copied()
+            } else {
+                stack.get(i - root_prefix + 1).copied()
+            };
+            (path_col + start as u16, path_col + end as u16, target)
+        })
+        .collect()
 }
 
 /// Metric cards row: total real · entries · errors · hardlinks, one
-/// rounded-border card each with its own accent color.
-fn draw_metric_cards(frame: &mut Frame<'_>, area: Rect, snapshot: &ViewSnapshot, ctx: &RenderCtx) {
+/// rounded-border card each with its own accent color. The errors card is
+/// clickable (toggles sort-by-errors); its screen rect is returned for
+/// that hit-test.
+fn draw_metric_cards(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    snapshot: &ViewSnapshot,
+    ctx: &RenderCtx,
+) -> Option<(u16, u16, u16, u16)> {
     let theme = &ctx.theme;
     let stats = &snapshot.stats;
     let error_entry = if stats.errors > 0 {
@@ -581,7 +806,11 @@ fn draw_metric_cards(frame: &mut Frame<'_>, area: Rect, snapshot: &ViewSnapshot,
         ),
     ];
     let areas = Layout::horizontal([Constraint::Ratio(1, 4); 4]).split(area);
+    let mut errors_card = None;
     for ((label, value, accent), card_area) in cards.into_iter().zip(areas.iter()) {
+        if label == "errors" {
+            errors_card = Some((card_area.x, card_area.y, card_area.width, card_area.height));
+        }
         let block = card_block(ctx)
             .border_style(Style::new().fg(theme.color(theme::MUTED)))
             .title(Span::from(format!(" {label} ")).fg(theme.color(accent)));
@@ -590,6 +819,7 @@ fn draw_metric_cards(frame: &mut Frame<'_>, area: Rect, snapshot: &ViewSnapshot,
             .block(block);
         frame.render_widget(text, *card_area);
     }
+    errors_card
 }
 
 /// Rounded borders where the glyph ladder allows, plain ASCII otherwise.
@@ -658,7 +888,7 @@ fn draw_table(
     spinner: char,
     ranks: &[Option<usize>],
     ctx: &RenderCtx,
-) {
+) -> TableGeometry {
     let theme = &ctx.theme;
     let snapshot = ui.snapshot();
     let sort = ui.sort();
@@ -778,14 +1008,35 @@ fn draw_table(
         )
         .row_highlight_style(theme.selection_style());
     frame.render_stateful_widget(table, area, table_state);
+    // Body rows sit below the one-line header; ratatui scrolls
+    // `table_state`'s offset during the render above to keep the cursor
+    // visible, so reading it back here always matches what was just
+    // drawn.
+    TableGeometry {
+        x: area.x,
+        y: area.y + 1,
+        width: area.width,
+        height: area.height.saturating_sub(1),
+        offset: table_state.offset(),
+    }
 }
 
 /// Selection card under the table: humanized mtime, item count, share of
-/// the parent, error count for the row under the cursor.
+/// the parent, error count for the row under the cursor — or the
+/// mouse-hovered row while the pointer sits over the table.
 fn draw_selection_card(frame: &mut Frame<'_>, area: Rect, ui: &UiState, ctx: &RenderCtx) {
     let theme = &ctx.theme;
-    let block = card_block(ctx).border_style(Style::new().fg(theme.color(theme::MUTED)));
-    let Some(row) = ui.selected() else {
+    // Accent border while the mouse is driving the card (a transient
+    // preview), muted for the keyboard cursor's steady-state selection.
+    let border = if ui.hover().is_some() {
+        theme::ACCENT
+    } else {
+        theme::MUTED
+    };
+    let block = card_block(ctx).border_style(Style::new().fg(theme.color(border)));
+    // The mouse-hovered row while present, else the keyboard cursor —
+    // both drive this card (design slice 3).
+    let Some(row) = ui.card_row() else {
         frame.render_widget(
             Paragraph::new(Line::from(
                 Span::from("nothing selected").fg(theme.color(theme::MUTED)),
@@ -842,25 +1093,28 @@ fn draw_wheel(
     ui: &UiState,
     ranks: &[Option<usize>],
     ctx: &RenderCtx,
-) {
+) -> Option<WheelGeometry> {
     let theme = &ctx.theme;
     let snapshot = ui.snapshot();
     let block = card_block(ctx).border_style(Style::new().fg(theme.color(theme::MUTED)));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width < 4 || inner.height < 4 {
-        return;
+        return None;
     }
     // Reserve the bottom two lines for path + total.
     let [donut_area, caption_area] =
         Layout::vertical([Constraint::Min(2), Constraint::Length(2)]).areas(inner);
 
-    // Same rows, same order, same identity ranks as the table.
+    // Same rows, same order, same identity ranks as the table — and, since
+    // `slice_rows` is built in cursor/display order, its position doubles
+    // as the cursor position a click on that slice should land on.
     let slice_rows: Vec<(u64, Option<usize>)> = ui
         .rows_indexed()
         .map(|(index, row)| (row.disk, ranks.get(index).copied().flatten()))
         .collect();
     let (fracs, slice_ranks) = wheel::build_slices(&slice_rows, snapshot.totals.disk);
+    let mut geometry = None;
     if !fracs.is_empty() && donut_area.width >= 2 && donut_area.height >= 2 {
         let colors: Vec<Color> = slice_ranks
             .iter()
@@ -883,6 +1137,23 @@ fn draw_wheel(
             }
         };
         blit_wheel(frame, donut_area, &cells, &colors);
+
+        let targets = wheel::build_slice_targets(&slice_rows, snapshot.totals.disk);
+        let (width, height) = (donut_area.width as usize, donut_area.height as usize);
+        let mut cell_slices = vec![None; width * height];
+        for (row, line) in cells.iter().enumerate().take(height) {
+            for (col, cell) in line.iter().enumerate().take(width) {
+                cell_slices[row * width + col] = cell.fg;
+            }
+        }
+        geometry = Some(WheelGeometry {
+            x: donut_area.x,
+            y: donut_area.y,
+            width,
+            height,
+            cells: cell_slices,
+            targets,
+        });
     }
 
     let caption = vec![
@@ -898,6 +1169,7 @@ fn draw_wheel(
             .alignment(Alignment::Center),
     ];
     frame.render_widget(Paragraph::new(caption), caption_area);
+    geometry
 }
 
 /// Copy a composed wheel-cell grid into the frame buffer, mapping slice
@@ -1150,7 +1422,9 @@ mod tests {
                 let mut table_state = TableState::default();
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                 terminal
-                    .draw(|frame| draw(frame, &ui, &mut table_state, '⠋', Some("note"), &ctx))
+                    .draw(|frame| {
+                        draw(frame, &ui, &mut table_state, '⠋', Some("note"), &ctx);
+                    })
                     .unwrap();
             }
         }
@@ -1166,7 +1440,9 @@ mod tests {
             let mut table_state = TableState::default();
             let mut terminal = Terminal::new(TestBackend::new(width, 35)).unwrap();
             terminal
-                .draw(|frame| draw(frame, &ui, &mut table_state, '⠋', None, &ctx))
+                .draw(|frame| {
+                    draw(frame, &ui, &mut table_state, '⠋', None, &ctx);
+                })
                 .unwrap();
             let buffer = terminal.backend().buffer().clone();
             buffer
@@ -1188,7 +1464,9 @@ mod tests {
         let mut table_state = TableState::default();
         let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
         terminal
-            .draw(|frame| draw(frame, &ui, &mut table_state, '|', None, &ctx))
+            .draw(|frame| {
+                draw(frame, &ui, &mut table_state, '|', None, &ctx);
+            })
             .unwrap();
         let content: String = terminal
             .backend()
