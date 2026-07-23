@@ -135,6 +135,12 @@ pitch.
   totals + residual pill, composition with t/b/donut, dir marks
   refused under filter, history in XDG state + read-only `[queries]`,
   `--filter`/FILTER (strict in --no-ui, exit 2; dumps never filtered).
+- **Releases**: tag-triggered workflow builds static musl binaries
+  (x86_64 + aarch64, native runners) with sha256 sums attached to the
+  GitHub Release (notes categorized via `.github/release.yaml` labels);
+  `--version` embeds the build commit (build.rs, `-dirty` aware).
+  **v0.1.0 is released and end-to-end verified** (sha256 + static-pie +
+  version output checked from the published artifact).
 - **Infra**: pre-commit (fmt, clippy -D warnings, actionlint, hygiene),
   GitHub workflows `quality` + `release` (SHA-pinned), Dependabot,
   dual MIT/Apache-2.0, repository metadata. The GitHub repo is live at
@@ -200,9 +206,7 @@ pitch.
    inclusion-exclusion; see freeable-attack-b.md for why the phase-1
    ledger deliberately did not pre-build it) and the reserved in-bar
    bright segment. (ZFS: show nothing rather than invent.)
-2. **Release engineering**: musl static builds (x86_64 + aarch64) in the
-   release workflow, `--version` embedding, first tag.
-3. Wave 4 per the archived handoff: ssh remote scan, HTML export, watch
+2. Wave 4 per the archived handoff: ssh remote scan, HTML export, watch
    mode (single-mutator design sketched in scan-tree docs), dated cache.
 
 ## How to work on this repo
