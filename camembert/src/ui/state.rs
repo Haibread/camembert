@@ -104,6 +104,17 @@ pub struct ConfirmState {
     pub hardlink_files: u64,
 }
 
+/// State of the `v` review-list modal, opened by [`UiState::open_review`]:
+/// a floating, scrollable list of every marked entry (design slice 4).
+/// Modal precedence is confirm > review > cheatsheet — `ui.rs` only opens
+/// this when the confirm modal is not already up, and closes it before
+/// opening confirm from within the list (`D`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReviewState {
+    /// Position in [`UiState::marks`] (mark order) under the cursor.
+    pub cursor: usize,
+}
+
 /// Screen geometry of the most recently drawn frame, for mouse
 /// hit-testing. Plain coordinates only (no ratatui types) so this stays
 /// as terminal-free and unit-testable as the rest of this module; `ui.rs`
@@ -245,6 +256,11 @@ pub struct UiState {
     marked_set: HashSet<NodeId>,
     /// `Some` while the delete-confirmation modal is open.
     confirm: Option<ConfirmState>,
+    /// `Some` while the `v` review-list modal is open.
+    review: Option<ReviewState>,
+    /// Whether the `?` cheatsheet overlay is open. No extra data, unlike
+    /// the other two modals, so a plain flag is enough.
+    cheatsheet_open: bool,
     /// Display-order position of the row under the mouse cursor, while it
     /// sits over the table without clicking — the selection card prefers
     /// this over the keyboard cursor when present. Cleared by any
@@ -271,6 +287,8 @@ impl UiState {
             marks: Vec::new(),
             marked_set: HashSet::new(),
             confirm: None,
+            review: None,
+            cheatsheet_open: false,
             hover: None,
             geometry: FrameGeometry::default(),
         };
@@ -470,6 +488,14 @@ impl UiState {
         Some(dir)
     }
 
+    /// Show/hide the apparent-size column (`p`) — a plain toggle, but
+    /// given a method (rather than field mutation at the call site) so it
+    /// can sit in the keyboard dispatch table alongside every other
+    /// stateless key (see `ui::keymap::SIMPLE`).
+    pub fn toggle_apparent(&mut self) {
+        self.show_apparent = !self.show_apparent;
+    }
+
     // ---- mark-then-confirm deletion (HANDOFF §5) ----
 
     /// Mark/unmark the row under the cursor, then move down one (like
@@ -574,6 +600,81 @@ impl UiState {
         self.confirm.take()?;
         self.marked_set.clear();
         Some(std::mem::take(&mut self.marks))
+    }
+
+    // ---- `v` review list (design slice 4) ----
+
+    /// Open the review list over the marked entries (`v`). Refused
+    /// (returns `false`) when nothing is marked — the caller flashes a
+    /// hint, matching `D`'s "nothing marked" behavior.
+    pub fn open_review(&mut self) -> bool {
+        if self.marks.is_empty() {
+            return false;
+        }
+        self.review = Some(ReviewState::default());
+        true
+    }
+
+    /// The open review modal, if any. While `Some`, keys route to the
+    /// list (move, unmark, `D`, close) instead of the main view.
+    pub fn review(&self) -> Option<&ReviewState> {
+        self.review.as_ref()
+    }
+
+    /// Close the review list without changing any mark (`v` or `Esc`).
+    pub fn close_review(&mut self) {
+        self.review = None;
+    }
+
+    /// Move the review cursor down one row, clamped at the last mark.
+    pub fn review_move_down(&mut self) {
+        if let Some(review) = &mut self.review
+            && review.cursor + 1 < self.marks.len()
+        {
+            review.cursor += 1;
+        }
+    }
+
+    /// Move the review cursor up one row, clamped at the first mark.
+    pub fn review_move_up(&mut self) {
+        if let Some(review) = &mut self.review {
+            review.cursor = review.cursor.saturating_sub(1);
+        }
+    }
+
+    /// Unmark the entry under the review cursor (`Space` inside the
+    /// list) — the only way to unmark a single entry without hunting for
+    /// its row back in the table. Closes the list once the last mark is
+    /// gone (an empty basket has nothing left to review); otherwise
+    /// clamps the cursor onto the new last row if it pointed past it.
+    pub fn unmark_at_review_cursor(&mut self) {
+        let Some(review) = self.review else { return };
+        let Some(entry) = self.marks.get(review.cursor) else {
+            return;
+        };
+        let node = entry.node;
+        self.marked_set.remove(&node);
+        self.marks.remove(review.cursor);
+        if self.marks.is_empty() {
+            self.review = None;
+        } else {
+            let cursor = review.cursor.min(self.marks.len() - 1);
+            self.review = Some(ReviewState { cursor });
+        }
+    }
+
+    // ---- `?` cheatsheet (design slice 4) ----
+
+    pub fn cheatsheet_open(&self) -> bool {
+        self.cheatsheet_open
+    }
+
+    pub fn open_cheatsheet(&mut self) {
+        self.cheatsheet_open = true;
+    }
+
+    pub fn close_cheatsheet(&mut self) {
+        self.cheatsheet_open = false;
     }
 
     fn ensure_sorted(&mut self) {
@@ -1188,6 +1289,82 @@ mod tests {
         assert!(state.confirm().is_none());
         assert!(state.marks().is_empty());
         assert!(!state.is_marked(NodeId::from_raw(1)));
+    }
+
+    #[test]
+    fn review_refuses_to_open_with_nothing_marked_and_moves_within_bounds() {
+        let mut state = UiState::new(snapshot(1, 0, None, markable_rows(), true));
+        assert!(!state.open_review(), "nothing marked: refused");
+        assert!(state.review().is_none());
+
+        state.toggle_mark().unwrap(); // big
+        state.toggle_mark().unwrap(); // sub
+        assert!(state.open_review());
+        assert_eq!(state.review().unwrap().cursor, 0);
+
+        state.review_move_down();
+        assert_eq!(state.review().unwrap().cursor, 1);
+        state.review_move_down(); // clamped: only 2 marks
+        assert_eq!(state.review().unwrap().cursor, 1);
+        state.review_move_up();
+        state.review_move_up(); // clamped at 0
+        assert_eq!(state.review().unwrap().cursor, 0);
+
+        state.close_review();
+        assert!(state.review().is_none());
+        assert_eq!(state.marks().len(), 2, "closing keeps the marks");
+    }
+
+    #[test]
+    fn unmark_at_review_cursor_removes_exactly_that_entry_and_closes_when_empty() {
+        let mut state = UiState::new(snapshot(1, 0, None, markable_rows(), true));
+        state.toggle_mark().unwrap(); // big (node 1)
+        state.toggle_mark().unwrap(); // sub (node 2)
+        state.open_review();
+        state.review_move_down(); // cursor on "sub"
+
+        state.unmark_at_review_cursor();
+        assert!(state.review().is_some(), "one mark left: list stays open");
+        assert_eq!(state.marks().len(), 1);
+        assert!(state.is_marked(NodeId::from_raw(1)), "big unaffected");
+        assert!(!state.is_marked(NodeId::from_raw(2)), "sub unmarked");
+        assert_eq!(
+            state.review().unwrap().cursor,
+            0,
+            "clamped onto the last row"
+        );
+
+        state.unmark_at_review_cursor();
+        assert!(state.review().is_none(), "last mark gone: list auto-closes");
+        assert!(state.marks().is_empty());
+    }
+
+    #[test]
+    fn unmark_at_review_cursor_without_a_review_open_is_a_no_op() {
+        let mut state = UiState::new(snapshot(1, 0, None, markable_rows(), true));
+        state.toggle_mark().unwrap();
+        state.unmark_at_review_cursor(); // no review open
+        assert_eq!(state.marks().len(), 1, "untouched");
+    }
+
+    #[test]
+    fn cheatsheet_toggles() {
+        let mut state = UiState::new(snapshot(1, 0, None, Vec::new(), true));
+        assert!(!state.cheatsheet_open());
+        state.open_cheatsheet();
+        assert!(state.cheatsheet_open());
+        state.close_cheatsheet();
+        assert!(!state.cheatsheet_open());
+    }
+
+    #[test]
+    fn toggle_apparent_flips_the_flag() {
+        let mut state = UiState::new(snapshot(1, 0, None, Vec::new(), true));
+        assert!(state.show_apparent, "starts shown");
+        state.toggle_apparent();
+        assert!(!state.show_apparent);
+        state.toggle_apparent();
+        assert!(state.show_apparent);
     }
 
     #[test]

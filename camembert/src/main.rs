@@ -225,10 +225,20 @@ Keys (interactive mode):
                    then move down (a marked directory implies its whole
                    subtree; marks persist across navigation)
   u                clear all marks
+  v                review marked entries: a scrollable floating list of
+                   every marked path with its size; Space unmarks the row
+                   under the review cursor, D opens the delete
+                   confirmation from there too, v or Esc closes the list
   D                delete the marked entries: opens a confirmation dialog
                    listing count, total size and the first paths;
                    pressing y confirms, any other key cancels
+  ?                show the keyboard/mouse cheatsheet; ? or Esc closes it
   q, Esc, Ctrl-C   quit (cancels the scan if still running)
+
+  While any of these floating panels (delete confirmation, review list,
+  cheatsheet) is open, every key belongs to it alone; precedence when
+  more than one could apply is confirmation > review list > cheatsheet,
+  though in practice only one is ever open at a time.
 
 Mouse (interactive mode):
   The mouse is additive: every key above still works, nothing requires
@@ -255,7 +265,17 @@ Deleting (mark-then-confirm, with guard rails):
   batch: the footer sums them up and details go to the log (--log-file).
   Hardlinks: deleting one link of a multi-link inode only frees space
   when the last link goes; the dialog warns when the selection contains
-  hardlinked files. Totals in the header shrink as entries are deleted.";
+  hardlinked files. Totals in the header shrink as entries are deleted.
+
+Basket & toasts:
+  While at least one entry is marked, a one-line basket strip appears
+  above the footer (\"basket: N items, SIZE\") — gone again once nothing
+  is marked, so browsing without ever marking anything never sees the
+  layout shift. Top-right toast notifications announce things that just
+  happened rather than input being validated: a dump written, a deletion
+  finishing (with the space freed), the scan itself finishing while you
+  keep browsing. Toasts stack and auto-dismiss after a few seconds; they
+  never appear over the delete-confirmation dialog.";
 
 const DIFF_AFTER_HELP: &str = "\
 Output (default): a summary line (total disk/apparent/entry delta and

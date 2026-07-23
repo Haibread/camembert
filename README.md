@@ -102,12 +102,25 @@ interactive key map and the diff JSON schema.
 | `d` `a` `n` `m` `c` `e` | sort: disk (default) · apparent · name · mtime · items · **errors** (again = reverse) |
 | `p` | toggle the apparent-size column |
 | `Space` `u` `D` | mark for deletion · clear marks · delete (confirm with `y`) |
+| `v` | review marked entries: a scrollable list, `Space` unmarks a row, `D` deletes from there too |
+| `?` | keyboard/mouse cheatsheet (`?`/`Esc` closes) |
 | `q`/`Esc` | quit (cancels a running scan) |
 
 **Deletion is guarded**: mark-then-confirm, mount points refused, every
 entry re-checked (existence, file type, device) immediately before
 removal — anything that changed since the scan is skipped, never
 deleted. Symlinks are removed, never followed.
+
+While at least one entry is marked, a one-line **basket strip** appears
+above the footer (count + total size) — it disappears again once nothing
+is marked, so browsing without ever marking anything never sees the
+layout shift. **Toasts** in the top-right corner announce things that
+*happened* rather than input being validated — a dump written, a
+deletion finishing (with the space freed), the scan itself finishing
+while you keep browsing — stacking and auto-dismissing after a few
+seconds; they never cover the delete-confirmation dialog. Ordinary
+keypress feedback (mark refusals, "nothing marked") stays a quick footer
+note instead, right next to the key hints it explains.
 
 ## Mouse (interactive mode)
 

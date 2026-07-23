@@ -1,6 +1,8 @@
 //! Pure text/number formatting for the cockpit: humanized ages, path
 //! abbreviation, and the disk-gauge arithmetic. No terminal types.
 
+use std::time::Duration;
+
 /// Disk space of the filesystem holding the scan root (statvfs), in
 /// bytes. Captured once at UI startup.
 #[derive(Debug, Clone, Copy)]
@@ -50,6 +52,19 @@ pub fn humanize_age(now_secs: i64, mtime_secs: i64) -> String {
         DAY..MONTH => format!("{} days ago", delta / DAY),
         MONTH..YEAR => format!("{} months ago", delta / MONTH),
         _ => format!("{} years ago", delta / YEAR),
+    }
+}
+
+/// Humanize a scan's elapsed time for the "scan finished" toast: seconds
+/// with one decimal below a minute, `Xm YYs` at or above it (a scan long
+/// enough to matter is long enough that decimals stop being useful).
+pub fn humanize_duration(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs_f64();
+    if secs < 60.0 {
+        format!("{secs:.1}s")
+    } else {
+        let total = elapsed.as_secs();
+        format!("{}m {:02}s", total / 60, total % 60)
     }
 }
 
@@ -148,6 +163,20 @@ mod tests {
         };
         assert_eq!(empty.used_fraction(), 0.0);
         assert_eq!(empty.coverage_fraction(5), 0.0);
+    }
+
+    #[test]
+    fn humanize_duration_below_a_minute_shows_one_decimal() {
+        assert_eq!(humanize_duration(Duration::from_millis(1234)), "1.2s");
+        assert_eq!(humanize_duration(Duration::from_secs_f64(59.9)), "59.9s");
+        assert_eq!(humanize_duration(Duration::ZERO), "0.0s");
+    }
+
+    #[test]
+    fn humanize_duration_at_or_above_a_minute_switches_to_minutes_seconds() {
+        assert_eq!(humanize_duration(Duration::from_secs(60)), "1m 00s");
+        assert_eq!(humanize_duration(Duration::from_secs(125)), "2m 05s");
+        assert_eq!(humanize_duration(Duration::from_secs(3661)), "61m 01s");
     }
 
     #[test]

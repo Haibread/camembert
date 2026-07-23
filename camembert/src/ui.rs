@@ -24,11 +24,22 @@
 //! wheel slices, the breadcrumb and the errors card are all clickable,
 //! hit-tested against a [`state::FrameGeometry`] recomputed every frame
 //! from the actual layout — see [`draw`] and [`handle_mouse`].
+//!
+//! Design slice 4 adds the deletion basket strip (persistent above the
+//! footer while anything is marked), the `v` review list and `?`
+//! cheatsheet (floating modals, precedence confirm > review > cheatsheet
+//! — see [`handle_key`]), and top-right [`toast::ToastQueue`]
+//! notifications for events the footer's [`Flash`] is a poor fit for
+//! (see the module doc on [`toast`] for the split). Both new modals'
+//! keyboard/mouse maps are documented in [`keymap`], the single table the
+//! `?` cheatsheet renders from.
 
 pub mod caps;
 mod fmt;
+mod keymap;
 mod state;
 mod theme;
+mod toast;
 mod wheel;
 
 use std::io;
@@ -59,10 +70,11 @@ use camembert_core::view::{self, RowState, ViewSnapshot};
 use caps::{Caps, GlyphLevel};
 use fmt::DiskSpace;
 use state::{
-    ConfirmState, FrameGeometry, MarkRefusal, SortKey, TableGeometry, UiState, WheelGeometry,
-    show_hardlink_note, show_updating_note,
+    ConfirmState, FrameGeometry, MarkRefusal, ReviewState, SortKey, TableGeometry, UiState,
+    WheelGeometry, show_hardlink_note, show_updating_note,
 };
 use theme::Theme;
+use toast::ToastQueue;
 
 /// Frame budget: poll timeout of the render loop (~30 fps, D5).
 const FRAME: Duration = Duration::from_millis(33);
@@ -212,21 +224,41 @@ fn disk_space(path: &Path) -> Option<DiskSpace> {
     }
 }
 
+/// Result of [`finish_scan`]'s dump attempt, driving the "dump written"
+/// toast at the call site that stays around to show it (quitting mid-scan
+/// exits right after and never looks at this).
+enum DumpOutcome {
+    /// No `--output` was given.
+    NotRequested,
+    Written(PathBuf),
+    /// Cancelled mid-scan (--output skipped) or the write itself failed;
+    /// either way already logged, nothing more to say in the UI.
+    Unavailable,
+}
+
 /// Finalize hardlink attribution and, when requested, write the dump.
 /// Dump failures are logged, not fatal — the browsing session goes on.
-fn finish_scan(outcome: &mut ScanOutcome, output: Option<PathBuf>) {
+fn finish_scan(outcome: &mut ScanOutcome, output: Option<PathBuf>) -> DumpOutcome {
     outcome.finalize_hardlinks();
-    let Some(path) = output else { return };
+    let Some(path) = output else {
+        return DumpOutcome::NotRequested;
+    };
     if outcome.cancelled {
         warn!(path = %path.display(), "scan cancelled mid-run: dump not written");
-        return;
+        return DumpOutcome::Unavailable;
     }
     let meta = DumpMeta {
         timestamp: SystemTime::now(),
     };
     match dump::write_dump_to_path(outcome, &path, &meta) {
-        Ok(()) => info!(path = %path.display(), "dump written"),
-        Err(err) => error!(%err, path = %path.display(), "dump write failed"),
+        Ok(()) => {
+            info!(path = %path.display(), "dump written");
+            DumpOutcome::Written(path)
+        }
+        Err(err) => {
+            error!(%err, path = %path.display(), "dump write failed");
+            DumpOutcome::Unavailable
+        }
     }
 }
 
@@ -246,6 +278,7 @@ fn event_loop(
     // invalidates on post-scan navigation.
     let mut local_generation: u64 = 0;
     let mut flash = Flash::new();
+    let mut toasts = ToastQueue::new();
     // Last left-click's time and cell, for double-click detection —
     // independent of the click-already-selected-row shortcut.
     let mut last_click: Option<(Instant, u16, u16)> = None;
@@ -264,6 +297,7 @@ fn event_loop(
                         &mut phase,
                         &mut local_generation,
                         &mut flash,
+                        &mut toasts,
                     ) {
                         Action::Quit => {
                             if let Phase::Scanning(live) = phase {
@@ -274,6 +308,8 @@ fn event_loop(
                                         debug!(cancelled = outcome.cancelled, "scan wound down");
                                         // Rarely, the scan finished before the
                                         // cancel landed: honor --output then.
+                                        // The process exits right after, so
+                                        // there is no toast to show for it.
                                         finish_scan(&mut outcome, output.take());
                                     }
                                     Err(err) => debug!(%err, "scan failed while quitting"),
@@ -304,7 +340,18 @@ fn event_loop(
             );
             // Canonical hardlink attribution + dump, before the frozen
             // arena starts serving views (D3: corrected at scan end).
-            finish_scan(&mut outcome, output.take());
+            let dump_outcome = finish_scan(&mut outcome, output.take());
+            // Two toasts (design slice 4): the dump, when one was
+            // written, and the scan itself finishing — the browsing
+            // session keeps going, so both are worth a transient note
+            // instead of only a log line.
+            if let DumpOutcome::Written(path) = dump_outcome {
+                toasts.push(format!("dump written: {}", path.display()));
+            }
+            toasts.push(format!(
+                "scan finished in {}",
+                fmt::humanize_duration(outcome.elapsed)
+            ));
             local_generation = ui.snapshot().generation;
             phase = Phase::Done(Box::new(outcome));
             // Re-view the current dir so states/totals show final values,
@@ -332,6 +379,17 @@ fn event_loop(
         });
         let spinner = spinner_frame(ctx, started.elapsed());
         let flash_text = flash.current().map(str::to_owned);
+        // `is_empty` skips the prune-and-collect work on the (overwhelmingly
+        // common) frame where nothing has ever been pushed.
+        let toast_texts: Vec<String> = if toasts.is_empty() {
+            Vec::new()
+        } else {
+            toasts
+                .active()
+                .iter()
+                .map(|toast| toast.message.clone())
+                .collect()
+        };
         let mut geometry = FrameGeometry::default();
         terminal.draw(|frame| {
             geometry = draw(
@@ -340,6 +398,7 @@ fn event_loop(
                 &mut table_state,
                 spinner,
                 flash_text.as_deref(),
+                &toast_texts,
                 ctx,
             );
         })?;
@@ -363,6 +422,12 @@ enum Action {
     Quit,
 }
 
+/// Modal precedence (design slice 4): confirm > review > cheatsheet, only
+/// one open at a time, keys route to the open modal only. Each modal
+/// branch below `return`s unconditionally, so the normal-mode match at
+/// the bottom is only ever reached with none of them open — which is
+/// also what keeps that invariant true: opening a modal from normal mode
+/// can never happen while a higher-precedence one is up.
 fn handle_key(
     code: KeyCode,
     modifiers: KeyModifiers,
@@ -370,6 +435,7 @@ fn handle_key(
     phase: &mut Phase,
     generation: &mut u64,
     flash: &mut Flash,
+    toasts: &mut ToastQueue,
 ) -> Action {
     // The confirmation modal captures every key: `y` confirms, anything
     // else cancels (Ctrl-C keeps quitting — safety hatch).
@@ -378,32 +444,48 @@ fn handle_key(
             return Action::Quit;
         }
         if code == KeyCode::Char('y') {
-            execute_deletion(ui, phase, generation, flash);
+            execute_deletion(ui, phase, generation, toasts);
         } else {
             ui.cancel_confirm();
+        }
+        return Action::Continue;
+    }
+    if ui.review().is_some() {
+        match code {
+            KeyCode::Down | KeyCode::Char('j') => ui.review_move_down(),
+            KeyCode::Up | KeyCode::Char('k') => ui.review_move_up(),
+            KeyCode::Char(' ') => ui.unmark_at_review_cursor(),
+            // `D` is natural from inside the list too: close it and open
+            // the same confirm modal `D` opens from the main view.
+            KeyCode::Char('D') => {
+                ui.close_review();
+                open_delete_confirm(ui, phase, flash);
+            }
+            KeyCode::Char('v') | KeyCode::Esc => ui.close_review(),
+            _ => {}
+        }
+        return Action::Continue;
+    }
+    if ui.cheatsheet_open() {
+        if matches!(code, KeyCode::Char('?') | KeyCode::Esc) {
+            ui.close_cheatsheet();
         }
         return Action::Continue;
     }
     match code {
         KeyCode::Char('q') | KeyCode::Esc => return Action::Quit,
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return Action::Quit,
-        KeyCode::Down | KeyCode::Char('j') => ui.move_down(),
-        KeyCode::Up | KeyCode::Char('k') => ui.move_up(),
-        KeyCode::Char('g') => ui.move_top(),
-        KeyCode::Char('G') => ui.move_bottom(),
         KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => try_descend(ui, phase),
         KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => try_ascend(ui, phase),
-        KeyCode::Char('d') => ui.press_sort(SortKey::Disk),
-        KeyCode::Char('a') => ui.press_sort(SortKey::Apparent),
-        KeyCode::Char('n') => ui.press_sort(SortKey::Name),
-        KeyCode::Char('m') => ui.press_sort(SortKey::Mtime),
-        KeyCode::Char('c') => ui.press_sort(SortKey::Items),
-        KeyCode::Char('e') => ui.press_sort(SortKey::Errors),
-        KeyCode::Char('p') => ui.show_apparent = !ui.show_apparent,
         KeyCode::Char(' ') => try_toggle_mark(ui, phase, flash),
-        KeyCode::Char('u') => ui.unmark_all(),
         KeyCode::Char('D') => open_delete_confirm(ui, phase, flash),
-        _ => {}
+        KeyCode::Char('v') => try_open_review(ui, flash),
+        // Every other key (movement, sort, `p`, `u`, `?`) is stateless
+        // enough to live in the keymap dispatch table (`ui::keymap`) —
+        // the single source the `?` cheatsheet also renders from.
+        _ => {
+            keymap::dispatch_simple(code, ui);
+        }
     }
     Action::Continue
 }
@@ -426,15 +508,17 @@ fn try_ascend(ui: &mut UiState, phase: &Phase) {
 }
 
 /// Route a mouse event against the last frame's [`FrameGeometry`] (mouse
-/// support, design slice 3). Inert while the delete-confirmation modal is
-/// open — it only listens to the keyboard.
+/// support, design slice 3). Inert while any modal is open — confirm,
+/// review or cheatsheet (design slice 4) — they only listen to the
+/// keyboard; a click through to a hidden row underneath would be
+/// surprising.
 fn handle_mouse(
     mouse: MouseEvent,
     ui: &mut UiState,
     phase: &Phase,
     last_click: &mut Option<(Instant, u16, u16)>,
 ) {
-    if ui.confirm().is_some() {
+    if ui.confirm().is_some() || ui.review().is_some() || ui.cheatsheet_open() {
         return;
     }
     match mouse.kind {
@@ -556,6 +640,15 @@ fn try_toggle_mark(ui: &mut UiState, phase: &Phase, flash: &mut Flash) {
     }
 }
 
+/// `v`: open the review list over the marked entries. Refused (flashed,
+/// like `D`'s own "nothing marked") when the basket is empty — there is
+/// nothing to review, and an empty modal would just be confusing.
+fn try_open_review(ui: &mut UiState, flash: &mut Flash) {
+    if !ui.open_review() {
+        flash.set("nothing marked — Space marks the row under the cursor");
+    }
+}
+
 /// `D`: open the confirmation modal over the marked entries, computing
 /// the hardlink warning from the frozen arena.
 fn open_delete_confirm(ui: &mut UiState, phase: &Phase, flash: &mut Flash) {
@@ -574,8 +667,16 @@ fn open_delete_confirm(ui: &mut UiState, phase: &Phase, flash: &mut Flash) {
 
 /// Modal confirmed (`y`): delete the marked entries from disk (all guards
 /// in [`camembert_core::delete`]), update the tree's accounting, and
-/// re-view from the nearest surviving directory.
-fn execute_deletion(ui: &mut UiState, phase: &mut Phase, generation: &mut u64, flash: &mut Flash) {
+/// re-view from the nearest surviving directory. The result is a toast
+/// (design slice 4), not a footer flash — "deletion done" is exactly the
+/// kind of announcement-of-something-that-happened the toast mechanism
+/// exists for, see the `toast` module doc for the split.
+fn execute_deletion(
+    ui: &mut UiState,
+    phase: &mut Phase,
+    generation: &mut u64,
+    toasts: &mut ToastQueue,
+) {
     let Phase::Done(outcome) = phase else {
         // The modal only opens post-scan, but never delete on a stale
         // assumption.
@@ -589,7 +690,7 @@ fn execute_deletion(ui: &mut UiState, phase: &mut Phase, generation: &mut u64, f
     info!(count = nodes.len(), "deletion confirmed");
     let report = delete::delete_nodes(outcome, &nodes);
     if report.failed > 0 || report.skipped > 0 {
-        flash.set(format!(
+        toasts.push(format!(
             "deleted {} ({} freed), failed {}, skipped {} — see log",
             report.deleted,
             HumanSize(report.freed.real),
@@ -597,7 +698,7 @@ fn execute_deletion(ui: &mut UiState, phase: &mut Phase, generation: &mut u64, f
             report.skipped
         ));
     } else {
-        flash.set(format!(
+        toasts.push(format!(
             "deleted {} entries, {} freed",
             report.deleted,
             HumanSize(report.freed.real)
@@ -655,14 +756,28 @@ fn draw(
     table_state: &mut TableState,
     spinner: char,
     flash: Option<&str>,
+    toasts: &[String],
     ctx: &RenderCtx,
 ) -> FrameGeometry {
     let snapshot = ui.snapshot();
-    let [header_area, cards_area, gauge_area, main_area, footer_area] = Layout::vertical([
+    // The basket strip (design slice 4) only takes a row while something
+    // is marked — `Length(0)` otherwise, so browsing without ever marking
+    // anything never sees the layout shift, same idea as the selection
+    // card below.
+    let basket_height = if ui.marked_summary().is_some() { 1 } else { 0 };
+    let [
+        header_area,
+        cards_area,
+        gauge_area,
+        main_area,
+        basket_area,
+        footer_area,
+    ] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(3),
         Constraint::Length(1),
         Constraint::Min(3),
+        Constraint::Length(basket_height),
         Constraint::Length(2),
     ])
     .areas(frame.area());
@@ -703,10 +818,24 @@ fn draw(
     }
     let wheel = wheel_area.and_then(|wheel_area| draw_wheel(frame, wheel_area, ui, &ranks, ctx));
 
+    draw_basket_strip(frame, basket_area, ui, ctx);
     draw_footer(frame, footer_area, ui, flash, ctx);
+
+    // Toasts must not obstruct the confirm modal (design slice 4): they
+    // sit top-right of the main content, well clear of the centered
+    // confirm dialog, but are skipped outright whenever it is open —
+    // simpler than reasoning about overlap and correct for every
+    // terminal size, not just the common ones.
+    if ui.confirm().is_none() {
+        draw_toasts(frame, main_area, toasts, ctx);
+    }
 
     if let Some(confirm) = ui.confirm() {
         draw_confirm_modal(frame, ui, confirm, ctx);
+    } else if let Some(review) = ui.review() {
+        draw_review_modal(frame, ui, review, ctx);
+    } else if ui.cheatsheet_open() {
+        draw_cheatsheet_modal(frame, ctx);
     }
 
     FrameGeometry {
@@ -1229,13 +1358,9 @@ fn draw_footer(
                 .bold(),
         );
     }
-    if let Some((count, disk)) = ui.marked_summary() {
-        push_note(
-            &mut notes,
-            Span::from(format!("marked: {count} entries, {}", HumanSize(disk)))
-                .fg(theme.color(theme::ERROR)),
-        );
-    }
+    // Marked-entry count/size lives in the basket strip now (design
+    // slice 4, drawn just above the footer) — showing it here too would
+    // be the same fact twice on adjacent lines.
     if show_hardlink_note(snapshot) {
         push_note(
             &mut notes,
@@ -1249,13 +1374,67 @@ fn draw_footer(
     }
     let footer = Paragraph::new(vec![
         Line::from(
-            " ↑↓/jk move · ⏎/l/→ open · ⌫/h/← up · g/G ends · d/a/n/m/c/e sort · p apparent · Space mark · u unmark · D delete · q quit"
+            " ↑↓/jk move · ⏎/l/→ open · ⌫/h/← up · g/G ends · d/a/n/m/c/e sort · p apparent · \
+             Space mark · u unmark · v review · D delete · ? help · q quit"
                 .dim(),
         ),
         Line::from(notes),
     ])
     .alignment(Alignment::Left);
     frame.render_widget(footer, area);
+}
+
+/// Persistent one-line deletion basket, above the footer, while at least
+/// one entry is marked (design slice 4). `draw` reserves zero height for
+/// `area` otherwise, so this simply has nothing to render into — no
+/// separate visibility check needed beyond the one `marked_summary`
+/// already does.
+fn draw_basket_strip(frame: &mut Frame<'_>, area: Rect, ui: &UiState, ctx: &RenderCtx) {
+    let Some((count, disk)) = ui.marked_summary() else {
+        return;
+    };
+    let theme = &ctx.theme;
+    let glyph = if ctx.ascii() { "[x]" } else { "⌫" };
+    let noun = if count == 1 { "item" } else { "items" };
+    let text = format!(
+        " {glyph} basket: {count} {noun}, {} — v to review, D to delete",
+        HumanSize(disk)
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::from(text).fg(theme.color(theme::ERROR)))),
+        area,
+    );
+}
+
+/// Top-right transient notification stack (design slice 4): whatever is
+/// still active in the [`toast::ToastQueue`] this frame, one per row,
+/// growing down from `area`'s top-right corner (the caller passes the
+/// main table/wheel split so toasts never sit over the header or metric
+/// cards). Never called while the confirm modal is open — see `draw`.
+fn draw_toasts(frame: &mut Frame<'_>, area: Rect, toasts: &[String], ctx: &RenderCtx) {
+    let theme = &ctx.theme;
+    for (i, message) in toasts.iter().enumerate() {
+        let y = area.y + i as u16;
+        if y >= area.y + area.height {
+            break; // ran out of room: older toasts below the fold wait
+        }
+        let text = format!(" {message} ");
+        let width = (text.chars().count() as u16).min(area.width);
+        let rect = Rect {
+            x: area.x + area.width - width,
+            y,
+            width,
+            height: 1,
+        };
+        frame.render_widget(Clear, rect);
+        frame.render_widget(
+            Paragraph::new(Line::from(
+                Span::from(text).fg(theme.color(theme::ACCENT)).bold(),
+            ))
+            .alignment(Alignment::Right),
+            rect,
+        );
+    }
 }
 
 /// Centered confirmation modal: count, cumulative size, the first few
@@ -1330,6 +1509,131 @@ fn draw_confirm_modal(
     frame.render_widget(dialog, modal);
 }
 
+/// Centered, scrollable review-list modal (`v`): every marked entry with
+/// its path and size, the cursor row picked out, `Space` unmarks it. Only
+/// ever drawn when [`ConfirmState`] is not open (see `draw`'s
+/// precedence), so it never has to reason about that overlap.
+fn draw_review_modal(frame: &mut Frame<'_>, ui: &UiState, review: &ReviewState, ctx: &RenderCtx) {
+    let theme = &ctx.theme;
+    let marks = ui.marks();
+    let area = frame.area();
+    let width = area
+        .width
+        .saturating_sub(4)
+        .clamp(20, 76)
+        .min(area.width.saturating_sub(2));
+    // Reserve: title line, blank, scroll-position note, blank, hint line.
+    const CHROME_LINES: u16 = 5;
+    let visible_rows = area.height.saturating_sub(2 + CHROME_LINES).max(1) as usize;
+    let offset = if marks.len() <= visible_rows {
+        0
+    } else {
+        review
+            .cursor
+            .saturating_sub(visible_rows - 1)
+            .min(marks.len() - visible_rows)
+    };
+
+    let mut lines: Vec<Line<'_>> = vec![
+        Line::from(Span::from(format!("{} marked entries", marks.len())).bold()),
+        Line::default(),
+    ];
+    for (i, mark) in marks.iter().enumerate().skip(offset).take(visible_rows) {
+        let suffix = if mark.is_dir { "/" } else { "" };
+        let text = format!(
+            "{:>9}  {}{suffix}",
+            HumanSize(mark.disk).to_string(),
+            mark.path.display()
+        );
+        lines.push(if i == review.cursor {
+            Line::from(Span::from(text).fg(theme.color(theme::ERROR)).bold())
+        } else {
+            Line::from(Span::from(text))
+        });
+    }
+    lines.push(Line::default());
+    if marks.len() > visible_rows {
+        lines.push(Line::from(
+            Span::from(format!(
+                "row {} of {} — scroll with ↑↓/jk",
+                review.cursor + 1,
+                marks.len()
+            ))
+            .dim(),
+        ));
+    }
+    lines.push(Line::from("Space unmark · D delete · v/Esc close".dim()));
+
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let modal = Rect {
+        x: area.width.saturating_sub(width) / 2,
+        y: area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, modal);
+    let dialog = Paragraph::new(lines).block(
+        card_block(ctx)
+            .title(" review marked entries ")
+            .border_style(Style::new().fg(theme.color(theme::ACCENT))),
+    );
+    frame.render_widget(dialog, modal);
+}
+
+/// Centered `?` cheatsheet: every keyboard shortcut and mouse action,
+/// read straight from [`keymap`] — the same tables `handle_key` dispatch
+/// and the mouse handlers implement, so this can't drift from what the
+/// keys actually do (see the `keymap` module doc).
+fn draw_cheatsheet_modal(frame: &mut Frame<'_>, ctx: &RenderCtx) {
+    let theme = &ctx.theme;
+    let key_line = |keys: &str, action: &str| -> Line<'static> {
+        Line::from(vec![
+            Span::from(format!("  {keys:<24}")).fg(theme.color(theme::ACCENT)),
+            Span::from(action.to_owned()),
+        ])
+    };
+    let heading = |text: &'static str| -> Line<'static> {
+        Line::from(Span::from(text).bold().fg(theme.color(theme::INFO)))
+    };
+
+    let mut lines: Vec<Line<'_>> = vec![heading("Keyboard")];
+    for key in keymap::SIMPLE {
+        lines.push(key_line(key.keys, key.action));
+    }
+    for key in keymap::EXTRA {
+        lines.push(key_line(key.keys, key.action));
+    }
+    lines.push(Line::default());
+    lines.push(heading("Mouse"));
+    for key in keymap::MOUSE {
+        lines.push(key_line(key.keys, key.action));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from("? or Esc closes".italic().dim()));
+
+    let area = frame.area();
+    let width = (lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 4)
+        .min(area.width.saturating_sub(2));
+    // Cheatsheet content is fixed-size (not scrollable, unlike the review
+    // list): on a too-short terminal it simply clips to what fits rather
+    // than panicking or growing past the frame.
+    let height = (lines.len() as u16 + 2).min(area.height);
+    lines.truncate(height.saturating_sub(2) as usize);
+    let modal = Rect {
+        x: area.width.saturating_sub(width) / 2,
+        y: area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, modal);
+    let dialog = Paragraph::new(lines).block(
+        card_block(ctx)
+            .title(" keys & mouse ")
+            .border_style(Style::new().fg(theme.color(theme::INFO))),
+    );
+    frame.render_widget(dialog, modal);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1385,6 +1689,48 @@ mod tests {
         })
     }
 
+    /// A scan-complete snapshot with distinct node ids per row (unlike
+    /// [`sample_snapshot`], which shares node 0 across every row and is
+    /// therefore unsuitable for tests that mark individual entries) —
+    /// backs the basket/review/cheatsheet render tests below.
+    fn markable_snapshot() -> Arc<ViewSnapshot> {
+        let row = |node: u32, name: &[u8], disk: u64| Row {
+            name: name.into(),
+            node: NodeId::from_raw(node),
+            dir: None,
+            is_dir: false,
+            apparent: disk,
+            disk,
+            items: 1,
+            errors: 0,
+            state: RowState::File,
+            mtime: 0,
+        };
+        Arc::new(ViewSnapshot {
+            generation: 1,
+            dir: DirId::from_raw(0),
+            parent: None,
+            path: PathBuf::from("/scan/root"),
+            rows: vec![row(1, b"big", 6000), row(2, b"mid", 3000)],
+            totals: DirTotals {
+                apparent: 9000,
+                disk: 9000,
+                items: 2,
+                errors: 0,
+            },
+            stats: ScanStats {
+                entries: 2,
+                dirs: 0,
+                errors: 0,
+                disk_bytes: 9000,
+                elapsed: Duration::from_millis(500),
+                root_complete: true,
+            },
+            hardlink_inodes: 0,
+            degraded: false,
+        })
+    }
+
     fn ctx(glyphs: GlyphLevel, color: ColorLevel) -> RenderCtx {
         RenderCtx {
             caps: Caps { color, glyphs },
@@ -1423,7 +1769,7 @@ mod tests {
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                 terminal
                     .draw(|frame| {
-                        draw(frame, &ui, &mut table_state, '⠋', Some("note"), &ctx);
+                        draw(frame, &ui, &mut table_state, '⠋', Some("note"), &[], &ctx);
                     })
                     .unwrap();
             }
@@ -1441,7 +1787,7 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(width, 35)).unwrap();
             terminal
                 .draw(|frame| {
-                    draw(frame, &ui, &mut table_state, '⠋', None, &ctx);
+                    draw(frame, &ui, &mut table_state, '⠋', None, &[], &ctx);
                 })
                 .unwrap();
             let buffer = terminal.backend().buffer().clone();
@@ -1465,7 +1811,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
         terminal
             .draw(|frame| {
-                draw(frame, &ui, &mut table_state, '|', None, &ctx);
+                draw(frame, &ui, &mut table_state, '|', None, &[], &ctx);
             })
             .unwrap();
         let content: String = terminal
@@ -1478,5 +1824,289 @@ mod tests {
         assert!(content.contains('#'), "ASCII proportion bars");
         assert!(!content.contains('▀'), "no wheel on the ASCII rung");
         assert!(!content.contains('█'), "no block glyphs on the ASCII rung");
+    }
+
+    fn render(ui: &UiState, toasts: &[String], flash: Option<&str>) -> String {
+        let ctx = ctx(GlyphLevel::HalfBlock, ColorLevel::Truecolor);
+        let mut table_state = TableState::default();
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw(frame, ui, &mut table_state, '⠋', flash, toasts, &ctx);
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_owned())
+            .collect()
+    }
+
+    /// No marks: no basket strip glyph anywhere (design slice 4 — the
+    /// layout must not jump for users who never mark anything). One
+    /// mark: the strip shows up with the count and size.
+    #[test]
+    fn basket_strip_appears_only_once_something_is_marked() {
+        let empty = UiState::new(markable_snapshot());
+        assert!(
+            !render(&empty, &[], None).contains("basket:"),
+            "nothing marked: no strip"
+        );
+
+        let mut marked = UiState::new(markable_snapshot());
+        marked.toggle_mark().unwrap(); // "big", 6000 disk bytes
+        let content = render(&marked, &[], None);
+        assert!(content.contains("basket:"), "one mark: strip shown");
+        assert!(content.contains("1 item"), "singular noun for one entry");
+    }
+
+    #[test]
+    fn basket_strip_pluralizes_and_sums_several_marks() {
+        let mut ui = UiState::new(markable_snapshot());
+        ui.toggle_mark().unwrap();
+        ui.toggle_mark().unwrap();
+        let content = render(&ui, &[], None);
+        assert!(content.contains("2 items"), "plural noun for two entries");
+    }
+
+    /// Toasts render top-right and are skipped outright while the
+    /// confirm modal is open (must not obstruct it).
+    #[test]
+    fn toasts_render_and_are_suppressed_under_the_confirm_modal() {
+        let ui = UiState::new(markable_snapshot());
+        let toasts = vec!["dump written: /tmp/x.cmbt".to_owned()];
+        let content = render(&ui, &toasts, None);
+        assert!(content.contains("dump written"));
+
+        let mut confirming = UiState::new(markable_snapshot());
+        confirming.toggle_mark().unwrap();
+        confirming.open_confirm(0);
+        let content = render(&confirming, &toasts, None);
+        assert!(
+            !content.contains("dump written"),
+            "confirm modal open: toast suppressed"
+        );
+    }
+
+    /// The review list renders the marked path and its "row N of M" note
+    /// once there are more marks than fit — and never panics at
+    /// degenerate terminal sizes.
+    #[test]
+    fn review_modal_renders_marked_paths() {
+        let mut ui = UiState::new(markable_snapshot());
+        ui.toggle_mark().unwrap();
+        ui.toggle_mark().unwrap();
+        assert!(ui.open_review());
+        let content = render(&ui, &[], None);
+        assert!(content.contains("review marked entries"));
+        assert!(content.contains("big"));
+        assert!(content.contains("mid"));
+
+        for (width, height) in [(120, 35), (40, 10), (10, 5), (3, 2), (1, 1)] {
+            let ctx = ctx(GlyphLevel::HalfBlock, ColorLevel::Truecolor);
+            let mut table_state = TableState::default();
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw(frame, &ui, &mut table_state, '⠋', None, &[], &ctx);
+                })
+                .unwrap();
+        }
+    }
+
+    /// The `?` cheatsheet lists entries from every `keymap` table (the
+    /// generated-from-one-table guarantee, visible at the render layer)
+    /// and never panics at degenerate sizes.
+    #[test]
+    fn cheatsheet_modal_lists_keymap_entries() {
+        let mut ui = UiState::new(markable_snapshot());
+        ui.open_cheatsheet();
+        let content = render(&ui, &[], None);
+        assert!(content.contains("keys & mouse"));
+        // One representative row from each of the three tables.
+        assert!(content.contains("move down"), "SIMPLE entry present");
+        assert!(content.contains("delete the marked"), "EXTRA entry present");
+        assert!(content.contains("scroll the cursor"), "MOUSE entry present");
+
+        for (width, height) in [(120, 35), (40, 10), (10, 5), (3, 2), (1, 1)] {
+            let ctx = ctx(GlyphLevel::HalfBlock, ColorLevel::Truecolor);
+            let mut table_state = TableState::default();
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw(frame, &ui, &mut table_state, '⠋', None, &[], &ctx);
+                })
+                .unwrap();
+        }
+    }
+
+    // ---- `handle_key` modal routing (design slice 4) ----
+    //
+    // These drive the real key handler over a real (tiny, tempdir) scan
+    // instead of hand-built fixtures — `Phase::Done` needs an actual
+    // `ScanOutcome`, and the point of these tests is exactly the routing
+    // glue in `handle_key`/`open_delete_confirm`/`try_open_review`, not
+    // the pure `UiState` methods already covered in `state`'s own tests.
+
+    use camembert_core::scan::{ScanOptions, Scanner};
+    use camembert_core::view;
+
+    /// Scan `path` to completion (2 threads is plenty for a handful of
+    /// files) and finalize hardlinks, matching what `finish_scan` does
+    /// before the frozen arena starts serving views.
+    fn scan_dir(path: &Path) -> ScanOutcome {
+        let mut outcome = Scanner::new(ScanOptions {
+            threads: 2,
+            cross_filesystems: false,
+        })
+        .scan(path)
+        .expect("scan of a tempdir never fails");
+        outcome.finalize_hardlinks();
+        outcome
+    }
+
+    /// A `Phase::Done` UI over a tempdir with one file, cursor already on
+    /// it — ready for `toggle_mark`/`handle_key` tests.
+    fn done_ui_with_one_file() -> (UiState, Phase) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("a"), b"hello").expect("write fixture file");
+        let outcome = scan_dir(tmp.path());
+        let stats = view::scan_stats(outcome.tree(), outcome.root(), outcome.elapsed);
+        let snapshot = view::build_snapshot(
+            outcome.tree(),
+            outcome.root(),
+            1,
+            stats,
+            outcome.hardlink_inodes,
+            false,
+        );
+        let ui = UiState::new(Arc::new(snapshot));
+        (ui, Phase::Done(Box::new(outcome)))
+    }
+
+    fn press(
+        code: KeyCode,
+        ui: &mut UiState,
+        phase: &mut Phase,
+        generation: &mut u64,
+        flash: &mut Flash,
+        toasts: &mut ToastQueue,
+    ) -> Action {
+        handle_key(
+            code,
+            KeyModifiers::NONE,
+            ui,
+            phase,
+            generation,
+            flash,
+            toasts,
+        )
+    }
+
+    /// `v` opens the review list; `D` from inside it closes the list and
+    /// opens the same delete-confirmation modal `D` opens from the main
+    /// view — "D from within the review list should work too".
+    #[test]
+    fn v_opens_review_and_d_from_within_it_opens_confirm() {
+        let (mut ui, mut phase) = done_ui_with_one_file();
+        let (mut generation, mut flash, mut toasts) = (1u64, Flash::new(), ToastQueue::new());
+        ui.toggle_mark().expect("marking the only row succeeds");
+
+        press(
+            KeyCode::Char('v'),
+            &mut ui,
+            &mut phase,
+            &mut generation,
+            &mut flash,
+            &mut toasts,
+        );
+        assert!(ui.review().is_some(), "v opened the review list");
+
+        press(
+            KeyCode::Char('D'),
+            &mut ui,
+            &mut phase,
+            &mut generation,
+            &mut flash,
+            &mut toasts,
+        );
+        assert!(ui.review().is_none(), "D closed the review list");
+        assert!(ui.confirm().is_some(), "D opened the confirm modal");
+    }
+
+    /// `?` opens the cheatsheet from the main view; `?`/`Esc` closes it.
+    #[test]
+    fn cheatsheet_opens_and_closes() {
+        let (mut ui, mut phase) = done_ui_with_one_file();
+        let (mut generation, mut flash, mut toasts) = (1u64, Flash::new(), ToastQueue::new());
+
+        press(
+            KeyCode::Char('?'),
+            &mut ui,
+            &mut phase,
+            &mut generation,
+            &mut flash,
+            &mut toasts,
+        );
+        assert!(ui.cheatsheet_open());
+
+        press(
+            KeyCode::Esc,
+            &mut ui,
+            &mut phase,
+            &mut generation,
+            &mut flash,
+            &mut toasts,
+        );
+        assert!(!ui.cheatsheet_open());
+    }
+
+    /// Modal precedence (confirm > review > cheatsheet): once the confirm
+    /// modal is open, every key belongs to it alone — `v`/`?` do not leak
+    /// through and open another modal underneath.
+    #[test]
+    fn confirm_modal_captures_keys_that_would_open_other_modals() {
+        let (mut ui, mut phase) = done_ui_with_one_file();
+        let (mut generation, mut flash, mut toasts) = (1u64, Flash::new(), ToastQueue::new());
+        ui.toggle_mark().expect("marking the only row succeeds");
+        open_delete_confirm(&mut ui, &phase, &mut flash);
+        assert!(ui.confirm().is_some());
+
+        // `v` is not `y`: the confirm modal treats it as "cancel", not as
+        // a request to open the review list underneath.
+        press(
+            KeyCode::Char('v'),
+            &mut ui,
+            &mut phase,
+            &mut generation,
+            &mut flash,
+            &mut toasts,
+        );
+        assert!(ui.confirm().is_none(), "any non-y key cancels confirm");
+        assert!(ui.review().is_none(), "and never opened review instead");
+    }
+
+    /// While the review list is open, `?` is not handled by it (only
+    /// move/unmark/`D`/`v`/`Esc` are) — it is silently ignored rather
+    /// than leaking through to open the cheatsheet underneath.
+    #[test]
+    fn review_modal_does_not_leak_unhandled_keys_to_the_cheatsheet() {
+        let (mut ui, mut phase) = done_ui_with_one_file();
+        let (mut generation, mut flash, mut toasts) = (1u64, Flash::new(), ToastQueue::new());
+        ui.toggle_mark().expect("marking the only row succeeds");
+        assert!(ui.open_review());
+
+        press(
+            KeyCode::Char('?'),
+            &mut ui,
+            &mut phase,
+            &mut generation,
+            &mut flash,
+            &mut toasts,
+        );
+        assert!(ui.review().is_some(), "still in the review list");
+        assert!(!ui.cheatsheet_open(), "? did not leak through to it");
     }
 }
