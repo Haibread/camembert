@@ -49,7 +49,7 @@ pitch.
   identity is `Haibread <haibread@users.noreply.github.com>` (set
   repo-locally).
 
-## What is implemented (all merged on main, ~310 tests green)
+## What is implemented (all merged on main, ~346 tests green)
 
 - **Scan engine** (`camembert-core/src/scan/`): work-stealing,
   fd-relative `openat`/`getdents64`/`statx` (fstatat fallback), mount
@@ -57,7 +57,12 @@ pitch.
   with `--cross-filesystems`**, single-owner arena integration with
   bounded out-of-order holding, per-directory batched aggregation,
   completion cascade, first-seen hardlink registry + post-scan canonical
-  re-attribution.
+  re-attribution. **Media-adaptive auto threading** (sysfs rotational +
+  mountinfo fallback for btrfs: SSD → min(cores, 16), HDD → 2, unknown
+  → min(2×cores, 8); measured 95 → 76 ms on the bench tree) and
+  **io_uring-batched statx** (per-worker rings, runtime probe, sync
+  fallback, auto-engaged at ≤ 2 workers where it wins 12-21 %;
+  `--statx-engine`/STATX_ENGINE experimental override).
 - **Tree** (`tree.rs`): 32-byte nodes, run-list children (D2), subtree
   aggregates, tombstoned removal with negative-delta propagation,
   excluded-reason side map.
@@ -123,7 +128,12 @@ pitch.
 
 ## Known limitations (documented in code where they live)
 
-- No io_uring statx yet; worker fd usage can approach RLIMIT_NOFILE on
+- io_uring statx ships behind an auto heuristic: engages at ≤ 2
+  resolved workers (the HDD tier), where it measures 12-21 % faster;
+  at high warm thread counts it loses to io-wq context-switch storms,
+  so auto stays sync there. Threshold is warm-cache-derived — retune
+  after cold-cache/real-HDD runs (`--statx-engine` forces either
+  engine). Worker fd usage can approach RLIMIT_NOFILE on
   pathologically wide trees; a worker panic hangs the scan (owner panics
   are handled). The media-adaptive thread policy resolves anon-bdev
   filesystems (major 0 — btrfs, notably) via a `/proc/self/mountinfo`
@@ -177,18 +187,15 @@ pitch.
    inclusion-exclusion; see freeable-attack-b.md for why the phase-1
    ledger deliberately did not pre-build it) and the reserved in-bar
    bright segment. (ZFS: show nothing rather than invent.)
-3. **io_uring batched statx** with runtime detection + fallback (spec'd
-   in the original handoff §3; the completion invariant it needs is
-   already documented in owner.rs).
-4. **Release engineering**: musl static builds (x86_64 + aarch64) in the
+3. **Release engineering**: musl static builds (x86_64 + aarch64) in the
    release workflow, `--version` embedding, first tag.
-5. Wave 4 per the archived handoff: ssh remote scan, HTML export, watch
+4. Wave 4 per the archived handoff: ssh remote scan, HTML export, watch
    mode (single-mutator design sketched in scan-tree docs), dated cache.
 
 ## How to work on this repo
 
 ```bash
-cargo test --workspace                                  # ~310 tests
+cargo test --workspace                                  # ~346 tests
 cargo clippy --workspace --all-targets -- -D warnings   # zero tolerance
 pre-commit run --all-files
 ```
