@@ -63,7 +63,23 @@ struct ScanArgs {
     #[arg(env = "SCAN_PATH", default_value = ".")]
     path: PathBuf,
 
-    /// Scan worker threads; 0 = auto (2x CPU cores, capped at 8) (env: THREADS)
+    /// Scan worker threads; 0 = auto (env: THREADS)
+    ///
+    /// The auto policy probes the scan root's backing device once per
+    /// scan and adapts: non-rotational storage (SSD/NVMe) uses
+    /// `min(cores, 16)` threads; rotational storage (spinning disks,
+    /// where parallel readers thrash the seek head) is capped at 2. On
+    /// filesystems that report an anonymous device number (btrfs,
+    /// notably — no direct sysfs node), it instead resolves the covering
+    /// mount's real backing device from `/proc/self/mountinfo` and
+    /// probes that. When the medium still can't be determined (network
+    /// filesystems, containers with no matching mount, unreadable
+    /// sysfs/mountinfo, a `tmpfs`/`overlay` source) it falls back to the
+    /// historical `min(2x cores, 8)`. A multi-device btrfs volume is
+    /// classified from whichever single member device the mount table
+    /// happens to report, which can misjudge a volume mixing SSDs and
+    /// HDDs. An explicit value here always wins and skips detection
+    /// entirely.
     #[arg(long, env = "THREADS", default_value_t = 0)]
     threads: usize,
 

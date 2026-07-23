@@ -123,9 +123,19 @@ pitch.
 
 ## Known limitations (documented in code where they live)
 
-- No io_uring statx yet; no HDD-adaptive threading; worker fd usage can
-  approach RLIMIT_NOFILE on pathologically wide trees; a worker panic
-  hangs the scan (owner panics are handled).
+- No io_uring statx yet; worker fd usage can approach RLIMIT_NOFILE on
+  pathologically wide trees; a worker panic hangs the scan (owner panics
+  are handled). The media-adaptive thread policy resolves anon-bdev
+  filesystems (major 0 — btrfs, notably) via a `/proc/self/mountinfo`
+  fallback to the covering mount's real backing device, but a
+  **multi-device btrfs volume is classified from a single member
+  device**: mountinfo reports only one, so a volume mixing an SSD and an
+  HDD can be misjudged either way (enumerating
+  `/sys/fs/btrfs/<uuid>/devices/` and combining every member
+  conservatively, as already done for device-mapper/RAID slaves, is a
+  possible refinement). Genuinely undetectable cases (network
+  filesystems, unreadable sysfs/mountinfo) still fall back to the
+  pre-adaptive `min(2x cores, 8)` default.
 - Deletion: intermediate-symlink TOCTOU window (needs a descriptor-
   relative unlink walk); freed-space estimate for surviving hardlinks is
   optimistic (warned in dialog).

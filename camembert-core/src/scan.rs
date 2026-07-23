@@ -19,6 +19,7 @@
 //! integrations and on receive timeouts), per D5.
 
 mod hardlink;
+mod media;
 mod message;
 mod owner;
 mod worker;
@@ -54,8 +55,11 @@ const RECV_TIMEOUT: Duration = Duration::from_millis(33);
 /// Scan configuration.
 #[derive(Debug, Clone, Default)]
 pub struct ScanOptions {
-    /// Worker threads. `0` = heuristic: 2× available parallelism, capped
-    /// at 8 (this increment; the HDD/NVMe adaptive policy comes later).
+    /// Worker threads. `0` = media-adaptive auto policy, decided per scan
+    /// from the root's backing device (see [`ScanOptions::effective_threads`]):
+    /// non-rotational storage gets `min(cores, 16)`, rotational storage
+    /// (seek thrashing under parallel readers) gets `2`, and an
+    /// undetectable medium keeps the historical `min(2× cores, 8)`.
     pub threads: usize,
     /// Descend into other filesystems instead of recording the mount
     /// point as an excluded directory.
@@ -63,12 +67,27 @@ pub struct ScanOptions {
 }
 
 impl ScanOptions {
-    fn effective_threads(&self) -> usize {
+    /// Resolve `threads` into a worker count for a scan of `root_path`
+    /// (whose `st_dev` is `root_dev`), plus a human-readable description
+    /// of the decision for logging (`"explicit"`, `"ssd"`, `"hdd (sda
+    /// rotational)"`, `"unknown (anon bdev (major 0), …)"`, `"ssd (btrfs
+    /// via /dev/nvme0n1p2)"`, …).
+    ///
+    /// An explicit (non-zero) `threads` always wins, unchanged, and skips
+    /// media detection entirely. `0` runs the auto policy: [`media::resolve_media`]
+    /// probes the root's backing device (real sysfs in production, with a
+    /// `/proc/self/mountinfo` fallback for anonymous `major == 0` devices
+    /// such as btrfs — see the [`media`] module docs) and
+    /// [`media::thread_count`] — a pure function, unit-tested on its own —
+    /// turns that plus the core count into a worker count.
+    fn effective_threads(&self, root_dev: u64, root_path: &Path) -> (usize, String) {
         if self.threads > 0 {
-            return self.threads;
+            return (self.threads, "explicit".to_string());
         }
         let cores = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
-        (cores * 2).clamp(1, 8)
+        let media = media::resolve_media(root_dev, root_path, Path::new(media::DEFAULT_SYSFS_ROOT));
+        let threads = media::thread_count(cores, &media);
+        (threads, media.describe())
     }
 }
 
@@ -267,10 +286,11 @@ impl Scanner {
         let root_dev = root_stat.st_dev;
         let root_size = Size::new(root_stat.st_size as u64, root_stat.st_blocks as u64);
 
-        let threads = self.options.effective_threads();
+        let (threads, media) = self.options.effective_threads(root_dev, path);
         info!(
             path = %path.display(),
             threads,
+            media = %media,
             cross_filesystems = self.options.cross_filesystems,
             "scan starting"
         );

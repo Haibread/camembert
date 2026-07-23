@@ -127,7 +127,7 @@ reference, including the interactive key map and the diff JSON schema.
 
 | Flag | Env | What it does |
 | --- | --- | --- |
-| `--threads` | `THREADS` | scan worker threads (`0` = auto) |
+| `--threads` | `THREADS` | scan worker threads (`0` = auto, media-adaptive: see below) |
 | `--cross-filesystems` | `CROSS_FILESYSTEMS` | descend into other mounted filesystems instead of stopping at them |
 | `--top` | `TOP` | entries in the summary's "top directories" **and** "top files" (D5) lists — one flag, two lists; the interactive `t` mode's own cap is the separate `flat_cap` config key |
 | `--no-ui` | `NO_UI` | summary mode: scan to completion, print totals, top directories, top files, no TUI |
@@ -138,6 +138,30 @@ reference, including the interactive key map and the diff JSON schema.
 | `--no-proc-sweep` | `NO_PROC_SWEEP` | disable the freeable `/proc` sweep (gauge suffix, `f` panel, toast, pre-deletion open-file check) |
 | `--log-filter` | `LOG_FILTER` | `tracing` filter directive |
 | `--log-file` | `LOG_FILE` | write diagnostics to a file instead of discarding them |
+
+`--threads 0` (the default) picks a worker count from the scan root's
+backing device, probed once per scan:
+
+- **non-rotational** (SSD/NVMe): `min(cores, 16)` — parallel readers help;
+- **rotational** (spinning disks): `2` — more workers just adds seek
+  thrashing;
+- **undetectable** (network filesystems, unreadable sysfs, no matching
+  mount, a `tmpfs`/`overlay` source): `min(2x cores, 8)`, the historical
+  safe default.
+
+Filesystems that report an anonymous device number with no direct sysfs
+node — btrfs, notably — aren't automatically "undetectable": camembert
+resolves the covering mount's real backing device from
+`/proc/self/mountinfo` (e.g. `/dev/nvme0n1p2`) and probes *that* instead.
+A **multi-device btrfs** volume (RAID0/1/10 across several disks) is
+classified from whichever single member device the mount table happens
+to report, so a volume mixing an SSD and an HDD can be misjudged either
+way — a precise per-member check is a possible future refinement.
+
+An explicit `--threads`/`THREADS` value always overrides this and skips
+detection. The decision is logged at `info` level (`media=ssd`,
+`media=hdd (sda rotational)`, `media=ssd (btrfs via /dev/nvme0n1p2)`,
+`media=unknown (...)`).
 
 ## Keys (interactive mode)
 
