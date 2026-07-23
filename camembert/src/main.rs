@@ -16,6 +16,7 @@ use camembert_core::dump::read::DumpReader;
 use camembert_core::dump::{self, DumpMeta, encode_name};
 use camembert_core::flat;
 use camembert_core::ncdu;
+use camembert_core::query;
 use camembert_core::scan::{ScanOptions, Scanner, StatxEngine};
 use camembert_core::size::{HumanSize, SignedHumanSize, parse_size};
 
@@ -183,6 +184,23 @@ struct ScanArgs {
     /// README's Freeable section).
     #[arg(long = "no-proc-sweep")]
     no_proc_sweep: bool,
+
+    /// Filter query applied to the scan (env: FILTER)
+    ///
+    /// Same grammar as the interactive Ctrl-K/`/` palette: whitespace-
+    /// separated terms, implicitly ANDed, each optionally negated with a
+    /// leading `!` (`*.log >100M !older:1y`). See the README's Filtering
+    /// section for the full grammar (substrings, globs, `ext:`, `kind:`,
+    /// `is:`, size sugar, `older:`/`newer:`, `dir/` ancestor terms,
+    /// double-quoted literals). In summary mode (`--no-ui`) the top
+    /// directories/files lists are computed over the match set and a
+    /// non-empty query must parse *completely clean* — any unparseable
+    /// term exits 2 with every parse error printed, so a typo is never
+    /// silently ignored in a script. In interactive mode the query
+    /// pre-applies the instant the scan completes (broken terms are inert
+    /// there instead, exactly like typing them into the palette).
+    #[arg(long, env = "FILTER")]
+    filter: Option<String>,
 }
 
 /// CLI face of [`StatxEngine`] (experimental knob, see `--statx-engine`).
@@ -358,6 +376,10 @@ Config file (camembert.toml):
                             # .venv/, *.log, *.tmp); reusing a preset's
                             # label replaces it in place (D1/D4).
 
+    [queries]              # label = \"query string\"; read-only saved
+    big_logs = \"*.log >100M\" # filters (D6), shown in the Ctrl-K/`/`
+    stale = \"older:1y\"       # palette when its input is empty.
+
   Pattern syntax: a basename glob matched against one path component
   (never a full path). Only * (zero or more bytes) and ? (exactly one
   byte) are special; every other character -- including { } [ ] -- is
@@ -368,15 +390,16 @@ Config file (camembert.toml):
   Precedence for theme/color/no_motion: the matching CLI flag > its env
   var > this file > the built-in default (tokyo-night/auto/motion
   enabled) — except `theme`, where the OSC 11 query above still gets a
-  turn between the config file and the default. flat_cap and [patterns]
-  are config-file only, no CLI flag or env var.
+  turn between the config file and the default. flat_cap, [patterns] and
+  [queries] are config-file only, no CLI flag or env var (--filter/FILTER
+  is a separate, one-shot query -- see Filtering above).
 
   Parsing is per-key resilient: broken TOML *syntax* falls back to
   every default (unchanged from before flat_cap/[patterns] existed), but
   a bad individual value -- an invalid theme, a non-numeric flat_cap, a
-  [patterns] entry whose value isn't a string, or a [patterns] table
-  that isn't a table at all -- is warned about and defaulted on its own,
-  never resetting the other keys or the other pattern entries. An
+  [patterns]/[queries] entry whose value isn't a string, or either table
+  not being a table at all -- is warned about and defaulted on its own,
+  never resetting the other keys or the other pattern/query entries. An
   invalid glob spec is skipped the same way. Every case logs a warning
   (see --log-file); the interactive UI additionally shows a one-time
   startup toast (\"N invalid patterns ignored — see log\") when any
@@ -429,21 +452,62 @@ Keys (interactive mode):
                    pressing y confirms, any other key cancels
   f                freeable files: deleted-but-open files still holding
                    disk space (see Freeable below); f or Esc closes it
+  Ctrl-K, /        open the filter/command palette (see Filtering below)
   ?                show the keyboard/mouse cheatsheet; ? or Esc closes it
   z                toggle zen mode: table only (no metric cards, disk
                    gauge or donut wheel) — header, table, footer and the
                    basket strip stay
-  Esc              contextual: closes an open modal first; else leaves a
-                   flat/breakdown mode back to the tree; only quits when
-                   already in tree view with nothing open
+  Esc              contextual: closes the palette first; else an open
+                   modal; else leaves a flat/breakdown mode back to the
+                   tree; else clears an active filter; only quits when
+                   already in tree view with nothing open and no filter
   q, Ctrl-C        quit unconditionally (cancels the scan if still
-                   running), regardless of mode or open modal
+                   running), regardless of mode or open modal — EXCEPT
+                   inside the palette, where only Ctrl-C quits: every
+                   other key, q included, is a character being typed
 
-  While any of these floating panels (delete confirmation, review list,
-  freeable panel, cheatsheet) is open, every key belongs to it alone;
-  precedence when more than one could apply is confirmation > review
-  list > freeable panel > cheatsheet, though in practice only one is
-  ever open at a time.
+  While any of these floating surfaces (palette, delete confirmation,
+  review list, freeable panel, cheatsheet) is open, every key belongs to
+  it alone; precedence is palette > confirmation > review list > freeable
+  panel > cheatsheet, though in practice only one is ever open at a time.
+
+Filtering (Ctrl-K/`/`, docs/design/query-decisions.md):
+  Ctrl-K opens a floating palette over the tree: typed text with no
+  leading '>' is a filter query, parsed and applied live (debounced
+  ~100ms) to the whole cockpit (tree table, donut, metric cards) as you
+  type; a leading '>' switches the same box to fuzzy command search
+  (every keyboard shortcut, by name). '/' opens the identical palette,
+  pre-scoped to the query side. Grammar: whitespace-separated terms,
+  implicitly ANDed, each optionally negated with a leading '!' --
+  substrings (smartcase), \"literal quoted\" substrings, *.glob?
+  patterns, dir/ ancestor constraints, >SIZE/<SIZE disk-byte sugar,
+  older:DUR/newer:DUR mtime age (h/d/w/mo/y), kind:file|dir|symlink,
+  ext:EXT, is:hardlink|error|excluded. Broken terms are inert (shown
+  inline, span + message) -- the rest of the query still applies; only
+  --filter's --no-ui mode is strict (see below). Filtering is post-scan
+  only: mid-scan the query side shows \"filter available once the scan
+  completes\" (command mode still works). A hardlinked file matches by
+  ANY of its names -- a non-canonical link shows as a 0-byte row flagged
+  counted-at-its-canonical-path, never silently absent.
+
+  An active filter shows a persistent pill above the basket strip: query
+  text, matched entries/bytes, the dir-inode residual (\"+N GiB in M
+  directory inode(s) not counted\") whenever nonzero, and \"Esc clears\".
+  The tree table/donut/cards compose over the match set (a directory row
+  survives only when its filtered subtree still matches; the viewed
+  directory itself always renders, even at zero matches); t/b do the
+  same. Directory marks are refused while a filter is active (file marks
+  still work) -- a filtered directory shows only its matches, so marking
+  it would delete everything inside it, matched or not.
+
+  While the palette is open it owns the keyboard: only Esc (close),
+  Enter (commit), the arrows/Home/End/Backspace/Delete, and Ctrl-C (quit)
+  are interpreted specially -- every other key, q included, is text.
+  Up/Down recall query history (persisted to
+  $XDG_STATE_HOME/camembert/history, or ~/.local/state/camembert/history,
+  one query per line, bounded to 200, written atomically); on an empty
+  query box they instead browse camembert.toml's read-only [queries]
+  table. See --filter below for the same grammar on the command line.
 
 Flat view & pattern breakdown (t/b, docs/design/flat-view-decisions.md):
   Two extra in-place table modes; cards/gauge/basket/footer stay put.
@@ -726,6 +790,8 @@ fn run_scan(cli: &Cli) -> ExitCode {
             no_proc_sweep,
             flat_config,
             startup_toasts,
+            file_config.queries.clone(),
+            args.filter.clone(),
         ) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
@@ -741,11 +807,44 @@ fn run_scan(cli: &Cli) -> ExitCode {
     summary(args, &scanner, &flat_config)
 }
 
+/// "Now" in unix seconds for [`query::ApplyOptions::now_unix`] (D7's
+/// `--filter`'s `older:`/`newer:` cutoffs) — read once, not inside the
+/// fold, for a reproducible result.
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 /// Non-interactive mode: scan to completion, then print the summary on
 /// stdout (diagnostics stay on stderr via tracing). `flat_config` (D2/D4)
 /// is folded once, after the scan, for the top-files section (D5) — no
-/// live accumulator here, this run was never browsed.
+/// live accumulator here, this run was never browsed. `--filter`/`FILTER`
+/// (D7) is parsed *strictly* up front: unlike the interactive palette
+/// (broken terms are inert, per the module docs), a query a script is
+/// about to rely on must be entirely valid or loudly rejected — every
+/// parse error is printed and the scan itself is skipped (exit 2), rather
+/// than silently running over a smaller-than-intended query.
 fn summary(args: &ScanArgs, scanner: &Scanner, flat_config: &flat::FlatConfig) -> ExitCode {
+    let filter_query = match &args.filter {
+        Some(text) if !text.trim().is_empty() => {
+            let parsed = query::parse(text);
+            if !parsed.errors.is_empty() {
+                eprintln!(
+                    "camembert: --filter has {} problem(s) and will not run:",
+                    parsed.errors.len()
+                );
+                for err in &parsed.errors {
+                    eprintln!("  {}", err.message);
+                }
+                return ExitCode::from(2);
+            }
+            Some(parsed.query)
+        }
+        _ => None,
+    };
+
     // Progress line on stderr (via tracing) roughly every second while the
     // scan blocks this thread. The poller waits on a channel, not a plain
     // sleep, so a scan that finishes in milliseconds isn't held hostage by
@@ -782,6 +881,27 @@ fn summary(args: &ScanArgs, scanner: &Scanner, flat_config: &flat::FlatConfig) -
     // are final, not first-seen provisional.
     outcome.finalize_hardlinks();
 
+    // D7: fold the filter once, over the finalized (canonical-hardlink)
+    // tree — same shape as the interactive palette's post-scan apply,
+    // minus the debounce (there are no keystrokes to debounce here).
+    let filter_result = filter_query.as_ref().map(|q| {
+        let hardlinks = query::HardlinkIndex::build(&outcome, 0);
+        query::apply(
+            outcome.tree(),
+            q,
+            &flat_config.patterns,
+            &hardlinks,
+            &query::ApplyOptions {
+                cap: flat_config.cap,
+                epoch: 0,
+                now_unix: unix_now(),
+                threads: std::thread::available_parallelism()
+                    .map(std::num::NonZeroUsize::get)
+                    .unwrap_or(1),
+            },
+        )
+    });
+
     let dump_to_stdout = args.output.as_deref() == Some(Path::new("-"));
     if dump_to_stdout {
         info!("dump streams to stdout: summary text suppressed");
@@ -791,11 +911,21 @@ fn summary(args: &ScanArgs, scanner: &Scanner, flat_config: &flat::FlatConfig) -
             args.path.display(),
             outcome.elapsed.as_secs_f64()
         );
-        println!(
-            "  total: {} real, {} apparent",
-            HumanSize(outcome.totals.real),
-            HumanSize(outcome.totals.apparent)
-        );
+        match &filter_result {
+            Some(result) => println!(
+                "  matched (--filter {:?}): {} real, {} apparent, {} entries — of {} real scanned",
+                args.filter.as_deref().unwrap_or_default(),
+                HumanSize(result.matched_disk),
+                HumanSize(result.matched_apparent),
+                result.matched_entries,
+                HumanSize(outcome.totals.real),
+            ),
+            None => println!(
+                "  total: {} real, {} apparent",
+                HumanSize(outcome.totals.real),
+                HumanSize(outcome.totals.apparent)
+            ),
+        }
         print!(
             "  entries: {} ({} dirs)  errors: {}  excluded mounts: {} ({} kernfs)",
             outcome.entries,
@@ -812,39 +942,91 @@ fn summary(args: &ScanArgs, scanner: &Scanner, flat_config: &flat::FlatConfig) -
         }
         println!();
         println!();
-        println!("Top {} directories by real size:", args.top);
-        for dir in outcome.top_dirs_by_disk(args.top) {
-            let meta = outcome.dir(dir);
-            println!(
-                "  {:>10}  {}",
-                HumanSize(meta.td).to_string(),
-                outcome.path_of(dir).display()
-            );
-        }
 
-        // D5: the flat-view top files, right beside the top-dirs list,
-        // reusing --top/TOP the same way (attack finding 8: one flag, two
-        // lists, the interactive view's own cap is independent — see
-        // --help). Folded once over the finalized tree (canonical hardlink
-        // attribution, same as everything above); `-o -` (dump to stdout)
-        // already skips this whole branch, so the dump stream is never at
-        // risk (attack finding 7).
-        println!();
-        println!("Top {} files by real size:", args.top);
-        let flat_summary = flat::fold(outcome.tree(), &flat_config.patterns, flat_config.cap, 0);
-        for file in flat_summary.top_files.iter().take(args.top) {
-            let badge = if file.hardlink { " \u{26d3}" } else { "" };
-            println!(
-                "  {:>10}  {}{badge}",
-                HumanSize(file.disk).to_string(),
-                outcome.tree().path_of_node(file.node).display()
-            );
-        }
-        if flat_summary.truncated {
-            println!(
-                "  (top {} of more eligible files shown; flat_cap in camembert.toml)",
-                flat_config.cap
-            );
+        match &filter_result {
+            Some(result) => {
+                // D7: both lists computed over the match set — never the
+                // whole-scan lists sitting silently under a filtered
+                // header (the same honesty rule the interactive `b` mode
+                // holds itself to under a filter).
+                println!("Top {} directories by matched real size:", args.top);
+                let mut dirs: Vec<(camembert_core::tree::DirId, u64)> = outcome
+                    .tree()
+                    .dir_ids()
+                    .filter(|&dir| !outcome.tree().is_removed(outcome.tree().dir(dir).node))
+                    .map(|dir| (dir, result.dir_total(dir).disk))
+                    .collect();
+                dirs.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.index().cmp(&b.0.index())));
+                for (dir, disk) in dirs.into_iter().take(args.top) {
+                    println!(
+                        "  {:>10}  {}",
+                        HumanSize(disk).to_string(),
+                        outcome.path_of(dir).display()
+                    );
+                }
+                println!();
+                println!("Top {} matched files by real size:", args.top);
+                for file in result.top_files.iter().take(args.top) {
+                    let badge = if file.hardlink { " \u{26d3}" } else { "" };
+                    println!(
+                        "  {:>10}  {}{badge}",
+                        HumanSize(file.disk).to_string(),
+                        outcome.tree().path_of_node(file.node).display()
+                    );
+                }
+                if result.truncated {
+                    println!(
+                        "  (top {} of more eligible files shown; flat_cap in camembert.toml)",
+                        flat_config.cap
+                    );
+                }
+                let residual_disk = result.residual.disk;
+                if residual_disk > 0 {
+                    println!(
+                        "  (+{} in {} directory inode(s), never matched by any query)",
+                        HumanSize(residual_disk),
+                        result.residual.dirs
+                    );
+                }
+            }
+            None => {
+                println!("Top {} directories by real size:", args.top);
+                for dir in outcome.top_dirs_by_disk(args.top) {
+                    let meta = outcome.dir(dir);
+                    println!(
+                        "  {:>10}  {}",
+                        HumanSize(meta.td).to_string(),
+                        outcome.path_of(dir).display()
+                    );
+                }
+
+                // D5: the flat-view top files, right beside the top-dirs
+                // list, reusing --top/TOP the same way (attack finding 8:
+                // one flag, two lists, the interactive view's own cap is
+                // independent — see --help). Folded once over the
+                // finalized tree (canonical hardlink attribution, same as
+                // everything above); `-o -` (dump to stdout) already
+                // skips this whole branch, so the dump stream is never at
+                // risk (attack finding 7).
+                println!();
+                println!("Top {} files by real size:", args.top);
+                let flat_summary =
+                    flat::fold(outcome.tree(), &flat_config.patterns, flat_config.cap, 0);
+                for file in flat_summary.top_files.iter().take(args.top) {
+                    let badge = if file.hardlink { " \u{26d3}" } else { "" };
+                    println!(
+                        "  {:>10}  {}{badge}",
+                        HumanSize(file.disk).to_string(),
+                        outcome.tree().path_of_node(file.node).display()
+                    );
+                }
+                if flat_summary.truncated {
+                    println!(
+                        "  (top {} of more eligible files shown; flat_cap in camembert.toml)",
+                        flat_config.cap
+                    );
+                }
+            }
         }
     }
 

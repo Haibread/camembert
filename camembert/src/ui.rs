@@ -36,11 +36,14 @@
 
 mod anim;
 pub mod caps;
+mod filterview;
 mod flatview;
 mod fmt;
 mod freeable_panel;
+mod history;
 mod keymap;
 mod osc11;
+mod palette;
 mod state;
 pub mod theme;
 mod toast;
@@ -48,10 +51,10 @@ mod wheel;
 
 use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, RwLock};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -70,13 +73,15 @@ use camembert_core::delete;
 use camembert_core::dump::{self, DumpMeta};
 use camembert_core::flat::{self, FlatConfig};
 use camembert_core::freeable::{self, Ledger};
+use camembert_core::query::{self, ApplyOptions, FilterResult, HardlinkIndex, Query};
 use camembert_core::scan::{LiveScan, ScanOutcome, Scanner};
 use camembert_core::size::HumanSize;
-use camembert_core::tree::{DirId, NodeId, Tree};
-use camembert_core::view::{self, RowState, ViewSnapshot};
+use camembert_core::tree::{DirId, NodeFlags, NodeId, Tree};
+use camembert_core::view::{self, RowState};
 
 use caps::{Caps, GlyphLevel};
 use fmt::DiskSpace;
+use palette::{CommandAction, PaletteMode};
 use state::{
     ConfirmState, FrameGeometry, MarkRefusal, ReviewState, SortKey, TableGeometry, UiState,
     ViewMode, WheelGeometry, show_hardlink_note, show_updating_note,
@@ -149,6 +154,12 @@ const MIN_WHEEL_TERMINAL_WIDTH: u16 = 100;
 /// Footer hint while mark/delete keys are inactive during the scan.
 const DELETION_LOCKED: &str = "deletion available once the scan completes";
 
+/// Flash for a directory-mark attempt under an active filter (D4): the row
+/// shows only matching descendants, so marking it would delete everything
+/// inside it, matched or not — the exact trap query-attack-a names.
+const DIR_MARK_FILTER_LOCKED: &str =
+    "directory marks are disabled while a filter is active — clear the filter first";
+
 /// Immutable per-session render context: capabilities, palette, disk
 /// space of the scanned filesystem.
 struct RenderCtx {
@@ -217,11 +228,32 @@ impl Flash {
 enum Phase {
     /// Owner thread alive: snapshots and navigation over the bus.
     Scanning(LiveScan),
-    /// Scan over: this thread owns the frozen arena and serves its own
-    /// navigation (see `Scanner::scan_live` for why no owner survives).
-    Done(Box<ScanOutcome>),
+    /// Scan over: this thread (reads) and the off-thread filter fold
+    /// (reads, D5) share the frozen arena through a `RwLock` rather than
+    /// a bare `Box` — the *only* writer is a confirmed deletion, which
+    /// briefly blocks on the write lock exactly like it would block on
+    /// any other exclusive access, while an in-flight background filter
+    /// fold holds the read side for its duration (tens of ms even at
+    /// scale). Every other reader (navigation, the hardlink index build,
+    /// drawing) takes the read lock too. See `spawn_filter_fold`.
+    Done(Arc<RwLock<ScanOutcome>>),
     /// Transient marker while moving between the two.
     Transitioning,
+}
+
+/// Acquire the read side of a [`Phase::Done`] lock, recovering from
+/// poisoning rather than panicking (a panicked reader/writer elsewhere in
+/// the session must not turn every subsequent frame into a crash — the
+/// arena itself is still exactly as valid as it was the instant before).
+fn read_outcome(lock: &RwLock<ScanOutcome>) -> std::sync::RwLockReadGuard<'_, ScanOutcome> {
+    lock.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Acquire the write side (deletion only — see [`Phase::Done`]'s doc).
+fn write_outcome(lock: &RwLock<ScanOutcome>) -> std::sync::RwLockWriteGuard<'_, ScanOutcome> {
+    lock.write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Run the interactive UI over a live scan of `path`. Blocks until the
@@ -243,7 +275,12 @@ enum Phase {
 /// itself only needed it to seed the live accumulator). `startup_toasts`
 /// (D4) surfaces config-time warnings collected before the UI existed —
 /// today just the combined `[patterns]` warning count ("N invalid
-/// patterns ignored — see log").
+/// patterns ignored — see log"). `saved_queries` (D6) is
+/// `camembert.toml`'s read-only `[queries]` table (label, query string),
+/// offered in the Ctrl-K/`/` palette when its input is empty.
+/// `filter_text` (D7) pre-applies `--filter`/`FILTER` the instant the scan
+/// completes, exactly as if the user had typed it into the palette and
+/// pressed Enter — empty means no pre-applied filter.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     scanner: Scanner,
@@ -255,6 +292,8 @@ pub fn run(
     no_proc_sweep: bool,
     flat_config: FlatConfig,
     startup_toasts: Vec<String>,
+    saved_queries: Vec<(String, String)>,
+    filter_text: Option<String>,
 ) -> io::Result<()> {
     info!(
         ?caps,
@@ -278,7 +317,15 @@ pub fn run(
         no_proc_sweep,
         flat_config,
     };
-    let result = event_loop(&mut terminal, live, output, &ctx, startup_toasts);
+    let result = event_loop(
+        &mut terminal,
+        live,
+        output,
+        &ctx,
+        startup_toasts,
+        saved_queries,
+        filter_text,
+    );
     disable_mouse_capture();
     ratatui::restore();
     result
@@ -412,6 +459,8 @@ fn event_loop(
     output: Option<PathBuf>,
     ctx: &RenderCtx,
     startup_toasts: Vec<String>,
+    saved_queries: Vec<(String, String)>,
+    filter_text: Option<String>,
 ) -> io::Result<()> {
     let bus = Arc::clone(live.bus());
     let mut output = output;
@@ -440,17 +489,26 @@ fn event_loop(
     // sweep's result lands, polled non-blockingly below (step 2.5) — never
     // set at all under `--no-proc-sweep`/`NO_PROC_SWEEP`.
     let mut sweep_rx: Option<Receiver<Ledger>> = None;
+    // D6: the palette's clock/IO-owning runtime (history file, the
+    // debounce timer, the off-thread filter fold's channel) — kept out of
+    // `PaletteState`/`UiState` the same way `Flash`/`sweep_rx` are kept out
+    // of the terminal-free state modules.
+    let mut palette_rt = PaletteRuntime::new(saved_queries);
+    // D7: `--filter`/`FILTER` pre-applies the instant the scan completes,
+    // exactly like a palette query the user typed and committed.
+    let mut pending_filter_text = filter_text.filter(|text| !text.trim().is_empty());
 
     loop {
         // 1. Input (drain everything pending; block at most one frame
         //    while something needs a timely redraw of its own accord —
         //    otherwise idle: a quiescent UI costs nothing between
         //    keypresses, design slice 5).
-        let mut deadline = if needs_frequent_polling(&phase, &flash, &toasts, &motion, &sweep_rx) {
-            FRAME
-        } else {
-            IDLE_POLL
-        };
+        let mut deadline =
+            if needs_frequent_polling(&phase, &flash, &toasts, &motion, &sweep_rx, &palette_rt) {
+                FRAME
+            } else {
+                IDLE_POLL
+            };
         while event::poll(deadline)? {
             deadline = Duration::ZERO;
             match event::read()? {
@@ -464,6 +522,8 @@ fn event_loop(
                         &mut flash,
                         &mut toasts,
                         ctx.no_proc_sweep,
+                        &mut palette_rt,
+                        &ctx.flat_config,
                     ) {
                         Action::Quit => {
                             if let Phase::Scanning(live) = phase {
@@ -531,11 +591,36 @@ fn event_loop(
                 sweep_rx = spawn_freeable_sweep(root_dev);
             }
             local_generation = ui.snapshot().generation;
-            phase = Phase::Done(Box::new(outcome));
+            phase = Phase::Done(Arc::new(RwLock::new(outcome)));
             // Re-view the current dir so states/totals show final values,
             // resolving any nav request the owner no longer serves.
             let dir = ui.pending_nav().unwrap_or(ui.snapshot().dir);
             serve_local(&phase, dir, &mut local_generation, &mut ui);
+            // D7: `--filter`/`FILTER` pre-applies now, exactly like a
+            // palette query the user typed and committed — the interactive
+            // UI is lenient (broken terms are inert, per the module docs),
+            // unlike `--no-ui`'s strict parse, so this never blocks the
+            // session over a typo; it just toasts the problem count.
+            if let Some(text) = pending_filter_text.take() {
+                let parsed = query::parse(&text);
+                if !parsed.errors.is_empty() {
+                    for err in &parsed.errors {
+                        warn!(message = %err.message, "--filter: parse issue (term ignored)");
+                    }
+                    toasts.push(format!(
+                        "--filter: {} term(s) ignored — see log",
+                        parsed.errors.len()
+                    ));
+                }
+                request_filter_fold(
+                    &phase,
+                    &ui,
+                    &mut palette_rt,
+                    &ctx.flat_config,
+                    parsed.query,
+                    text,
+                );
+            }
         }
 
         // 2.5. Freeable sweep result landed? (D4/D5 — polled
@@ -563,6 +648,12 @@ fn event_loop(
                 }
             }
         }
+
+        // 2.6. Filter fold (D5): debounced trigger, then a non-blocking
+        // poll of whatever is currently in flight — same shape as the
+        // freeable sweep just above, applied to the query engine instead.
+        maybe_spawn_filter_fold(&phase, &mut ui, &mut palette_rt, &ctx.flat_config);
+        poll_filter_fold(&mut ui, &mut palette_rt);
 
         // 3. Snapshot for this frame (wait-free).
         match &phase {
@@ -616,6 +707,8 @@ fn event_loop(
                 &toast_texts,
                 &mut motion,
                 ctx,
+                palette_rt.fold_rx.is_some(),
+                &palette_rt.saved_queries,
             );
         })?;
         // Recomputed every frame (design slice 3): mouse events hit-test
@@ -662,23 +755,283 @@ fn spawn_freeable_sweep(root_dev: u64) -> Option<Receiver<Ledger>> {
 /// Whether the render loop needs to keep polling at [`FRAME`] cadence
 /// even without new input: a running scan (progress arrives off the
 /// input stream), an in-flight bar/donut animation, a toast/flash that
-/// still needs to expire on schedule, or a freeable sweep whose result
+/// still needs to expire on schedule, a freeable sweep whose result
 /// hasn't landed yet (D4 — `sweep_rx` is `Some` from scan end until
-/// `try_recv` succeeds). `false` means nothing on screen changes until the
-/// user does something, so the loop idles at [`IDLE_POLL`] instead (design
-/// slice 5).
+/// `try_recv` succeeds), or the filter palette waiting out its debounce
+/// window / a fold already in flight (D5). `false` means nothing on
+/// screen changes until the user does something, so the loop idles at
+/// [`IDLE_POLL`] instead (design slice 5).
 fn needs_frequent_polling(
     phase: &Phase,
     flash: &Flash,
     toasts: &ToastQueue,
     motion: &anim::Motion,
     sweep_rx: &Option<Receiver<Ledger>>,
+    palette_rt: &PaletteRuntime,
 ) -> bool {
     matches!(phase, Phase::Scanning(_))
         || motion.is_active()
         || flash.is_set()
         || !toasts.is_empty()
         || sweep_rx.is_some()
+        || palette_rt.last_edit.is_some()
+        || palette_rt.fold_rx.is_some()
+}
+
+// ---------------------------------------------------------------------------
+// Filter fold (D5): off-UI-thread, debounced, epoch-guarded
+// ---------------------------------------------------------------------------
+
+/// Debounce window (D5, D6: "~100 ms"): a query fold is requested only
+/// once this long has passed since the palette buffer last changed in
+/// query mode, so a fast typist never triggers one fold per keystroke.
+const FILTER_DEBOUNCE: Duration = Duration::from_millis(100);
+
+/// One completed background fold, carried back with the query text it was
+/// computed for (the text becomes the pill's label and the history
+/// entry — the [`FilterResult`] itself only carries a fingerprint, not the
+/// original text).
+struct FilterFoldOutcome {
+    query_text: String,
+    result: FilterResult,
+}
+
+/// The palette's clock/IO-owning runtime: everything [`palette::PaletteState`]
+/// and [`state::UiState`] deliberately stay free of (see their module
+/// docs) — the debounce timer, the in-flight fold's channel and its
+/// (fingerprint, epoch) identity, the lazily-built/cached
+/// [`HardlinkIndex`] (D3: built on first filter use, rebuilt only when the
+/// deletion epoch moves), and the history/saved-queries lists themselves.
+/// One instance lives for the whole interactive session, exactly like
+/// `sweep_rx`/`Flash`/`ToastQueue`.
+struct PaletteRuntime {
+    /// Set on every palette-buffer edit in query mode; cleared once a
+    /// fold has been requested for the resulting text. `None` means
+    /// nothing is waiting on the debounce.
+    last_edit: Option<Instant>,
+    /// (query fingerprint, deletion epoch) of the fold currently
+    /// requested/in-flight, if any.
+    in_flight: Option<(u64, u64)>,
+    fold_rx: Option<Receiver<FilterFoldOutcome>>,
+    hardlink_cache: Option<(u64, Arc<HardlinkIndex>)>,
+    history: Vec<String>,
+    history_path: Option<PathBuf>,
+    saved_queries: Vec<(String, String)>,
+}
+
+impl PaletteRuntime {
+    fn new(saved_queries: Vec<(String, String)>) -> Self {
+        let history_path = history::history_path();
+        let history = history_path
+            .as_deref()
+            .map(history::load)
+            .unwrap_or_default();
+        Self {
+            last_edit: None,
+            in_flight: None,
+            fold_rx: None,
+            hardlink_cache: None,
+            history,
+            history_path,
+            saved_queries,
+        }
+    }
+
+    /// Record that the query committed (Enter, or the palette closing with
+    /// a nonempty query) so Up/Down can recall it later; best-effort
+    /// persisted to the history file (never fatal, see `history`'s module
+    /// doc).
+    fn record_history(&mut self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        if self.history.last().map(String::as_str) != Some(text) {
+            self.history.push(text.to_owned());
+        }
+        if let Some(path) = &self.history_path {
+            history::append(path, text);
+        }
+    }
+}
+
+/// "Now" in unix seconds for [`ApplyOptions::now_unix`] — read once per
+/// fold request, never inside the fold itself (D5: reproducible results).
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Worker threads for the candidate fold ([`ApplyOptions::threads`]):
+/// the machine's parallelism, same idea as the scan's own auto thread
+/// count — [`query::apply`] produces an identical result for any count.
+fn default_fold_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1)
+}
+
+/// Off-UI-thread filtered fold (D5): the freeable sweep's spawn+channel
+/// idiom, applied to the query engine. The spawned thread holds a
+/// *read* lock on the frozen arena for the fold's duration; the sole
+/// writer (a confirmed deletion) briefly waits on the same lock instead of
+/// racing it — see [`Phase::Done`]'s doc.
+fn spawn_filter_fold(
+    outcome: Arc<RwLock<ScanOutcome>>,
+    hardlinks: Arc<HardlinkIndex>,
+    query: Query,
+    query_text: String,
+    patterns: flat::PatternSet,
+    opts: ApplyOptions,
+) -> Receiver<FilterFoldOutcome> {
+    let (tx, rx) = mpsc::channel();
+    let spawned = thread::Builder::new()
+        .name("filter-fold".to_owned())
+        .spawn(move || {
+            let guard = match outcome.read() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let result = query::apply(guard.tree(), &query, &patterns, &hardlinks, &opts);
+            drop(guard);
+            // The receiver may already be gone (process exiting, or the
+            // session moved on) — a failed send just means nobody is
+            // listening anymore.
+            let _ = tx.send(FilterFoldOutcome { query_text, result });
+        });
+    if let Err(err) = spawned {
+        warn!(%err, "failed to spawn the filter fold thread; filter not applied");
+    }
+    rx
+}
+
+/// Request a fold right now, no debounce (used once the debounce window
+/// has actually elapsed, and by `--filter`/`FILTER`'s scan-end pre-apply,
+/// which has no keystrokes to debounce in the first place). Builds/rebuilds
+/// the cached [`HardlinkIndex`] first when the deletion epoch has moved
+/// (D3) — a bounded, infrequent rebuild, never per-keystroke.
+fn request_filter_fold(
+    phase: &Phase,
+    ui: &UiState,
+    rt: &mut PaletteRuntime,
+    flat_config: &FlatConfig,
+    query: Query,
+    query_text: String,
+) {
+    let Phase::Done(lock) = phase else { return };
+    let fingerprint = query.fingerprint();
+    let epoch = ui.flat_epoch();
+    let hardlinks = {
+        let guard = match lock.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match &rt.hardlink_cache {
+            Some((cached_epoch, index)) if *cached_epoch == epoch => Arc::clone(index),
+            _ => {
+                let index = Arc::new(HardlinkIndex::build(&guard, epoch));
+                rt.hardlink_cache = Some((epoch, Arc::clone(&index)));
+                index
+            }
+        }
+    };
+    let opts = ApplyOptions {
+        cap: flat_config.cap,
+        epoch,
+        now_unix: unix_now(),
+        threads: default_fold_threads(),
+    };
+    let rx = spawn_filter_fold(
+        Arc::clone(lock),
+        hardlinks,
+        query,
+        query_text,
+        flat_config.patterns.clone(),
+        opts,
+    );
+    rt.fold_rx = Some(rx);
+    rt.in_flight = Some((fingerprint, epoch));
+    rt.last_edit = None;
+}
+
+/// The debounce check (D5/D6, ~100 ms after the last edit): while the
+/// palette is open in query mode, post-scan, request a fold once the
+/// buffer has been quiet long enough — unless the exact (fingerprint,
+/// epoch) is already in flight or already the applied result, in which
+/// case there is nothing new to compute.
+fn maybe_spawn_filter_fold(
+    phase: &Phase,
+    ui: &mut UiState,
+    rt: &mut PaletteRuntime,
+    flat_config: &FlatConfig,
+) {
+    if !matches!(phase, Phase::Done(_)) {
+        return; // D2: post-scan only
+    }
+    if rt.fold_rx.is_some() {
+        return; // one in flight; let it land before requesting another
+    }
+    let Some(palette) = ui.palette() else {
+        return;
+    };
+    if palette.mode() != PaletteMode::Query {
+        return;
+    }
+    let Some(last_edit) = rt.last_edit else {
+        return;
+    };
+    if last_edit.elapsed() < FILTER_DEBOUNCE {
+        return;
+    }
+    let parsed = palette.parsed();
+    let fingerprint = parsed.query.fingerprint();
+    let epoch = ui.flat_epoch();
+    if rt.in_flight == Some((fingerprint, epoch)) {
+        rt.last_edit = None;
+        return;
+    }
+    if let Some(active) = ui.active_filter()
+        && active.result.query_hash == fingerprint
+        && active.result.epoch == epoch
+    {
+        rt.last_edit = None; // already showing exactly this
+        return;
+    }
+    let text = palette.text();
+    request_filter_fold(phase, ui, rt, flat_config, parsed.query, text);
+}
+
+/// Non-blocking poll of whatever fold is currently in flight (D5): a
+/// result is only adopted when it is still the one currently wanted
+/// (`rt.in_flight` still names its exact (fingerprint, epoch)) *and* the
+/// deletion epoch has not moved since it was requested — stale results
+/// (superseded by a newer keystroke, or overtaken by a delete) are
+/// dropped silently and never rendered.
+fn poll_filter_fold(ui: &mut UiState, rt: &mut PaletteRuntime) {
+    let Some(rx) = &rt.fold_rx else {
+        return;
+    };
+    match rx.try_recv() {
+        Ok(outcome) => {
+            rt.fold_rx = None;
+            let still_wanted =
+                rt.in_flight == Some((outcome.result.query_hash, outcome.result.epoch));
+            let epoch_current = ui.flat_epoch() == outcome.result.epoch;
+            if still_wanted && epoch_current {
+                ui.set_active_filter(outcome.query_text, Arc::new(outcome.result));
+            } else {
+                debug!("dropped a stale filter fold result");
+            }
+            rt.in_flight = None;
+        }
+        Err(mpsc::TryRecvError::Empty) => {}
+        Err(mpsc::TryRecvError::Disconnected) => {
+            rt.fold_rx = None;
+            rt.in_flight = None;
+        }
+    }
 }
 
 fn spinner_frame(ctx: &RenderCtx, elapsed: Duration) -> char {
@@ -695,18 +1048,21 @@ enum Action {
     Quit,
 }
 
-/// Modal precedence (D5 extends design slice 4's ladder — confirm beats
-/// review beats the freeable panel beats the cheatsheet), only one open at
-/// a time, keys route to the open modal only. Each modal branch below
+/// Modal precedence: the Ctrl-K/`/` palette (D6) outranks everything,
+/// then confirm beats review beats the freeable panel beats the
+/// cheatsheet (design slice 4's ladder, D5 extends it) — only one open at
+/// a time, keys route to the open one only. Each modal branch below
 /// `return`s unconditionally, so the normal-mode match at the bottom is
 /// only ever reached with none of them open — which is also what keeps
 /// that invariant true: opening a modal from normal mode can never happen
-/// while a higher-precedence one is up. `no_proc_sweep` is
-/// `--no-proc-sweep`/`NO_PROC_SWEEP` (D7): `D` skips the pre-deletion
-/// open-file refresh outright when set.
+/// while a higher-precedence one is up, and the palette can only ever be
+/// opened from normal mode (so it can never coexist with the other four
+/// either). `no_proc_sweep` is `--no-proc-sweep`/`NO_PROC_SWEEP` (D7): `D`
+/// skips the pre-deletion open-file refresh outright when set.
 // Every parameter is an independent per-keypress input (the key itself,
-// the UI/phase/generation/flash/toast state it can mutate, and the one
-// runtime flag): same shape as `draw`'s own too-many-arguments allowance.
+// the UI/phase/generation/flash/toast state it can mutate, and two
+// runtime flags/config): same shape as `draw`'s own too-many-arguments
+// allowance.
 #[allow(clippy::too_many_arguments)]
 fn handle_key(
     code: KeyCode,
@@ -717,7 +1073,24 @@ fn handle_key(
     flash: &mut Flash,
     toasts: &mut ToastQueue,
     no_proc_sweep: bool,
+    palette_rt: &mut PaletteRuntime,
+    flat_config: &FlatConfig,
 ) -> Action {
+    // The palette (D6) is the topmost rung: while open, it owns the
+    // keyboard except Esc/Enter/arrows/Home/End/Backspace/Delete/Ctrl-C —
+    // every other key, `q` included, is a character (attack finding 2).
+    if ui.palette_open() {
+        return handle_palette_key(
+            code,
+            modifiers,
+            ui,
+            phase,
+            flash,
+            no_proc_sweep,
+            palette_rt,
+            flat_config,
+        );
+    }
     // The confirmation modal captures every key: `y` confirms, anything
     // else cancels (Ctrl-C keeps quitting — safety hatch).
     if ui.confirm().is_some() {
@@ -764,17 +1137,32 @@ fn handle_key(
     }
     match code {
         KeyCode::Char('q') => return Action::Quit,
-        // Contextual Esc (D3): a modal already returned above, so getting
-        // here means none is open — leave a flat/breakdown mode if one is
-        // active, otherwise quit exactly like `q`. `q` itself always
-        // quits, mode or no mode (D3: "`q` always quits").
+        // Contextual Esc ladder (D3, extended by D6/attack-a finding 12):
+        // every modal already returned above, so getting here means none
+        // is open — leave a flat/breakdown mode first, else clear an
+        // active filter, else quit exactly like `q`. `q` itself always
+        // quits regardless of mode or filter (D3: "`q` always quits").
         KeyCode::Esc => {
-            if ui.mode() == ViewMode::Tree {
+            if ui.mode() != ViewMode::Tree {
+                ui.leave_mode();
+            } else if ui.active_filter().is_some() {
+                ui.clear_filter();
+            } else {
                 return Action::Quit;
             }
-            ui.leave_mode();
         }
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return Action::Quit,
+        // Ctrl-K / `/` (D6): open the palette, pre-filled with the active
+        // filter's text when there is one so editing continues naturally
+        // instead of starting from an empty box behind its own effect.
+        KeyCode::Char('k') if modifiers.contains(KeyModifiers::CONTROL) => {
+            let prefill = ui.active_filter().map(|f| f.query_text.clone());
+            ui.open_palette(prefill.as_deref());
+        }
+        KeyCode::Char('/') => {
+            let prefill = ui.active_filter().map(|f| f.query_text.clone());
+            ui.open_palette(prefill.as_deref());
+        }
         KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => activate_selected(ui, phase, flash),
         KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
             // Ascend is a tree-mode concept only: a flat/breakdown row
@@ -805,6 +1193,208 @@ fn handle_key(
         _ => {
             keymap::dispatch_simple(code, ui);
         }
+    }
+    Action::Continue
+}
+
+/// Route one keypress to the open palette (D6). Only Esc, Enter, the
+/// arrows/Home/End/Backspace/Delete and Ctrl-C are interpreted; every
+/// other key is a character inserted at the cursor — `q` included (attack
+/// finding 2: `q`-always-quits is suspended the instant the palette has
+/// focus, and resumes the instant it closes). Mouse stays inert except
+/// click-outside-closes, handled in `handle_mouse`.
+#[allow(clippy::too_many_arguments)]
+fn handle_palette_key(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    ui: &mut UiState,
+    phase: &mut Phase,
+    flash: &mut Flash,
+    no_proc_sweep: bool,
+    rt: &mut PaletteRuntime,
+    flat_config: &FlatConfig,
+) -> Action {
+    if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
+        return Action::Quit; // the one safety hatch that survives inside the palette
+    }
+    match code {
+        // Esc closes the palette only — it must never also clear the
+        // filter (attack finding 12's off-by-one): whatever was last
+        // applied while typing stays active.
+        KeyCode::Esc => ui.close_palette(),
+        KeyCode::Enter => return palette_enter(ui, phase, flash, no_proc_sweep, rt, flat_config),
+        KeyCode::Left => {
+            if let Some(p) = ui.palette_mut() {
+                p.move_left();
+            }
+        }
+        KeyCode::Right => {
+            if let Some(p) = ui.palette_mut() {
+                p.move_right();
+            }
+        }
+        KeyCode::Home => {
+            if let Some(p) = ui.palette_mut() {
+                p.move_home();
+            }
+        }
+        KeyCode::End => {
+            if let Some(p) = ui.palette_mut() {
+                p.move_end();
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(p) = ui.palette_mut() {
+                p.backspace();
+            }
+            rt.last_edit = Some(Instant::now());
+        }
+        KeyCode::Delete => {
+            if let Some(p) = ui.palette_mut() {
+                p.delete_forward();
+            }
+            rt.last_edit = Some(Instant::now());
+        }
+        KeyCode::Up => palette_move_selection(ui, rt, true),
+        KeyCode::Down => palette_move_selection(ui, rt, false),
+        KeyCode::Char(ch) => {
+            if let Some(p) = ui.palette_mut() {
+                p.insert_char(ch);
+            }
+            rt.last_edit = Some(Instant::now());
+        }
+        _ => {}
+    }
+    Action::Continue
+}
+
+/// Up/Down inside the palette: command-mode selection, saved-query
+/// selection (query mode, empty buffer, D6), or history navigation (query
+/// mode, nonempty buffer) — three different lists sharing one key, none
+/// of them live at once.
+fn palette_move_selection(ui: &mut UiState, rt: &PaletteRuntime, up: bool) {
+    let Some(mode) = ui.palette().map(palette::PaletteState::mode) else {
+        return;
+    };
+    match mode {
+        PaletteMode::Command => {
+            let content = ui
+                .palette()
+                .map(palette::PaletteState::content)
+                .unwrap_or_default();
+            let commands = palette::all_commands();
+            let len = palette::filter_commands(&content, &commands).len();
+            if let Some(p) = ui.palette_mut() {
+                if up {
+                    p.move_selection_up();
+                } else {
+                    p.move_selection_down(len);
+                }
+            }
+        }
+        PaletteMode::Query => {
+            let empty = ui.palette().map(|p| p.text().is_empty()).unwrap_or(true);
+            if empty {
+                let len = rt.saved_queries.len();
+                if let Some(p) = ui.palette_mut() {
+                    if up {
+                        p.move_selection_up();
+                    } else {
+                        p.move_selection_down(len);
+                    }
+                }
+            } else if let Some(p) = ui.palette_mut() {
+                if up {
+                    p.history_up(&rt.history);
+                } else {
+                    p.history_down(&rt.history);
+                }
+            }
+        }
+    }
+}
+
+/// Enter inside the palette: commit. Command mode runs the
+/// fuzzy-selected command; query mode applies the typed text (or, on an
+/// empty buffer, the selected saved query, D6) immediately — bypassing the
+/// debounce, since an explicit Enter is exactly the "the user is done
+/// typing" signal the debounce exists to infer from silence — and closes
+/// the palette either way, leaving whatever filter is now active in
+/// place.
+fn palette_enter(
+    ui: &mut UiState,
+    phase: &mut Phase,
+    flash: &mut Flash,
+    no_proc_sweep: bool,
+    rt: &mut PaletteRuntime,
+    flat_config: &FlatConfig,
+) -> Action {
+    let Some(mode) = ui.palette().map(palette::PaletteState::mode) else {
+        return Action::Continue;
+    };
+    match mode {
+        PaletteMode::Command => {
+            let content = ui
+                .palette()
+                .map(palette::PaletteState::content)
+                .unwrap_or_default();
+            let commands = palette::all_commands();
+            let filtered = palette::filter_commands(&content, &commands);
+            let selected = ui
+                .palette()
+                .map(palette::PaletteState::list_selected)
+                .unwrap_or(0);
+            let action = filtered.get(selected).map(|&i| commands[i].action);
+            ui.close_palette();
+            if let Some(action) = action {
+                return execute_command(action, ui, phase, flash, no_proc_sweep);
+            }
+        }
+        PaletteMode::Query => {
+            let text = ui
+                .palette()
+                .map(palette::PaletteState::text)
+                .unwrap_or_default();
+            let final_text = if text.trim().is_empty() {
+                let selected = ui
+                    .palette()
+                    .map(palette::PaletteState::list_selected)
+                    .unwrap_or(0);
+                rt.saved_queries.get(selected).map(|(_, q)| q.clone())
+            } else {
+                Some(text)
+            };
+            ui.close_palette();
+            if let Some(text) = final_text
+                && !text.trim().is_empty()
+            {
+                let parsed = query::parse(&text);
+                rt.record_history(&text);
+                request_filter_fold(phase, ui, rt, flat_config, parsed.query, text);
+            }
+        }
+    }
+    Action::Continue
+}
+
+/// Run one palette command (D6): [`CommandAction::Simple`] dispatches
+/// exactly like `keymap::dispatch_simple`; the rest reuse the same
+/// hand-written helpers the equivalent keypress already calls, so a
+/// command can never do something its keyboard equivalent wouldn't.
+fn execute_command(
+    action: CommandAction,
+    ui: &mut UiState,
+    phase: &mut Phase,
+    flash: &mut Flash,
+    no_proc_sweep: bool,
+) -> Action {
+    match action {
+        CommandAction::Simple(apply) => apply(ui),
+        CommandAction::ReviewMarks => try_open_review(ui, flash),
+        CommandAction::DeleteMarked => open_delete_confirm(ui, phase, flash, no_proc_sweep),
+        CommandAction::FreeablePanel => open_freeable_panel(ui, phase),
+        CommandAction::ClearFilter => ui.clear_filter(),
+        CommandAction::Quit => return Action::Quit,
     }
     Action::Continue
 }
@@ -847,10 +1437,12 @@ fn activate_selected(ui: &mut UiState, phase: &Phase, flash: &mut Flash) {
 /// module doc) has no path to give one from, so mid-scan this flashes the
 /// same "available once the scan completes" note marking already uses.
 fn try_jump_flat_row(ui: &mut UiState, phase: &Phase, flash: &mut Flash) {
-    let Phase::Done(outcome) = phase else {
+    let Phase::Done(lock) = phase else {
         flash.set(FLAT_ROW_DETAILS_LOCKED);
         return;
     };
+    let guard = read_outcome(lock);
+    let outcome = &*guard;
     let Some(summary) = ui.flat_summary() else {
         return;
     };
@@ -914,7 +1506,10 @@ fn try_sort(ui: &mut UiState, flash: &mut Flash, key: SortKey) {
 /// support, design slice 3). Inert while any modal is open — confirm,
 /// review, the freeable panel (D5) or cheatsheet (design slice 4) — they
 /// only listen to the keyboard; a click through to a hidden row
-/// underneath would be surprising.
+/// underneath would be surprising. The palette (D6) is almost the same,
+/// with one exception: any click closes it (there is no inner click
+/// target to route to — no click-to-position-the-cursor, no
+/// click-a-list-row — so every click is definitionally "outside").
 fn handle_mouse(
     mouse: MouseEvent,
     ui: &mut UiState,
@@ -922,6 +1517,12 @@ fn handle_mouse(
     last_click: &mut Option<(Instant, u16, u16)>,
     flash: &mut Flash,
 ) {
+    if ui.palette_open() {
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            ui.close_palette();
+        }
+        return;
+    }
     if ui.confirm().is_some() || ui.review().is_some() || ui.freeable_open() || ui.cheatsheet_open()
     {
         return;
@@ -1052,6 +1653,7 @@ fn try_toggle_mark(ui: &mut UiState, phase: &Phase, flash: &mut Flash) {
             Err(MarkRefusal::MountPoint) => {
                 flash.set("mount points cannot be marked for deletion");
             }
+            Err(MarkRefusal::FilterActive) => flash.set(DIR_MARK_FILTER_LOCKED),
         },
         ViewMode::FlatTop => try_toggle_mark_flat(ui, phase, flash),
         ViewMode::Breakdown => flash.set("marking is not available in the breakdown view"),
@@ -1064,10 +1666,12 @@ fn try_toggle_mark(ui: &mut UiState, phase: &Phase, flash: &mut Flash) {
 /// same reason as [`try_jump_flat_row`] (the live accumulator's
 /// `TopFile` has no path to resolve).
 fn try_toggle_mark_flat(ui: &mut UiState, phase: &Phase, flash: &mut Flash) {
-    let Phase::Done(outcome) = phase else {
+    let Phase::Done(lock) = phase else {
         flash.set(DELETION_LOCKED);
         return;
     };
+    let guard = read_outcome(lock);
+    let outcome = &*guard;
     let Some(summary) = ui.flat_summary() else {
         return;
     };
@@ -1087,6 +1691,9 @@ fn try_toggle_mark_flat(ui: &mut UiState, phase: &Phase, flash: &mut Flash) {
         Err(MarkRefusal::MountPoint) => {
             debug!("unreachable: flat rows are always regular files, never mount points");
         }
+        Err(MarkRefusal::FilterActive) => {
+            debug!("unreachable: flat rows are always regular files, never refused by a filter");
+        }
     }
 }
 
@@ -1103,10 +1710,12 @@ fn try_open_review(ui: &mut UiState, flash: &mut Flash) {
 /// hardlink warning from the frozen arena and, unless `no_proc_sweep` (D7),
 /// the D6 pre-deletion open-file advisory.
 fn open_delete_confirm(ui: &mut UiState, phase: &Phase, flash: &mut Flash, no_proc_sweep: bool) {
-    let Phase::Done(outcome) = phase else {
+    let Phase::Done(lock) = phase else {
         flash.set(DELETION_LOCKED);
         return;
     };
+    let guard = read_outcome(lock);
+    let outcome = &*guard;
     if ui.marked_summary().is_none() {
         flash.set("nothing marked — Space marks the row under the cursor");
         return;
@@ -1208,7 +1817,7 @@ fn open_freeable_panel(ui: &mut UiState, phase: &Phase) {
         // cheap.
         let entries = ledger.root_fs_entries().to_vec();
         let ancestors = match phase {
-            Phase::Done(outcome) => live_dir_paths(outcome),
+            Phase::Done(lock) => live_dir_paths(&read_outcome(lock)),
             _ => Vec::new(),
         };
         let groups = freeable_panel::group_by_ancestor(&entries, &ancestors);
@@ -1244,7 +1853,7 @@ fn execute_deletion(
     generation: &mut u64,
     toasts: &mut ToastQueue,
 ) {
-    let Phase::Done(outcome) = phase else {
+    let Phase::Done(lock) = phase else {
         // The modal only opens post-scan, but never delete on a stale
         // assumption.
         ui.cancel_confirm();
@@ -1255,33 +1864,42 @@ fn execute_deletion(
     };
     let nodes: Vec<NodeId> = marks.iter().map(|mark| mark.node).collect();
     info!(count = nodes.len(), "deletion confirmed");
-    let report = delete::delete_nodes(outcome, &nodes);
-    if report.deleted > 0 {
-        // D2/D3, attack finding 1: advance the epoch so the very next
-        // render-time check (`ensure_flat_summary_fresh`) recomputes the
-        // flat/breakdown summary before drawing — regardless of which
-        // mode this deletion was performed from.
-        ui.bump_flat_epoch();
-    }
-    if report.failed > 0 || report.skipped > 0 {
-        toasts.push(format!(
-            "deleted {} ({} freed), failed {}, skipped {} — see log",
-            report.deleted,
-            HumanSize(report.freed.real),
-            report.failed,
-            report.skipped
-        ));
-    } else {
-        toasts.push(format!(
-            "deleted {} entries, {} freed",
-            report.deleted,
-            HumanSize(report.freed.real)
-        ));
-    }
     // The viewed directory may sit inside a deleted subtree: climb to the
     // nearest surviving ancestor before rebuilding the view.
     let mut dir = ui.snapshot().dir;
     {
+        // The write lock (D5: the sole writer against `Phase::Done`'s
+        // shared arena — see its doc) is scoped to this block and dropped
+        // before `serve_local` below re-acquires the *read* side; an
+        // in-flight background filter fold simply waited its turn on the
+        // same lock, never raced it.
+        let mut guard = write_outcome(lock);
+        let outcome = &mut *guard;
+        let report = delete::delete_nodes(outcome, &nodes);
+        if report.deleted > 0 {
+            // D2/D3, attack finding 1: advance the epoch so the very next
+            // render-time check (`ensure_flat_summary_fresh`) recomputes
+            // the flat/breakdown summary before drawing, and so the very
+            // next filter-fold poll (D5) discards any in-flight result
+            // computed against the arena as it stood before this delete —
+            // regardless of which mode/surface this deletion came from.
+            ui.bump_flat_epoch();
+        }
+        if report.failed > 0 || report.skipped > 0 {
+            toasts.push(format!(
+                "deleted {} ({} freed), failed {}, skipped {} — see log",
+                report.deleted,
+                HumanSize(report.freed.real),
+                report.failed,
+                report.skipped
+            ));
+        } else {
+            toasts.push(format!(
+                "deleted {} entries, {} freed",
+                report.deleted,
+                HumanSize(report.freed.real)
+            ));
+        }
         let tree = outcome.tree();
         while tree.is_removed(tree.dir(dir).node) {
             dir = tree
@@ -1305,9 +1923,11 @@ fn request_nav(phase: &Phase, dir: DirId) {
 /// Post-scan navigation: build the requested view straight off the frozen
 /// arena (same row shape as live snapshots, root_complete stats).
 fn serve_local(phase: &Phase, dir: DirId, generation: &mut u64, ui: &mut UiState) {
-    let Phase::Done(outcome) = phase else {
+    let Phase::Done(lock) = phase else {
         return;
     };
+    let guard = read_outcome(lock);
+    let outcome = &*guard;
     *generation += 1;
     let stats = view::scan_stats(outcome.tree(), outcome.root(), outcome.elapsed);
     let snapshot = view::build_snapshot(
@@ -1337,7 +1957,7 @@ fn serve_local(phase: &Phase, dir: DirId, generation: &mut u64, ui: &mut UiState
 /// [`UiState::flat_epoch`] — triggers one authoritative
 /// [`flat::fold`] over the frozen arena.
 fn ensure_flat_summary_fresh(phase: &Phase, flat_config: &FlatConfig, ui: &mut UiState) {
-    let Phase::Done(outcome) = phase else {
+    let Phase::Done(lock) = phase else {
         return;
     };
     let epoch = ui.flat_epoch();
@@ -1347,6 +1967,8 @@ fn ensure_flat_summary_fresh(phase: &Phase, flat_config: &FlatConfig, ui: &mut U
     if !stale {
         return;
     }
+    let guard = read_outcome(lock);
+    let outcome = &*guard;
     let summary = flat::fold(
         outcome.tree(),
         &flat_config.patterns,
@@ -1376,6 +1998,8 @@ fn draw(
     toasts: &[String],
     motion: &mut anim::Motion,
     ctx: &RenderCtx,
+    filter_fold_in_flight: bool,
+    saved_queries: &[(String, String)],
 ) -> FrameGeometry {
     // Once per frame: a navigation/sort since the last frame starts a
     // fresh animation window (design slice 5) — see the `anim` module.
@@ -1388,12 +2012,19 @@ fn draw(
     // card below. Zen mode (`z`, design slice 5) collapses the cards row
     // and disk gauge the same way: table + footer + basket strip only.
     let basket_height = if ui.marked_summary().is_some() { 1 } else { 0 };
+    // D6: the filter pill takes a row the same way the basket strip does
+    // — `Length(0)` while no filter is active, so browsing without ever
+    // filtering never sees the layout shift. Sits just above the basket
+    // strip (both above the footer); with both active at once the two
+    // stack, each keeping its own line.
+    let pill_height = if ui.active_filter().is_some() { 1 } else { 0 };
     let (cards_height, gauge_height) = cards_and_gauge_heights(ui.zen());
     let [
         header_area,
         cards_area,
         gauge_area,
         main_area,
+        pill_area,
         basket_area,
         footer_area,
     ] = Layout::vertical([
@@ -1401,21 +2032,26 @@ fn draw(
         Constraint::Length(cards_height),
         Constraint::Length(gauge_height),
         Constraint::Min(3),
+        Constraint::Length(pill_height),
         Constraint::Length(basket_height),
         Constraint::Length(2),
     ])
     .areas(frame.area());
 
-    let outcome = match phase {
-        Phase::Done(outcome) => Some(outcome.as_ref()),
+    // Held for the whole frame (brief, synchronous) — every draw helper
+    // below that needs the frozen arena borrows through this one guard
+    // rather than each acquiring its own.
+    let outcome_guard = match phase {
+        Phase::Done(lock) => Some(read_outcome(lock)),
         _ => None,
     };
+    let outcome: Option<&ScanOutcome> = outcome_guard.as_deref();
 
     let breadcrumb = draw_header(frame, header_area, ui, spinner, ctx);
     let errors_card = if ui.zen() {
         None
     } else {
-        draw_metric_cards(frame, cards_area, snapshot, ctx)
+        draw_metric_cards(frame, cards_area, ui, ctx)
     };
     let gauge_freeable = if ui.zen() {
         None
@@ -1460,33 +2096,53 @@ fn draw(
                 frame,
                 table_area,
                 ui,
+                outcome,
                 table_state,
                 spinner,
                 &ranks,
                 bar_progress,
                 ctx,
             );
+            // D4 composition: under an active filter, the donut's slices
+            // and total follow the same filtered per-directory totals the
+            // table rows now show, instead of the raw unfiltered subtree.
             let slice_rows: Vec<(u64, Option<usize>)> = ui
                 .rows_indexed()
-                .map(|(index, row)| (row.disk, ranks.get(index).copied().flatten()))
+                .map(|(index, row)| {
+                    let disk = match (ui.active_filter(), row.dir) {
+                        (Some(filter), Some(dir)) => filter.result.dir_total(dir).disk,
+                        _ => row.disk,
+                    };
+                    (disk, ranks.get(index).copied().flatten())
+                })
                 .collect();
+            let total = ui
+                .active_filter()
+                .map(|filter| filter.result.dir_total(snapshot.dir).disk)
+                .unwrap_or(snapshot.totals.disk);
             let wheel_source = WheelSource {
                 slice_rows,
-                total: snapshot.totals.disk,
+                total,
                 caption: snapshot.path.display().to_string(),
             };
             (table, wheel_source)
         }
-        ViewMode::FlatTop => draw_flat_table(
-            frame,
-            table_area,
-            ui,
-            outcome,
-            table_state,
-            snapshot.stats.disk_bytes,
-            bar_progress,
-            ctx,
-        ),
+        ViewMode::FlatTop => {
+            let scan_disk_total = ui
+                .active_filter()
+                .map(|filter| filter.result.matched_disk)
+                .unwrap_or(snapshot.stats.disk_bytes);
+            draw_flat_table(
+                frame,
+                table_area,
+                ui,
+                outcome,
+                table_state,
+                scan_disk_total,
+                bar_progress,
+                ctx,
+            )
+        }
         ViewMode::Breakdown => {
             draw_breakdown_table(frame, table_area, ui, table_state, bar_progress, ctx)
         }
@@ -1500,22 +2156,26 @@ fn draw(
     let wheel =
         wheel_area.and_then(|wheel_area| draw_wheel(frame, wheel_area, &wheel_source, motion, ctx));
 
+    draw_filter_pill(frame, pill_area, ui, filter_fold_in_flight, ctx);
     draw_basket_strip(frame, basket_area, ui, ctx);
     draw_footer(frame, footer_area, ui, flash, ctx);
 
-    // Toasts must not obstruct the confirm modal (design slice 4): they
-    // sit top-right of the main content, well clear of the centered
-    // confirm dialog, but are skipped outright whenever it is open —
-    // simpler than reasoning about overlap and correct for every
+    // Toasts must not obstruct the confirm modal (design slice 4) or the
+    // palette (D6): they sit top-right of the main content, well clear of
+    // either's centered dialog, but are skipped outright whenever one is
+    // open — simpler than reasoning about overlap and correct for every
     // terminal size, not just the common ones.
-    if ui.confirm().is_none() {
+    if ui.confirm().is_none() && !ui.palette_open() {
         draw_toasts(frame, main_area, toasts, ctx);
     }
 
-    // Modal precedence (D5 extends design slice 4's ladder): confirm >
-    // review > freeable panel > cheatsheet.
+    // Modal precedence: the palette (D6) outranks everything (D5 extends
+    // design slice 4's ladder for the rest: confirm > review > freeable
+    // panel > cheatsheet).
     let mut freeable_rows = None;
-    if let Some(confirm) = ui.confirm() {
+    if let Some(palette) = ui.palette() {
+        draw_palette_modal(frame, palette, ui, phase, saved_queries, ctx);
+    } else if let Some(confirm) = ui.confirm() {
         draw_confirm_modal(frame, ui, confirm, ctx);
     } else if let Some(review) = ui.review() {
         draw_review_modal(frame, ui, review, ctx);
@@ -1659,9 +2319,10 @@ fn mode_badge_text(mode: ViewMode, summary: Option<&flat::FlatSummary>) -> Optio
 fn draw_metric_cards(
     frame: &mut Frame<'_>,
     area: Rect,
-    snapshot: &ViewSnapshot,
+    ui: &UiState,
     ctx: &RenderCtx,
 ) -> Option<(u16, u16, u16, u16)> {
+    let snapshot = ui.snapshot();
     let theme = &ctx.theme;
     let stats = &snapshot.stats;
     let error_entry = if stats.errors > 0 {
@@ -1669,13 +2330,24 @@ fn draw_metric_cards(
     } else {
         theme::MUTED
     };
+    // D4 composition: "total"/"entries" become the match set's own
+    // totals under an active filter — errors and the hardlink-inode count
+    // stay whole-scan concepts the filter has no opinion about.
+    let (total_label, total_bytes, entries) = match ui.active_filter() {
+        Some(filter) => (
+            "matched",
+            filter.result.matched_disk,
+            filter.result.matched_entries,
+        ),
+        None => ("total", stats.disk_bytes, stats.entries),
+    };
     let cards: [(&str, String, theme::Slot); 4] = [
         (
-            "total",
-            HumanSize(stats.disk_bytes).to_string(),
+            total_label,
+            HumanSize(total_bytes).to_string(),
             theme::ACCENT,
         ),
-        ("entries", stats.entries.to_string(), theme::INFO),
+        ("entries", entries.to_string(), theme::INFO),
         ("errors", stats.errors.to_string(), error_entry),
         (
             "hardlinks",
@@ -1784,6 +2456,7 @@ fn draw_table(
     frame: &mut Frame<'_>,
     area: Rect,
     ui: &UiState,
+    outcome: Option<&ScanOutcome>,
     table_state: &mut TableState,
     spinner: char,
     ranks: &[Option<usize>],
@@ -1831,10 +2504,26 @@ fn draw_table(
         Constraint::Min(10),
     ]);
 
-    let parent_disk = snapshot.totals.disk;
+    // D4 composition: under an active filter, a directory row's own
+    // subtree total is swapped for its *filtered* one (the row set itself
+    // is already filtered — see `UiState::ensure_sorted` — this is only
+    // the displayed numbers); `parent_disk` (the % column's denominator)
+    // follows the same swap so the percentages stay internally
+    // consistent with what they're a percentage *of*.
+    let active_filter = ui.active_filter();
+    let parent_disk = active_filter
+        .map(|filter| filter.result.dir_total(snapshot.dir).disk)
+        .unwrap_or(snapshot.totals.disk);
     let muted = theme.color(theme::MUTED);
     let coral = theme.color(theme::ERROR);
     let rows = ui.rows_indexed().map(|(index, row)| {
+        let (disk, apparent, items) = match (active_filter, row.dir) {
+            (Some(filter), Some(dir)) => {
+                let totals = filter.result.dir_total(dir);
+                (totals.disk, totals.apparent, totals.entries)
+            }
+            _ => (row.disk, row.apparent, row.items),
+        };
         let marked = ui.is_marked(row.node);
         let mark = if marked {
             Span::from("*").fg(coral).bold()
@@ -1848,7 +2537,7 @@ fn draw_table(
             RowState::Complete | RowState::File => Span::raw(" "),
         };
         let frac = if parent_disk > 0 {
-            row.disk as f64 / parent_disk as f64
+            disk as f64 / parent_disk as f64
         } else {
             0.0
         };
@@ -1873,11 +2562,29 @@ fn draw_table(
             ctx.ascii(),
         ))
         .fg(identity.unwrap_or(muted));
-        let name = String::from_utf8_lossy(&row.name).into_owned();
+        let mut name_text = String::from_utf8_lossy(&row.name).into_owned();
+        if row.is_dir {
+            name_text.push('/');
+        }
+        // D3/attack finding 1: a matched hardlink-extra row is present at
+        // 0 bytes (never silently absent) — flagged so the 0 makes sense
+        // instead of reading as "empty"; the pill spells out where the
+        // bytes are actually counted.
+        let is_extra = active_filter.is_some()
+            && !row.is_dir
+            && outcome.is_some_and(|outcome| {
+                outcome
+                    .node(row.node)
+                    .flags()
+                    .contains(NodeFlags::HARDLINK_EXTRA)
+            });
+        if is_extra {
+            name_text.push_str(" \u{26d3}");
+        }
         let name = if row.is_dir {
-            Span::from(format!("{name}/")).bold()
+            Span::from(name_text).bold()
         } else {
-            Span::from(name)
+            Span::from(name_text)
         };
         // Marked rows tint coral; otherwise the identity color (non-top-N
         // rows keep the default foreground).
@@ -1891,18 +2598,18 @@ fn draw_table(
         let mut cells = vec![
             Cell::from(mark),
             Cell::from(marker),
-            Cell::from(format!("{:>9}", HumanSize(row.disk).to_string())),
+            Cell::from(format!("{:>9}", HumanSize(disk).to_string())),
         ];
         if ui.show_apparent {
             cells.push(Cell::from(format!(
                 "{:>9}",
-                HumanSize(row.apparent).to_string()
+                HumanSize(apparent).to_string()
             )));
         }
         cells.extend([
             Cell::from(pct),
             Cell::from(bar),
-            Cell::from(format!("{:>8}", row.items)),
+            Cell::from(format!("{:>8}", items)),
             Cell::from(name),
         ]);
         TableRow::new(cells)
@@ -1967,10 +2674,16 @@ fn draw_flat_table(
         }
     };
 
-    let flat_rows = ui
-        .flat_summary()
-        .map(|summary| flatview::flat_rows(summary, outcome))
-        .unwrap_or_default();
+    // D4 composition: under an active filter, `t` shows the filtered top
+    // files ([`FilterResult::top_files`]) instead of the whole-scan
+    // summary — never a silent unfiltered list under a filtered header.
+    let flat_rows = match ui.active_filter() {
+        Some(filter) => flatview::filtered_flat_rows(&filter.result, outcome),
+        None => ui
+            .flat_summary()
+            .map(|summary| flatview::flat_rows(summary, outcome))
+            .unwrap_or_default(),
+    };
     let order = flatview::sort_flat_rows(&flat_rows, sort);
     let disks: Vec<u64> = flat_rows.iter().map(|row| row.disk).collect();
     let ranks = theme::assign_identity(&disks, theme::IDENTITY_LEN);
@@ -2126,15 +2839,25 @@ fn draw_breakdown_table(
         }
     };
 
-    let rows = ui
-        .flat_summary()
-        .map(flatview::breakdown_rows)
-        .unwrap_or_default();
+    // D4 composition / attack finding 6: under an active filter, `b`
+    // shows groups computed *over the match set*
+    // ([`FilterResult::groups`]/`rest`) — never the silent unfiltered
+    // groups under a filtered header the attack forbids.
+    let rows = match ui.active_filter() {
+        Some(filter) => flatview::filtered_breakdown_rows(&filter.result),
+        None => ui
+            .flat_summary()
+            .map(flatview::breakdown_rows)
+            .unwrap_or_default(),
+    };
     let order = flatview::sort_breakdown_rows(&rows, sort);
-    let total_disk = ui
-        .flat_summary()
-        .map(flatview::breakdown_total_disk)
-        .unwrap_or(0);
+    let total_disk = match ui.active_filter() {
+        Some(filter) => flatview::filtered_breakdown_total_disk(&filter.result),
+        None => ui
+            .flat_summary()
+            .map(flatview::breakdown_total_disk)
+            .unwrap_or(0),
+    };
     // Every row except the trailing uncategorized one gets a rank (never
     // that one — see the function doc); `rows.len() - 1` is always the
     // uncategorized row's position (`flatview::breakdown_rows` appends it
@@ -2590,6 +3313,38 @@ fn draw_basket_strip(frame: &mut Frame<'_>, area: Rect, ui: &UiState, ctx: &Rend
     );
 }
 
+/// Persistent one-line filter pill (D6), above the basket strip while a
+/// filter is active. `draw` reserves zero height otherwise, same idiom as
+/// [`draw_basket_strip`]. Content: query text, matched entries/bytes, the
+/// dir-inode residual explanation when nonzero, a hardlink-extra count
+/// when nonzero, and "Esc clears" (attack finding 12: true only from tree
+/// view with nothing else open — the Esc ladder in `handle_key` is what
+/// actually enforces that scope, this is just the label matching it). A
+/// spinner replaces the static glyph while a background fold is in flight
+/// (D5), so a debounced keystroke that hasn't landed yet is visibly
+/// "still computing" rather than silently stale-looking.
+fn draw_filter_pill(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    ui: &UiState,
+    fold_in_flight: bool,
+    ctx: &RenderCtx,
+) {
+    let Some(filter) = ui.active_filter() else {
+        return;
+    };
+    let theme = &ctx.theme;
+    let mut text = filterview::pill_text(&filter.query_text, &filter.result, ui.show_apparent);
+    if fold_in_flight {
+        let spinner = if ctx.ascii() { '*' } else { '⠋' };
+        text = format!("{spinner} {text}");
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::from(text).fg(theme.color(theme::ACCENT)))),
+        area,
+    );
+}
+
 /// Top-right transient notification stack (design slice 4): whatever is
 /// still active in the [`toast::ToastQueue`] this frame, one per row,
 /// growing down from `area`'s top-right corner (the caller passes the
@@ -2619,6 +3374,146 @@ fn draw_toasts(frame: &mut Frame<'_>, area: Rect, toasts: &[String], ctx: &Rende
             rect,
         );
     }
+}
+
+/// The Ctrl-K/`/` palette (D6): topmost modal, floating like the others.
+/// The input line renders with a block cursor; below it, one of three
+/// bodies depending on mode/phase/buffer: mid-scan query mode shows the
+/// "available once the scan completes" note (command mode still works,
+/// D2); an empty query-mode buffer lists saved queries
+/// (`camembert.toml`'s `[queries]`, D6); a nonempty one shows its live
+/// parse errors inline (span text + message, attack finding: broken terms
+/// are inert, never blocking further typing); command mode lists the
+/// fuzzy-matched commands with the current selection picked out.
+fn draw_palette_modal(
+    frame: &mut Frame<'_>,
+    palette: &palette::PaletteState,
+    ui: &UiState,
+    phase: &Phase,
+    saved_queries: &[(String, String)],
+    ctx: &RenderCtx,
+) {
+    let theme = &ctx.theme;
+    let area = frame.area();
+    let width = area
+        .width
+        .saturating_sub(4)
+        .clamp(30, 90)
+        .min(area.width.saturating_sub(2));
+
+    let mode = palette.mode();
+    let sigil = match mode {
+        PaletteMode::Command => ">",
+        PaletteMode::Query => "/",
+    };
+    let text = palette.text();
+    let chars: Vec<char> = text.chars().collect();
+    let cursor = palette.cursor();
+    // No dedicated background slot in the theme palette — a reverse-video
+    // cell is a portable, always-visible cursor block on every capability
+    // rung without needing one.
+    let cursor_style = Style::new().add_modifier(Modifier::REVERSED);
+    let mut input_spans = vec![
+        Span::from(format!("{sigil} "))
+            .fg(theme.color(theme::ACCENT))
+            .bold(),
+    ];
+    for (i, ch) in chars.iter().enumerate() {
+        let span = Span::from(ch.to_string());
+        input_spans.push(if i == cursor {
+            span.style(cursor_style)
+        } else {
+            span
+        });
+    }
+    if cursor == chars.len() {
+        input_spans.push(Span::from(" ").style(cursor_style));
+    }
+    let mut lines: Vec<Line<'_>> = vec![Line::from(input_spans), Line::default()];
+
+    match mode {
+        PaletteMode::Command => {
+            let commands = palette::all_commands();
+            let filtered = palette::filter_commands(&palette.content(), &commands);
+            if filtered.is_empty() {
+                lines.push(Line::from(Span::from("no matching commands").dim()));
+            }
+            let selected = palette.list_selected();
+            for (i, &index) in filtered.iter().enumerate().take(14) {
+                let cmd = commands[index];
+                let text = format!("{:<34} {}", cmd.label, cmd.hint);
+                lines.push(if i == selected {
+                    Line::from(Span::from(text).fg(theme.color(theme::ACCENT)).bold())
+                } else {
+                    Line::from(Span::from(text).dim())
+                });
+            }
+            lines.push(Line::default());
+            lines.push(Line::from("↑↓ select · Enter run · Esc close".dim()));
+        }
+        PaletteMode::Query => {
+            if matches!(phase, Phase::Scanning(_)) {
+                lines.push(Line::from(
+                    Span::from(
+                        "filter available once the scan completes — command mode (>) still works",
+                    )
+                    .fg(theme.color(theme::ACCENT))
+                    .italic(),
+                ));
+            } else if text.is_empty() {
+                if saved_queries.is_empty() {
+                    lines.push(Line::from(
+                        "type a query, or > for commands (Up/Down recalls history)".dim(),
+                    ));
+                } else {
+                    lines.push(Line::from(Span::from("saved queries").bold()));
+                    let selected = palette.list_selected();
+                    for (i, (label, query)) in saved_queries.iter().enumerate().take(14) {
+                        let text = format!("{label:<20} {query}");
+                        lines.push(if i == selected {
+                            Line::from(Span::from(text).fg(theme.color(theme::ACCENT)).bold())
+                        } else {
+                            Line::from(Span::from(text).dim())
+                        });
+                    }
+                }
+            } else {
+                let parsed = palette.parsed();
+                if parsed.query.is_empty() && !parsed.errors.is_empty() {
+                    lines.push(Line::from(
+                        Span::from("every term failed to parse — nothing to apply yet").dim(),
+                    ));
+                } else if !ui.active_filter().is_some_and(|f| {
+                    f.result.query_hash == parsed.query.fingerprint()
+                        && f.result.epoch == ui.flat_epoch()
+                }) {
+                    lines.push(Line::from("applying…".dim()));
+                }
+                for err in &parsed.errors {
+                    let snippet = text.get(err.span.start..err.span.end).unwrap_or("");
+                    lines.push(Line::from(vec![
+                        Span::from("  "),
+                        Span::from(format!("{snippet:?}"))
+                            .fg(theme.color(theme::ERROR))
+                            .bold(),
+                        Span::from(format!(" — {}", err.message))
+                            .fg(theme.color(theme::ERROR))
+                            .italic(),
+                    ]));
+                }
+            }
+            lines.push(Line::default());
+            lines.push(Line::from(
+                "Enter applies · Up/Down history · Esc close · > for commands".dim(),
+            ));
+        }
+    }
+
+    let title = match mode {
+        PaletteMode::Command => " commands ",
+        PaletteMode::Query => " filter ",
+    };
+    render_floating_modal(frame, ctx, area, width, lines, title, theme::ACCENT);
 }
 
 /// Centered confirmation modal: count, cumulative size, the first few
@@ -3000,7 +3895,7 @@ fn draw_cheatsheet_modal(frame: &mut Frame<'_>, ctx: &RenderCtx) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use camembert_core::view::{DirTotals, Row, ScanStats};
+    use camembert_core::view::{DirTotals, Row, ScanStats, ViewSnapshot};
     use caps::ColorLevel;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -3115,6 +4010,52 @@ mod tests {
         anim::Motion::new(false)
     }
 
+    /// D6: the palette modal (query mode empty/typed/erroring, command
+    /// mode, mid-scan, with saved queries and an active filter) renders
+    /// without panicking at every terminal size — the palette is
+    /// entirely new drawing code (the cursor span, the parse-error
+    /// lines, the command/saved-query lists) that no other render test
+    /// exercises.
+    #[test]
+    fn palette_modal_never_panics_across_sizes_and_states() {
+        let sizes = [(120, 35), (80, 24), (40, 10), (10, 5), (3, 2), (1, 1)];
+        let ctx = ctx(GlyphLevel::Sextant, ColorLevel::Truecolor);
+        let saved_queries = [("big_logs".to_owned(), "*.log >100M".to_owned())];
+
+        for (width, height) in sizes {
+            for (prefill, phase, saved) in [
+                (None, &Phase::Transitioning, &[][..]),
+                (Some("*.log"), &Phase::Transitioning, &[][..]),
+                (Some("a;b"), &Phase::Transitioning, &[][..]), // parse error
+                (Some(">flat"), &Phase::Transitioning, &[][..]), // command mode
+                (None, &Phase::Transitioning, &saved_queries[..]), // saved queries
+            ] {
+                let mut ui = UiState::new(sample_snapshot());
+                ui.open_palette(prefill);
+                let mut table_state = TableState::default();
+                let mut motion = no_motion();
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        draw(
+                            frame,
+                            &ui,
+                            phase,
+                            &mut table_state,
+                            '⠋',
+                            None,
+                            &[],
+                            &mut motion,
+                            &ctx,
+                            true, // fold in flight: exercises the spinner path too
+                            saved,
+                        );
+                    })
+                    .unwrap();
+            }
+        }
+    }
+
     /// The cockpit renders without panicking at every size and capability
     /// rung — including degenerate terminals ("no panics at tiny sizes").
     #[test]
@@ -3153,6 +4094,8 @@ mod tests {
                             &[],
                             &mut motion,
                             &ctx,
+                            false,
+                            &[],
                         );
                     })
                     .unwrap();
@@ -3205,6 +4148,8 @@ mod tests {
                                     &[],
                                     &mut motion,
                                     &ctx,
+                                    false,
+                                    &[],
                                 );
                             })
                             .unwrap();
@@ -3273,6 +4218,8 @@ mod tests {
                         &[],
                         &mut motion,
                         &ctx,
+                        false,
+                        &[],
                     );
                 })
                 .unwrap();
@@ -3378,6 +4325,8 @@ mod tests {
                     &[],
                     &mut motion,
                     &ctx,
+                    false,
+                    &[],
                 );
             })
             .unwrap();
@@ -3405,6 +4354,8 @@ mod tests {
                     &[],
                     &mut motion,
                     &ctx,
+                    false,
+                    &[],
                 );
             })
             .unwrap();
@@ -3445,6 +4396,8 @@ mod tests {
                     &[],
                     &mut motion,
                     &ctx,
+                    false,
+                    &[],
                 );
             })
             .unwrap();
@@ -3477,6 +4430,8 @@ mod tests {
                     toasts,
                     &mut motion,
                     &ctx,
+                    false,
+                    &[],
                 );
             })
             .unwrap();
@@ -3566,6 +4521,8 @@ mod tests {
                         &[],
                         &mut motion,
                         &ctx,
+                        false,
+                        &[],
                     );
                 })
                 .unwrap();
@@ -3603,6 +4560,8 @@ mod tests {
                         &[],
                         &mut motion,
                         &ctx,
+                        false,
+                        &[],
                     );
                 })
                 .unwrap();
@@ -3650,7 +4609,7 @@ mod tests {
             false,
         );
         let ui = UiState::new(Arc::new(snapshot));
-        (ui, Phase::Done(Box::new(outcome)))
+        (ui, Phase::Done(Arc::new(RwLock::new(outcome))))
     }
 
     fn press(
@@ -3661,6 +4620,11 @@ mod tests {
         flash: &mut Flash,
         toasts: &mut ToastQueue,
     ) -> Action {
+        // A fresh runtime per call is fine here: none of the pre-existing
+        // routing tests exercise the palette (their own dedicated tests
+        // below construct/thread a `PaletteRuntime` explicitly instead).
+        let mut palette_rt = PaletteRuntime::new(Vec::new());
+        let flat_config = FlatConfig::default();
         handle_key(
             code,
             KeyModifiers::NONE,
@@ -3670,6 +4634,8 @@ mod tests {
             flash,
             toasts,
             false, // no_proc_sweep: not under test here
+            &mut palette_rt,
+            &flat_config,
         )
     }
 
@@ -3731,7 +4697,73 @@ mod tests {
             false,
         );
         let ui = UiState::new(Arc::new(snapshot));
-        (ui, Phase::Done(Box::new(outcome)), tmp)
+        (ui, Phase::Done(Arc::new(RwLock::new(outcome))), tmp)
+    }
+
+    /// D4 composition, end-to-end: applying a real filter over a real
+    /// two-file scan hides the non-matching row from the tree table and
+    /// renders the pill, without panicking — the render-level counterpart
+    /// to `state`'s `directory_marks_are_refused_under_an_active_filter...`
+    /// and `a_filter_that_matches_nothing_hides_every_row...` tests, which
+    /// cover the same composition at the `UiState` level.
+    #[test]
+    fn filtered_render_shows_the_pill_and_hides_the_non_matching_row() {
+        let (mut ui, phase, _tmp) = done_ui_with_two_files();
+        let parsed = query::parse("big");
+        assert!(parsed.errors.is_empty());
+        let Phase::Done(lock) = &phase else {
+            panic!("done_ui_with_two_files always returns Phase::Done")
+        };
+        let outcome = read_outcome(lock);
+        let hardlinks = HardlinkIndex::build(&outcome, 0);
+        let result = query::apply(
+            outcome.tree(),
+            &parsed.query,
+            &FlatConfig::default().patterns,
+            &hardlinks,
+            &ApplyOptions {
+                cap: 10,
+                epoch: 0,
+                now_unix: 0,
+                threads: 1,
+            },
+        );
+        drop(outcome);
+        ui.set_active_filter("big".to_owned(), Arc::new(result));
+        assert_eq!(ui.row_count(), 1, "only the matching file survives");
+
+        let ctx = ctx(GlyphLevel::Sextant, ColorLevel::Truecolor);
+        let mut table_state = TableState::default();
+        let mut motion = no_motion();
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &ui,
+                    &phase,
+                    &mut table_state,
+                    '⠋',
+                    None,
+                    &[],
+                    &mut motion,
+                    &ctx,
+                    false,
+                    &[],
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("big"), "the matching file is shown: {text}");
+        assert!(
+            !text.contains("small"),
+            "the non-matching file must be hidden: {text}"
+        );
+        assert!(
+            text.contains("matched"),
+            "the pill/cards mention the match: {text}"
+        );
     }
 
     /// `t`/`b` toggle into and back out of their modes through the real
@@ -3851,7 +4883,7 @@ mod tests {
             false,
         );
         let mut ui = UiState::new(Arc::new(snapshot));
-        let mut phase = Phase::Done(Box::new(outcome));
+        let mut phase = Phase::Done(Arc::new(RwLock::new(outcome)));
         let flat_config = FlatConfig::default();
         let (mut generation, mut flash, mut toasts) = (1u64, Flash::new(), ToastQueue::new());
         let mut press_code = |code, ui: &mut UiState, phase: &mut Phase| {
@@ -4211,6 +5243,8 @@ mod tests {
                         &[],
                         &mut motion,
                         &ctx,
+                        false,
+                        &[],
                     );
                 })
                 .unwrap();

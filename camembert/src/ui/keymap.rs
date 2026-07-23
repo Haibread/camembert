@@ -180,12 +180,18 @@ pub const EXTRA: &[ExtraKey] = &[
         action: "freeable files: deleted-but-open files holding disk space (f/Esc closes)",
     },
     ExtraKey {
+        keys: "Ctrl-K, /",
+        action: "open the filter/command palette (query-first; > switches to commands; \
+                 while open, every key but Esc/Enter/arrows/Ctrl-C is text, q included)",
+    },
+    ExtraKey {
         keys: "Esc",
-        action: "close a modal, else leave the flat/breakdown mode, else quit [from tree]",
+        action: "close the palette, else a modal, else leave the flat/breakdown mode, \
+                 else clear an active filter, else quit [from tree]",
     },
     ExtraKey {
         keys: "q, Ctrl-C",
-        action: "quit (cancels a running scan)",
+        action: "quit (cancels a running scan); inside the palette only Ctrl-C quits",
     },
 ];
 

@@ -20,6 +20,7 @@ fn bin() -> Command {
         "TOP",
         "NO_UI",
         "OUTPUT",
+        "FILTER",
         "JSON_OUTPUT",
         "THRESHOLD",
         "LOG_FILTER",
@@ -411,4 +412,121 @@ fn dump_to_stdout_suppresses_the_summary_including_the_top_files_block() {
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(!text.contains("Top"), "no summary text of any kind: {text}");
     assert!(!text.contains("Scanned"), "{text}");
+}
+
+// ---- D7: --filter/FILTER in the --no-ui summary ----
+
+#[test]
+fn filter_summary_shows_matched_totals_and_only_the_matching_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tree = dir.path().join("tree");
+    fs::create_dir_all(&tree).unwrap();
+    write_file(&tree.join("keep.log"), 8192);
+    write_file(&tree.join("skip.bin"), 8192);
+
+    let output = run(&[
+        tree.to_str().unwrap(),
+        "--no-ui",
+        "--top",
+        "5",
+        "--filter",
+        "*.log",
+    ]);
+    assert_eq!(code(&output), 0, "{output:?}");
+    let text = stdout(&output);
+    assert!(text.contains("matched (--filter"), "{text}");
+    assert!(
+        text.contains("Top 5 matched files by real size:"),
+        "matched-files header present: {text}"
+    );
+    assert!(text.contains("keep.log"), "{text}");
+    assert!(
+        !text.contains("skip.bin"),
+        "the non-matching file must never appear: {text}"
+    );
+}
+
+#[test]
+fn filter_with_a_parse_error_exits_2_and_never_scans() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tree = dir.path().join("tree");
+    fs::create_dir_all(&tree).unwrap();
+    write_file(&tree.join("f"), 4096);
+
+    // `;` is a reserved sigil (D1): guaranteed unparseable today.
+    let output = run(&[tree.to_str().unwrap(), "--no-ui", "--filter", "a;b"]);
+    assert_eq!(code(&output), 2, "{output:?}");
+    let text = stdout(&output);
+    assert!(
+        !text.contains("Scanned"),
+        "the scan must not have run: {text}"
+    );
+    let err = String::from_utf8_lossy(&output.stderr);
+    assert!(err.contains("--filter"), "{err}");
+}
+
+#[test]
+fn filter_env_var_is_honored_like_the_flag() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tree = dir.path().join("tree");
+    fs::create_dir_all(&tree).unwrap();
+    write_file(&tree.join("keep.log"), 4096);
+
+    let output = bin()
+        .args([tree.to_str().unwrap(), "--no-ui"])
+        .env("FILTER", "*.log")
+        .output()
+        .expect("run camembert");
+    assert_eq!(code(&output), 0, "{output:?}");
+    assert!(stdout(&output).contains("matched (--filter"));
+}
+
+#[test]
+fn filter_dump_to_stdout_is_never_filtered() {
+    // -o - always dumps the whole, unfiltered scan (D7): the filter only
+    // affects the summary text, which is suppressed anyway on this path.
+    // Verified by diffing an empty-tree baseline against this dump and
+    // checking *both* files (matching and non-matching) show up added —
+    // a filtered dump would only ever show the matching one.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tree = dir.path().join("tree");
+    fs::create_dir_all(&tree).unwrap();
+    write_file(&tree.join("keep.log"), 4096);
+    write_file(&tree.join("skip.bin"), 4096);
+
+    let empty = dir.path().join("empty");
+    fs::create_dir_all(&empty).unwrap();
+    let empty_dump = dir.path().join("empty.cmbt");
+    scan_to_dump(&empty, &empty_dump);
+
+    let output = run(&[
+        tree.to_str().unwrap(),
+        "--no-ui",
+        "-o",
+        "-",
+        "--filter",
+        "*.log",
+    ]);
+    assert_eq!(code(&output), 0, "{output:?}");
+    assert_eq!(
+        &output.stdout[..4.min(output.stdout.len())],
+        &[0x28, 0xB5, 0x2F, 0xFD][..],
+        "stdout is still exactly the dump stream"
+    );
+    let dump_path = dir.path().join("filtered_scan.cmbt");
+    fs::write(&dump_path, &output.stdout).unwrap();
+
+    let diff_output = run(&[
+        "diff",
+        empty_dump.to_str().unwrap(),
+        dump_path.to_str().unwrap(),
+        "--json",
+    ]);
+    assert_eq!(code(&diff_output), 0, "{diff_output:?}");
+    let text = stdout(&diff_output);
+    assert!(text.contains("keep.log"), "{text}");
+    assert!(
+        text.contains("skip.bin"),
+        "the non-matching file is still in the dump, unfiltered: {text}"
+    );
 }

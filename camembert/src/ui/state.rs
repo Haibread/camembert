@@ -9,10 +9,12 @@ use std::sync::Arc;
 
 use camembert_core::flat::FlatSummary;
 use camembert_core::freeable::Ledger;
+use camembert_core::query::FilterResult;
 use camembert_core::tree::{DirId, NodeId};
 use camembert_core::view::{Row, ViewSnapshot};
 
 use super::freeable_panel::{FreeableGroup, OpenWarning};
+use super::palette::PaletteState;
 
 /// Which table mode is active (D3, `docs/design/flat-view-decisions.md`):
 /// the tree browser, or one of the two flat-view modes toggled by `t`/`b`.
@@ -109,6 +111,25 @@ pub enum MarkRefusal {
     /// it would act blind. (Rows in state Error stay markable — deleting
     /// an unreadable directory is a legitimate cleanup.)
     MountPoint,
+    /// D4: a directory row under an active filter shows only its matching
+    /// descendants — marking it would delete everything in it, matched or
+    /// not (the "42 MB shown / 300 GB deleted" trap query-attack-a warns
+    /// about). File marks are unaffected; clear the filter first to mark
+    /// a directory.
+    FilterActive,
+}
+
+/// The currently applied filter (D2/D4/D6, `docs/design/query-decisions.md`):
+/// the query text as typed (the pill's label, and what re-opening the
+/// palette pre-fills) alongside the last accepted [`FilterResult`].
+/// `ui.rs` only ever calls [`UiState::set_active_filter`] after checking
+/// the (query fingerprint, deletion epoch) guard itself (D5) — a stale
+/// background fold never reaches this far, so whatever is stored here is
+/// always the freshest applied result.
+#[derive(Debug, Clone)]
+pub struct ActiveFilter {
+    pub query_text: String,
+    pub result: Arc<FilterResult>,
 }
 
 /// State of the delete-confirmation modal, opened by
@@ -266,12 +287,17 @@ impl FrameGeometry {
 }
 
 /// Cache key for the sorted permutation: re-sort only when any part
-/// changes (new generation, different dir, or different sort).
+/// changes (new generation, different dir, different sort, or the active
+/// filter's identity — D4 composition: the tree table's row *set*, not
+/// just its totals, changes under a filter).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OrderKey {
     generation: u64,
     dir: DirId,
     sort: SortSpec,
+    /// `(query fingerprint, deletion epoch)` of the applied
+    /// [`ActiveFilter::result`], `None` with no filter active.
+    filter: Option<(u64, u64)>,
 }
 
 /// The interactive session state around the current snapshot.
@@ -371,8 +397,22 @@ pub struct UiState {
     /// (D2/D3): the flat/breakdown summary is recomputed whenever this
     /// disagrees with the cached summary's `epoch`, so a delete performed
     /// *from within* a flat/breakdown mode can never leave a stale,
-    /// already-deleted row on screen past the very next frame.
+    /// already-deleted row on screen past the very next frame. Dual
+    /// -purpose since the query filter (D5, D6) landed: `ui.rs` also
+    /// stamps every background filter fold request with this same value
+    /// and drops the result on arrival if it has since moved — one
+    /// deletion epoch serves both recompute paths, rather than inventing
+    /// a second counter for what is the same underlying event ("the
+    /// frozen arena just changed under a live view").
     flat_epoch: u64,
+    /// `Some` while the Ctrl-K/`/` palette is open (D6); every keystroke
+    /// but Esc/Enter/arrows/Ctrl-C belongs to it while it is (see
+    /// `ui::handle_key`'s topmost precedence rung).
+    palette: Option<PaletteState>,
+    /// The currently applied filter (D2/D4/D5/D6), `None` when no filter
+    /// is active. Composition (tree/t/b totals, dir-mark refusal, the
+    /// pill) all key off this.
+    filter: Option<ActiveFilter>,
 }
 
 impl UiState {
@@ -405,6 +445,8 @@ impl UiState {
             mode: ViewMode::default(),
             flat: None,
             flat_epoch: 0,
+            palette: None,
+            filter: None,
         };
         state.ensure_sorted();
         state
@@ -683,6 +725,13 @@ impl UiState {
         if row.is_dir && row.dir.is_none() {
             return Err(MarkRefusal::MountPoint);
         }
+        // D4: a directory under an active filter shows only its matching
+        // descendants — marking it would delete everything inside it,
+        // matched or not. File marks are unaffected (checked implicitly:
+        // this branch only fires for `is_dir` rows).
+        if row.is_dir && self.filter.is_some() {
+            return Err(MarkRefusal::FilterActive);
+        }
         use std::os::unix::ffi::OsStrExt;
         let entry = MarkedEntry {
             node: row.node,
@@ -930,10 +979,15 @@ impl UiState {
     }
 
     fn ensure_sorted(&mut self) {
+        let filter_id = self
+            .filter
+            .as_ref()
+            .map(|f| (f.result.query_hash, f.result.epoch));
         let key = OrderKey {
             generation: self.snapshot.generation,
             dir: self.snapshot.dir,
             sort: self.sort,
+            filter: filter_id,
         };
         if self.order_key == Some(key) {
             return;
@@ -962,6 +1016,28 @@ impl UiState {
             // by the direction toggle.
             primary.then_with(|| ra.name.cmp(&rb.name))
         });
+        // D4 composition: under an active filter, a scanned-directory row
+        // is kept only when its filtered subtree has a match (its own
+        // totals are swapped for the filtered ones at render time, in
+        // `ui.rs`'s `draw_table`); every other row (file, symlink, device,
+        // or an excluded-mount/stat-failed dir stub — all candidates in
+        // their own right) is kept only when it is itself in the match
+        // set, hardlink extras included (attack finding 1: present at 0
+        // bytes, never silently absent). This is exactly the row set
+        // `Self::row_count`/`Self::rows_indexed`/`Self::selected` already
+        // read through `self.order`, so the cursor, mouse hit-testing and
+        // mark toggling automatically agree with what's rendered without
+        // any of them needing to know a filter exists.
+        if let Some(filter) = self.filter.as_ref() {
+            let result = &filter.result;
+            self.order.retain(|&i| {
+                let row = &rows[i];
+                match row.dir {
+                    Some(dir) => result.dir_total(dir).entries > 0,
+                    None => result.matched.contains(row.node),
+                }
+            });
+        }
     }
 
     fn clamp_cursor(&mut self) {
@@ -1112,6 +1188,73 @@ impl UiState {
         }
         self.move_down();
         Ok(())
+    }
+
+    // ---- Ctrl-K / `/` palette (D6) ----
+
+    /// Open the palette. `prefill` pre-fills the buffer (used when a
+    /// filter is already active: the query stays visible and editable
+    /// rather than vanishing into an empty box behind its own effect);
+    /// `None`/empty opens with an empty buffer. Always succeeds — even
+    /// mid-scan (D2: only *applying* a query is gated, not opening the
+    /// palette or using command mode).
+    pub fn open_palette(&mut self, prefill: Option<&str>) {
+        self.palette = Some(match prefill {
+            Some(text) if !text.is_empty() => PaletteState::with_text(text),
+            _ => PaletteState::new(),
+        });
+    }
+
+    /// Close the palette (Esc, or committing a query/command with Enter).
+    /// Never touches [`Self::filter`] — whatever was last applied (live,
+    /// while typing) stays active (attack finding 12's off-by-one: closing
+    /// the palette must not also clear the filter).
+    pub fn close_palette(&mut self) {
+        self.palette = None;
+    }
+
+    pub fn palette_open(&self) -> bool {
+        self.palette.is_some()
+    }
+
+    pub fn palette(&self) -> Option<&PaletteState> {
+        self.palette.as_ref()
+    }
+
+    pub fn palette_mut(&mut self) -> Option<&mut PaletteState> {
+        self.palette.as_mut()
+    }
+
+    // ---- active filter (D2/D4/D5/D6) ----
+
+    pub fn active_filter(&self) -> Option<&ActiveFilter> {
+        self.filter.as_ref()
+    }
+
+    /// Adopt a freshly accepted filter result. Callers (`ui.rs`) only
+    /// reach this after the (fingerprint, epoch) staleness check on the
+    /// background fold's arrival — never called with a stale result.
+    /// Re-sorts immediately (D4: the row *set* changes, not just totals)
+    /// and clamps the cursor/hover the same way a mode switch does.
+    pub fn set_active_filter(&mut self, query_text: String, result: Arc<FilterResult>) {
+        self.filter = Some(ActiveFilter { query_text, result });
+        self.ensure_sorted();
+        self.clamp_cursor();
+        self.clear_hover();
+        self.view_change_seq += 1;
+    }
+
+    /// Clear the active filter (Esc from tree view with nothing else to
+    /// close, or the "clear active filter" palette command). A no-op when
+    /// nothing is active; otherwise restores every row and re-sorts.
+    pub fn clear_filter(&mut self) {
+        if self.filter.take().is_none() {
+            return;
+        }
+        self.ensure_sorted();
+        self.clamp_cursor();
+        self.clear_hover();
+        self.view_change_seq += 1;
     }
 }
 
@@ -2145,5 +2288,208 @@ mod tests {
             state.flat_summary().is_none(),
             "epoch and summary are independent"
         );
+    }
+
+    // ---- Ctrl-K / `/` palette + active filter (D6) ----
+
+    #[test]
+    fn palette_opens_empty_or_prefilled_and_closes() {
+        let mut state = UiState::new(snapshot(1, 0, None, Vec::new(), true));
+        assert!(!state.palette_open());
+        state.open_palette(None);
+        assert!(state.palette_open());
+        assert_eq!(state.palette().unwrap().text(), "");
+        state.close_palette();
+        assert!(!state.palette_open());
+
+        state.open_palette(Some("*.log"));
+        assert_eq!(state.palette().unwrap().text(), "*.log");
+    }
+
+    #[test]
+    fn closing_the_palette_never_clears_an_active_filter() {
+        // Attack finding 12's off-by-one: Esc that closes the palette must
+        // not also clear the filter it just applied.
+        let mut state = UiState::new(snapshot(1, 0, None, Vec::new(), true));
+        let result = std::sync::Arc::new(sample_filter_result());
+        state.set_active_filter("*.log".to_owned(), result);
+        state.open_palette(Some("*.log"));
+        state.close_palette();
+        assert!(!state.palette_open());
+        assert!(
+            state.active_filter().is_some(),
+            "closing the palette must not clear the filter"
+        );
+        state.clear_filter();
+        assert!(state.active_filter().is_none());
+    }
+
+    /// A synthetic `FilterResult`, built with the real `apply()` over a
+    /// trivially empty tree — `FilterResult`'s fields are mostly private
+    /// to `camembert-core` by design (see `filterview.rs`'s own tests),
+    /// so every test here that needs one goes through the public engine
+    /// entry point rather than a hand-built literal.
+    fn sample_filter_result() -> camembert_core::query::FilterResult {
+        use camembert_core::flat::PatternSet;
+        use camembert_core::query::{ApplyOptions, HardlinkIndex, apply, parse};
+        use camembert_core::scan::{ScanOptions, Scanner};
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("a.log"), b"hi").unwrap();
+        let mut outcome = Scanner::new(ScanOptions {
+            statx_engine: Default::default(),
+            threads: 1,
+            cross_filesystems: false,
+        })
+        .scan(tmp.path())
+        .expect("scan");
+        outcome.finalize_hardlinks();
+        let parsed = parse("*.log");
+        let hardlinks = HardlinkIndex::build(&outcome, 0);
+        apply(
+            outcome.tree(),
+            &parsed.query,
+            &PatternSet::default(),
+            &hardlinks,
+            &ApplyOptions {
+                cap: 10,
+                epoch: 0,
+                now_unix: 0,
+                threads: 1,
+            },
+        )
+    }
+
+    #[test]
+    fn directory_marks_are_refused_under_an_active_filter_but_files_are_fine() {
+        use camembert_core::flat::PatternSet;
+        use camembert_core::query::{ApplyOptions, HardlinkIndex, apply, parse};
+        use camembert_core::scan::{ScanOptions, Scanner};
+        use camembert_core::view;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("keep.log"), b"hello").unwrap();
+        std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
+        std::fs::write(tmp.path().join("sub/other.log"), b"world").unwrap();
+
+        let mut outcome = Scanner::new(ScanOptions {
+            statx_engine: Default::default(),
+            threads: 1,
+            cross_filesystems: false,
+        })
+        .scan(tmp.path())
+        .expect("scan");
+        outcome.finalize_hardlinks();
+        let stats = view::scan_stats(outcome.tree(), outcome.root(), outcome.elapsed);
+        let snapshot = view::build_snapshot(
+            outcome.tree(),
+            outcome.root(),
+            1,
+            stats,
+            outcome.hardlink_inodes,
+            false,
+        );
+        let mut state = UiState::new(Arc::new(snapshot));
+
+        let parsed = parse("*.log");
+        assert!(parsed.errors.is_empty());
+        let hardlinks = HardlinkIndex::build(&outcome, 0);
+        let result = apply(
+            outcome.tree(),
+            &parsed.query,
+            &PatternSet::default(),
+            &hardlinks,
+            &ApplyOptions {
+                cap: 10,
+                epoch: 0,
+                now_unix: 0,
+                threads: 1,
+            },
+        );
+        state.set_active_filter("*.log".to_owned(), Arc::new(result));
+
+        // Both rows survive: "keep.log" matches directly, "sub" has a
+        // matching descendant ("sub/other.log").
+        assert_eq!(state.row_count(), 2, "neither row is fully unmatched");
+        let file_position = state
+            .rows_indexed()
+            .position(|(_, row)| !row.is_dir)
+            .expect("the file row survived the filter");
+        let dir_position = state
+            .rows_indexed()
+            .position(|(_, row)| row.is_dir)
+            .expect("the directory row survived the filter");
+
+        state.select_at(file_position);
+        assert_eq!(state.toggle_mark(), Ok(()), "file marks still work");
+        assert_eq!(state.marks().len(), 1);
+
+        state.select_at(dir_position);
+        assert_eq!(
+            state.toggle_mark(),
+            Err(MarkRefusal::FilterActive),
+            "directory marks refused while a filter is active"
+        );
+        assert_eq!(state.marks().len(), 1, "the refused mark did not land");
+
+        state.clear_filter();
+        state.select_at(dir_position);
+        assert_eq!(
+            state.toggle_mark(),
+            Ok(()),
+            "clearing the filter restores directory marking"
+        );
+        assert_eq!(state.marks().len(), 2);
+    }
+
+    #[test]
+    fn a_filter_that_matches_nothing_hides_every_row_but_stays_navigable() {
+        use camembert_core::flat::PatternSet;
+        use camembert_core::query::{ApplyOptions, HardlinkIndex, apply, parse};
+        use camembert_core::scan::{ScanOptions, Scanner};
+        use camembert_core::view;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("a.bin"), b"hello").unwrap();
+        let mut outcome = Scanner::new(ScanOptions {
+            statx_engine: Default::default(),
+            threads: 1,
+            cross_filesystems: false,
+        })
+        .scan(tmp.path())
+        .expect("scan");
+        outcome.finalize_hardlinks();
+        let stats = view::scan_stats(outcome.tree(), outcome.root(), outcome.elapsed);
+        let snapshot = view::build_snapshot(
+            outcome.tree(),
+            outcome.root(),
+            1,
+            stats,
+            outcome.hardlink_inodes,
+            false,
+        );
+        let mut state = UiState::new(Arc::new(snapshot));
+        let parsed = parse("*.nomatch");
+        let hardlinks = HardlinkIndex::build(&outcome, 0);
+        let result = apply(
+            outcome.tree(),
+            &parsed.query,
+            &PatternSet::default(),
+            &hardlinks,
+            &ApplyOptions {
+                cap: 10,
+                epoch: 0,
+                now_unix: 0,
+                threads: 1,
+            },
+        );
+        state.set_active_filter("*.nomatch".to_owned(), Arc::new(result));
+        // Attack finding 10's amendment: the viewed dir always renders
+        // (here as a legitimately empty table), never panics, and the
+        // cursor stays sanely at 0 rather than pointing past the end.
+        assert_eq!(state.row_count(), 0);
+        assert_eq!(state.cursor(), 0);
+        assert!(state.selected().is_none());
+        state.move_down();
+        assert_eq!(state.cursor(), 0);
     }
 }

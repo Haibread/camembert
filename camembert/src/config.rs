@@ -61,6 +61,11 @@ pub struct FileConfig {
     /// the entries are actually pushed; `main` combines both counts into
     /// one startup toast.
     pub pattern_warnings: Vec<String>,
+    /// `[queries]` entries in file order: `(label, query string)` (D6).
+    /// Read-only — the palette shows them when its input is empty; there
+    /// is no way to write one back from the UI. Same per-entry resilience
+    /// as `[patterns]`: only well-typed (string) entries make it here.
+    pub queries: Vec<(String, String)>,
 }
 
 /// `$XDG_CONFIG_HOME/camembert/camembert.toml`, falling back to
@@ -118,6 +123,7 @@ fn parse(text: &str, path: &Path) -> FileConfig {
     take_scalar(&mut table, "no_motion", path, &mut cfg.no_motion);
     take_scalar(&mut table, "flat_cap", path, &mut cfg.flat_cap);
     take_patterns(&mut table, path, &mut cfg);
+    take_queries(&mut table, path, &mut cfg);
 
     if !table.is_empty() {
         let keys: Vec<&String> = table.keys().collect();
@@ -186,6 +192,38 @@ fn take_patterns(table: &mut toml::Table, path: &Path, cfg: &mut FileConfig) {
                 let reason = format!("[patterns].{label} is not a string: ignoring");
                 warn!(path = %path.display(), label, value = ?other, "{reason}");
                 cfg.pattern_warnings.push(reason);
+            }
+        }
+    }
+}
+
+/// Pull `[queries]` out of `table` and validate it entry-by-entry (D6,
+/// mirroring [`take_patterns`]'s per-entry resilience): each `label =
+/// "query string"` pair that is not a string is dropped with a warning,
+/// the rest of the table still loads; a `queries` key that isn't a table
+/// at all drops the whole section the same way, leaving every other
+/// config key untouched.
+fn take_queries(table: &mut toml::Table, path: &Path, cfg: &mut FileConfig) {
+    let Some(value) = table.remove("queries") else {
+        return;
+    };
+    let toml::Value::Table(entries) = value else {
+        warn!(
+            path = %path.display(),
+            "[queries] must be a table of label = \"query string\": ignoring"
+        );
+        return;
+    };
+    for (label, entry) in entries {
+        match entry {
+            toml::Value::String(query) => cfg.queries.push((label, query)),
+            other => {
+                warn!(
+                    path = %path.display(),
+                    label,
+                    value = ?other,
+                    "[queries].{label} is not a string: ignoring"
+                );
             }
         }
     }
@@ -359,6 +397,7 @@ mod tests {
                 flat_cap: Some(500),
                 patterns: Vec::new(),
                 pattern_warnings: Vec::new(),
+                queries: Vec::new(),
             }
         );
     }
@@ -476,6 +515,43 @@ mod tests {
             ],
             "file order preserved, not alphabetized"
         );
+    }
+
+    // ---- D6: [queries] resilience ----
+
+    #[test]
+    fn queries_parse_in_file_order() {
+        let cfg = parse(
+            "[queries]\nbig_logs = \"*.log >100M\"\nold = \"older:1y\"\n",
+            Path::new("camembert.toml"),
+        );
+        assert_eq!(
+            cfg.queries,
+            vec![
+                ("big_logs".to_owned(), "*.log >100M".to_owned()),
+                ("old".to_owned(), "older:1y".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_broken_queries_entry_does_not_reset_theme_or_the_good_entries() {
+        let cfg = parse(
+            "theme = \"light\"\n[queries]\nbad = 5\ngood = \"*.tmp\"\n",
+            Path::new("camembert.toml"),
+        );
+        assert_eq!(cfg.theme, Some(ThemeName::Light));
+        assert_eq!(cfg.queries, vec![("good".to_owned(), "*.tmp".to_owned())]);
+    }
+
+    #[test]
+    fn queries_not_a_table_is_dropped_alone() {
+        let cfg = parse(
+            "theme = \"light\"\nqueries = \"oops\"\n",
+            Path::new("camembert.toml"),
+        );
+        assert_eq!(cfg.theme, Some(ThemeName::Light));
+        assert!(cfg.queries.is_empty());
     }
 
     // ---- build_flat_config ----

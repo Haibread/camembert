@@ -117,13 +117,18 @@ camembert diff yesterday.cmbt today.cmbt --threshold 500M --json
 # Already have ncdu exports? Bring them along — no rescan needed
 camembert import old-ncdu-export.json -o old.cmbt
 camembert diff old.cmbt today.cmbt
+
+# Filter the summary to what matters (see Filtering below); a bad query
+# exits 2 with every parse error, before wasting time on a scan
+camembert /var --no-ui --filter '*.log >100M !older:1y'
 ```
 
 Every option is also an environment variable (`THREADS`,
-`CROSS_FILESYSTEMS`, `STATX_ENGINE`, `TOP`, `NO_UI`, `OUTPUT`, `THRESHOLD`, `COLOR`,
-`THEME`, `NO_MOTION`, `NO_PROC_SWEEP`, `LOG_FILTER`, `LOG_FILE`, …) — see
-`camembert --help` and `camembert <subcommand> --help` for the full
-reference, including the interactive key map and the diff JSON schema.
+`CROSS_FILESYSTEMS`, `STATX_ENGINE`, `TOP`, `NO_UI`, `OUTPUT`, `FILTER`,
+`THRESHOLD`, `COLOR`, `THEME`, `NO_MOTION`, `NO_PROC_SWEEP`,
+`LOG_FILTER`, `LOG_FILE`, …) — see `camembert --help` and
+`camembert <subcommand> --help` for the full reference, including the
+interactive key map and the diff JSON schema.
 
 | Flag | Env | What it does |
 | --- | --- | --- |
@@ -132,7 +137,8 @@ reference, including the interactive key map and the diff JSON schema.
 | `--statx-engine` | `STATX_ENGINE` | **experimental** — stat engine: `auto` (io_uring for ≤ 2-worker scans, probed, sync otherwise), `sync`, `io_uring` (see below) |
 | `--top` | `TOP` | entries in the summary's "top directories" **and** "top files" (D5) lists — one flag, two lists; the interactive `t` mode's own cap is the separate `flat_cap` config key |
 | `--no-ui` | `NO_UI` | summary mode: scan to completion, print totals, top directories, top files, no TUI |
-| `-o`/`--output` | `OUTPUT` | write a `.cmbt` dump once the scan completes (`-` = stdout) |
+| `-o`/`--output` | `OUTPUT` | write a `.cmbt` dump once the scan completes (`-` = stdout); **never** filtered |
+| `--filter` | `FILTER` | filter query — see [Filtering](#filtering); strict parse in `--no-ui` (exit 2 on error), inert-broken-terms pre-apply in interactive mode |
 | `--color` | `COLOR` | `auto`/`always`/`never` |
 | `--theme` | `THEME` | `tokyo-night`/`light`/`high-contrast` |
 | `--no-motion` | `NO_MOTION` | disable bar/donut easing animations |
@@ -202,10 +208,11 @@ has proven itself.
 | `Space` `u` `D` | mark for deletion (tree/flat rows; not breakdown) · clear marks · delete (confirm with `y`) |
 | `v` | review marked entries: a scrollable list, `Space` unmarks a row, `D` deletes from there too |
 | `f` | freeable files: deleted-but-open files still holding disk space (`f`/`Esc` closes) |
+| `Ctrl-K` / `/` | open the filter/command palette — see [Filtering](#filtering) |
 | `?` | keyboard/mouse cheatsheet (`?`/`Esc` closes) |
 | `z` | toggle zen mode: table only — no metric cards, disk gauge or donut wheel |
-| `Esc` | close a modal, else leave a flat/breakdown mode, else quit (contextual) |
-| `q` | quit unconditionally (cancels a running scan) |
+| `Esc` | close the palette, else a modal, else leave a flat/breakdown mode, else clear an active filter, else quit (contextual) |
+| `q` | quit unconditionally (cancels a running scan); inside the palette, only `Ctrl-C` quits — every other key, `q` included, is text |
 
 **Deletion is guarded**: mark-then-confirm, mount points refused, every
 entry re-checked (existence, file type, device) immediately before
@@ -282,7 +289,10 @@ deletion basket tree rows use — real files, real node ids, nothing
 special-cased in the delete/review/confirm path. Breakdown rows aren't
 markable (a pattern group isn't a single file) and `⏎` on one is a no-op
 for now — group-level actions ("delete every `node_modules`") are a
-deliberate fast-follow once the query language lands.
+deliberate fast-follow: the filter query language ([below](#filtering))
+finds the matches, but bulk-marking an entire match set in one keystroke
+is a separate feature, not yet built (today you mark file-by-file, or a
+directory whose *entire* subtree you want).
 
 **The one honest paragraph on how groups are counted (D1):** patterns are
 a **disjoint partition**, not overlapping tags — every byte counts in *at
@@ -304,6 +314,117 @@ majority of a large scan not in the top-N at all) merged into one gray
 
 Pattern configuration (presets + `[patterns]` + `flat_cap`) lives in
 `camembert.toml` — see [Configuration](#configuration) below.
+
+## Filtering
+
+`Ctrl-K` (or `/`) opens the palette: a floating input over the tree. Type
+a query — it parses live and applies to the whole cockpit (tree table,
+donut, metric cards) as you type, debounced ~100ms so a fast typist never
+triggers one fold per keystroke. A leading `>` switches the same box to
+fuzzy command search (every keyboard shortcut, by name); `/` always opens
+pre-scoped to the query side — there is only ever one palette, one
+history, one Esc.
+
+**While the palette is open, it owns the keyboard**: every printable key,
+including `q`, is a character — only `Esc` (close), `Enter` (commit),
+the arrows/`Home`/`End`/`Backspace`/`Delete` (edit/navigate), and `Ctrl-C`
+(quit) are interpreted specially. Filtering only ever runs **after the
+scan completes** — mid-scan the query box shows "filter available once
+the scan completes" (command mode still works, since it needs no arena).
+
+### Grammar
+
+A query is whitespace-separated **terms**, implicitly ANDed; any term can
+be negated with a leading `!`:
+
+| term | meaning |
+| --- | --- |
+| `report` | bare word: substring match on the basename, ASCII-smartcase (all-lowercase input is case-insensitive; any capital makes it byte-exact) |
+| `"q(1).log"` | double-quoted: **literal** byte substring, case-sensitive — the escape hatch for names containing syntax characters (`\"` and `\\` are the only recognized escapes) |
+| `*.log`, `data?` | contains `*`/`?`: basename glob (same dialect as pattern breakdown — `{`/`[` are literal, not classes) |
+| `node_modules/` | trailing `/`: ancestor constraint — matches entries under a directory whose name matches the glob (the scan root itself is not an ancestor-matchable name) |
+| `>100M`, `<1G` | size sugar on **disk** bytes (only when the sigil is immediately followed by a digit — `>readme` stays a substring) |
+| `older:6mo`, `newer:2w` | mtime age; units `h`/`d`/`w`/`mo` (30.44 d)/`y` (365.25 d) — `older:` means *not modified since*, **not** "not read since" (this tool never reads atime; a `relatime`-mounted filesystem's own atime is unreliable anyway) |
+| `kind:file`, `kind:dir`, `kind:symlink` | entry kind (`kind:dir` only matches *not-descended* directory entries — excluded mounts, stat-failed stubs — scanned directories are structure, never candidates) |
+| `ext:log` | sugar for `*.log` (literal suffix, byte-exact) |
+| `is:hardlink`, `is:error`, `is:excluded` | node flags |
+| `!term` | negation of any term above |
+
+Reserved for a future expression grammar (grouping, OR, value lists): `(`
+`)` `;` `|` outside quotes are rejected with an error naming the feature;
+`<`/`>` are **not** reserved (already spent on size sugar). `user:`/
+`group:` parse but error — ownership isn't retained by this scan (a
+future retention change, not a parser gap).
+
+**Errors never block typing**: a broken term is *inert* — every other
+term in the query still applies — and its problem (span + message) shows
+inline under the input as you type, dimmed. Only `--filter` (below) is
+strict.
+
+**Hardlinks match by any path**: a query naming `*.bak` finds a 50 GiB
+`backup.bak` even when the byte-counted (canonical) link lives elsewhere
+under a different name — the matching non-canonical link shows up as a
+`⛓` row, 0 bytes, "counted at its canonical path" (a filter that can name
+a file and report it *absent* would be exactly the dishonest number this
+tool exists to avoid).
+
+### The pill and composition
+
+An active filter shows a persistent one-line **pill** above the basket
+strip: the query text, matched entries + bytes, the dir-inode residual
+("+N GiB in M directory inode(s) not counted" — directories' own inode
+bytes can never match any query, shown whenever nonzero rather than
+leaving an unexplained gap against the scanned total), and "Esc clears".
+A spinner replaces the bullet while a fold is still computing.
+
+With a filter active: the tree table shows only matching rows (a
+directory only when its filtered subtree still has a match; its total
+becomes the *filtered* subtree total, not the raw one) — the currently
+viewed directory itself always renders, even at zero matches, as a
+legitimately empty table, never an auto-navigate-away surprise. `t`/`b`
+compose the same way, over the match set, never the whole scan. The
+freeable panel/gauge are untouched by any filter (they describe a
+different, process-level fact).
+
+**Directory marks are refused while a filter is active** ("directory
+marks are disabled while a filter is active — clear the filter first") —
+a filtered directory row shows only its matches, so marking it would
+delete everything underneath, matched or not. File marks are unaffected.
+
+### History and saved queries
+
+Every committed query is recalled with `Up`/`Down` inside the palette,
+persisted to `$XDG_STATE_HOME/camembert/history` (falling back to
+`~/.local/state/camembert/history`), one query per line, newest last,
+bounded to 200 entries, written atomically (temp file + rename) — the
+first thing this otherwise read-only-config tool ever writes to disk on
+its own. A read/write failure there is logged and otherwise ignored; it
+never interrupts browsing.
+
+`camembert.toml`'s `[queries]` table holds read-only saved queries, shown
+in the palette (with their labels) whenever the query box is empty:
+
+```toml
+[queries]
+big_logs = "*.log >100M"
+stale = "older:1y"
+```
+
+### `--filter` (CLI, env `FILTER`)
+
+Same grammar, two modes:
+
+- **Interactive**: pre-applies the instant the scan completes, exactly as
+  if typed into the palette and committed — broken terms are inert, same
+  as above.
+- **`--no-ui` summary**: the top-directories/top-files lists are computed
+  over the match set, plus a "matched: … of … scanned" totals line. The
+  parse here is **strict** — any unparseable term prints every error and
+  exits **2** without scanning, so a typo in an automated script is never
+  silently ignored.
+
+`-o`/`--output` dumps are **never** filtered, in either mode — a dump is
+the whole scan, always; filtering is a view, not a subset export.
 
 ## Freeable (deleted-but-open files)
 
@@ -375,6 +496,12 @@ logs = "*.log"
 build = "dist/"         # trailing "/" = a directory pattern (D1: claims
                         # the whole matched subtree, see the flat-view
                         # section above)
+
+[queries]               # label = "query string" — read-only saved
+                        # filters, shown in the Ctrl-K/`/` palette when
+                        # its input is empty; see Filtering above.
+big_logs = "*.log >100M"
+stale = "older:1y"
 ```
 
 Pattern syntax (D4): a basename glob against one path component at a
@@ -388,21 +515,21 @@ only.
 An unparseable file (broken TOML syntax) is never fatal: camembert warns
 (visible with `--log-file`) and falls back to defaults entirely. Beyond
 that, parsing is **per-key resilient** — an invalid `theme`, a bad
-`flat_cap`, or a malformed `[patterns]` entry (or the whole table, if it
-isn't one) is warned about and defaulted **on its own**, without
-resetting the theme, the color mode, or any pattern entry that *did*
-parse. An invalid glob spec is likewise skipped with a warning, never
-fatal; the interactive UI additionally shows a one-time startup toast
-("N invalid patterns ignored — see log") when any pattern (config-level
-or glob-compile) was dropped.
+`flat_cap`, or a malformed `[patterns]`/`[queries]` entry (or the whole
+table, if it isn't one) is warned about and defaulted **on its own**,
+without resetting the theme, the color mode, or any pattern/query entry
+that *did* parse. An invalid glob spec is likewise skipped with a
+warning, never fatal; the interactive UI additionally shows a one-time
+startup toast ("N invalid patterns ignored — see log") when any pattern
+(config-level or glob-compile) was dropped.
 
 **Precedence**, for each of `theme`/`color`/`no_motion` independently: the
 matching **CLI flag > its environment variable > `camembert.toml` > built-in
 default** — `--theme`/`--color`/`--no-motion` beat `THEME`/`COLOR`/
 `NO_MOTION`, which beat the config file, which beats `tokyo-night`/
-`auto`/motion-enabled. `flat_cap` and `[patterns]` are config-file only —
-no CLI flag or environment variable (the query language planned for a
-later wave supersedes both).
+`auto`/motion-enabled. `flat_cap`, `[patterns]` and `[queries]` are
+config-file only — no CLI flag or environment variable (`--filter`/
+`FILTER` is a separate, one-shot query — see [Filtering](#filtering)).
 
 `theme` gets one more step between the config file and the default: an
 **OSC 11 terminal background query**. At startup, before the alternate
@@ -452,13 +579,14 @@ not gigabytes.
 
 ## Roadmap
 
-Scan engine (including io_uring-batched statx with a sync fallback),
-live TUI, dump v1, diff, ncdu import, guarded deletion, and freeable
-phase 1 (deleted-but-open files) are implemented. Next: freeable phase 2
-(btrfs shared extents, hardlink siblings), flat view and pattern
-aggregation, the filter query language with a command palette, per-owner
-views, remote scan over ssh, and an HTML report export.
-The full design trail lives in [`docs/design/`](docs/design/).
+Scan engine (including media-adaptive threading and io_uring-batched
+statx with a sync fallback), live TUI, dump v1, diff, ncdu import,
+guarded deletion, freeable phase 1 (deleted-but-open files), flat view
+and pattern aggregation, and the filter query language with a Ctrl-K
+command palette are implemented. Next: freeable phase 2 (btrfs shared
+extents, hardlink siblings), group/bulk marking under a filter,
+per-owner views, remote scan over ssh, and an HTML report export. The
+full design trail lives in [`docs/design/`](docs/design/).
 
 ## Development
 

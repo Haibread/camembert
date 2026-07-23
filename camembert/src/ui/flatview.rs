@@ -24,6 +24,7 @@
 use std::path::PathBuf;
 
 use camembert_core::flat::{FlatSummary, PatternKind, TopFile};
+use camembert_core::query::FilterResult;
 use camembert_core::scan::ScanOutcome;
 use camembert_core::tree::NodeId;
 
@@ -81,6 +82,19 @@ fn enrich(f: &TopFile, outcome: Option<&ScanOutcome>) -> FlatRow {
         hardlink: f.hardlink,
         path: Some(outcome.tree().path_of_node(f.node)),
     }
+}
+
+/// Build one display row per [`FilterResult::top_files`] entry (D4:
+/// composition — `t` mode under an active filter shows the filtered top
+/// files instead of the whole-scan [`FlatSummary`]). Same enrichment as
+/// [`flat_rows`], reusing the identical `TopFile` shape the filter engine
+/// and the flat fold both produce.
+pub fn filtered_flat_rows(result: &FilterResult, outcome: Option<&ScanOutcome>) -> Vec<FlatRow> {
+    result
+        .top_files
+        .iter()
+        .map(|f| enrich(f, outcome))
+        .collect()
 }
 
 /// Sort keys the flat top-files table can honor: disk (its natural
@@ -191,6 +205,40 @@ pub fn sort_breakdown_rows(rows: &[BreakdownRow], sort: SortSpec) -> Vec<usize> 
         primary.then_with(|| ra.label.cmp(&rb.label))
     });
     order
+}
+
+/// Build one row per [`FilterResult::groups`] plus a trailing
+/// uncategorized row for [`FilterResult::rest`] (D4: `b` mode under an
+/// active filter shows groups computed *over the match set*, never the
+/// silent unfiltered groups query-attack-a finding 6 forbids — the filter
+/// engine computes its own disjoint pattern-group fold, exactly parallel
+/// to [`breakdown_rows`]).
+pub fn filtered_breakdown_rows(result: &FilterResult) -> Vec<BreakdownRow> {
+    let mut rows: Vec<BreakdownRow> = result
+        .groups
+        .iter()
+        .map(|g| BreakdownRow {
+            label: g.label.clone(),
+            kind: Some(g.kind),
+            disk: g.disk,
+            apparent: g.apparent,
+            entries: g.entries,
+        })
+        .collect();
+    rows.push(BreakdownRow {
+        label: UNCATEGORIZED_LABEL.to_owned(),
+        kind: None,
+        disk: result.rest.disk,
+        apparent: result.rest.apparent,
+        entries: result.rest.entries,
+    });
+    rows
+}
+
+/// Σ groups + rest disk bytes of a filtered breakdown — the filtered
+/// analog of [`breakdown_total_disk`].
+pub fn filtered_breakdown_total_disk(result: &FilterResult) -> u64 {
+    result.groups.iter().map(|g| g.disk).sum::<u64>() + result.rest.disk
 }
 
 /// Percentage of the breakdown's own total (Σ groups + rest — the root
@@ -396,5 +444,58 @@ mod tests {
         assert!(breakdown_supports_sort(SortKey::Items));
         assert!(!breakdown_supports_sort(SortKey::Mtime));
         assert!(!breakdown_supports_sort(SortKey::Errors));
+    }
+
+    // ---- D4 composition: filtered t/b rows come from FilterResult ----
+
+    #[test]
+    fn filtered_flat_and_breakdown_rows_reflect_the_match_set_only() {
+        use camembert_core::query::{ApplyOptions, HardlinkIndex, apply, parse};
+        use camembert_core::scan::{ScanOptions, Scanner};
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("keep.log"), vec![0u8; 4096]).unwrap();
+        std::fs::write(tmp.path().join("skip.bin"), vec![0u8; 8192]).unwrap();
+        let mut outcome = Scanner::new(ScanOptions {
+            statx_engine: Default::default(),
+            threads: 1,
+            cross_filesystems: false,
+        })
+        .scan(tmp.path())
+        .expect("scan");
+        outcome.finalize_hardlinks();
+
+        let parsed = parse("*.log");
+        assert!(parsed.errors.is_empty());
+        let hardlinks = HardlinkIndex::build(&outcome, 0);
+        let mut patterns = camembert_core::flat::PatternSet::default();
+        patterns.push("logs", "*.log");
+        let result = apply(
+            outcome.tree(),
+            &parsed.query,
+            &patterns,
+            &hardlinks,
+            &ApplyOptions {
+                cap: 100,
+                epoch: 0,
+                now_unix: 0,
+                threads: 1,
+            },
+        );
+
+        let flat_rows = filtered_flat_rows(&result, Some(&outcome));
+        assert_eq!(flat_rows.len(), 1, "only the matching file, never skip.bin");
+        assert_eq!(&*flat_rows[0].name, "keep.log");
+
+        let rows = filtered_breakdown_rows(&result);
+        // One "logs" group (matched file) + the trailing uncategorized
+        // row, which must be empty: skip.bin never entered the match set
+        // at all, so it cannot leak into "rest" either (attack finding 6).
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].label, "logs");
+        assert_eq!(rows[0].entries, 1);
+        assert_eq!(rows[1].label, UNCATEGORIZED_LABEL);
+        assert_eq!(rows[1].entries, 0);
+        assert_eq!(filtered_breakdown_total_disk(&result), rows[0].disk);
     }
 }

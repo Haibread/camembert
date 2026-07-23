@@ -389,6 +389,13 @@ impl Tree {
         self.names.get(self.node(id).name_ref())
     }
 
+    /// Raw bytes of an interned name by its dense id (`0..name_count()`).
+    /// The filter engine ([`crate::query`]) builds per-unique-name verdict
+    /// tables indexed this way.
+    pub(crate) fn name_bytes(&self, name_id: u32) -> &[u8] {
+        self.names.get(NameRef(name_id))
+    }
+
     /// The [`DirId`] of a directory node, if it has directory metadata
     /// (excluded other-filesystem dirs do not).
     pub fn dir_of(&self, node: NodeId) -> Option<DirId> {

@@ -8,6 +8,7 @@ pub mod dump;
 pub mod flat;
 pub mod freeable;
 pub mod ncdu;
+pub mod query;
 pub mod scan;
 pub mod size;
 pub mod tree;

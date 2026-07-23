@@ -252,8 +252,10 @@ impl PatternSet {
     }
 
     /// First pattern of `kind` whose glob matches `name` (list order = D1
-    /// precedence), or `None`.
-    fn first_match(&self, name: &[u8], kind: PatternKind) -> Option<GroupId> {
+    /// precedence), or `None`. `pub(crate)`: the filter engine
+    /// ([`crate::query`]) precomputes these verdicts into an immutable
+    /// per-name table for its parallel fold.
+    pub(crate) fn first_match(&self, name: &[u8], kind: PatternKind) -> Option<GroupId> {
         self.patterns
             .iter()
             .position(|p| p.kind == kind && glob_match(&p.glob, name))
@@ -269,7 +271,10 @@ impl PatternSet {
 /// Basenames contain no `/`, so no path-boundary logic is needed: `b*`
 /// matches `bb`, `b` does not match `bb`, `*.log` matches `x.log` but not
 /// `x.log.txt` nor `foolog`.
-fn glob_match(pattern: &[u8], name: &[u8]) -> bool {
+///
+/// `pub(crate)`: the query language ([`crate::query`]) speaks exactly this
+/// dialect for its glob and ancestor terms (one glob dialect per binary).
+pub(crate) fn glob_match(pattern: &[u8], name: &[u8]) -> bool {
     let (mut p, mut n) = (0usize, 0usize);
     let (mut star, mut star_n): (Option<usize>, usize) = (None, 0);
     while n < name.len() {
@@ -464,15 +469,17 @@ fn outranks(disk: u64, node: NodeId, other: &RankedFile) -> bool {
 }
 
 /// Bounded top-N min-heap plus the count of eligible files (for the
-/// `truncated` flag). Shared by [`fold`] and [`Accumulator`].
-struct TopHeap {
+/// `truncated` flag). Shared by [`fold`], [`Accumulator`] and the filter
+/// engine's fold ([`crate::query`] — hence the `pub(crate)` surface; the
+/// keep-priority and tiebreak stay identical everywhere).
+pub(crate) struct TopHeap {
     heap: BinaryHeap<Reverse<RankedFile>>,
     cap: usize,
     considered: u64,
 }
 
 impl TopHeap {
-    fn new(cap: usize) -> Self {
+    pub(crate) fn new(cap: usize) -> Self {
         Self {
             heap: BinaryHeap::new(),
             cap,
@@ -483,7 +490,7 @@ impl TopHeap {
     /// Offer a file to the heap. The basename is cloned **only** when the
     /// entry is actually inserted or replaces the current minimum (never
     /// per candidate), so at most `cap` names are ever held.
-    fn offer(&mut self, disk: u64, node: NodeId, hardlink: bool, name: &[u8]) {
+    pub(crate) fn offer(&mut self, disk: u64, node: NodeId, hardlink: bool, name: &[u8]) {
         self.considered += 1;
         if self.cap == 0 {
             return;
@@ -511,12 +518,43 @@ impl TopHeap {
         }));
     }
 
-    fn truncated(&self) -> bool {
+    /// Merge another heap of the same cap into this one (the filter fold's
+    /// per-thread heaps). Because every globally-top-`cap` file is in its
+    /// own thread's top-`cap`, keeping the top `cap` of the union yields
+    /// exactly the sequential result; `considered` sums, so `truncated`
+    /// agrees too. Merge order does not affect the outcome (the
+    /// keep-priority is a total order).
+    pub(crate) fn merge(&mut self, other: TopHeap) {
+        debug_assert_eq!(self.cap, other.cap, "merging heaps of different caps");
+        self.considered += other.considered;
+        if self.cap == 0 {
+            return;
+        }
+        for Reverse(entry) in other.heap {
+            let insert = if self.heap.len() < self.cap {
+                true
+            } else {
+                match self.heap.peek() {
+                    Some(Reverse(min)) => outranks(entry.disk, entry.node, min),
+                    None => false,
+                }
+            };
+            if !insert {
+                continue;
+            }
+            if self.heap.len() >= self.cap {
+                self.heap.pop();
+            }
+            self.heap.push(Reverse(entry));
+        }
+    }
+
+    pub(crate) fn truncated(&self) -> bool {
         self.considered > self.cap as u64
     }
 
     /// Drain (by clone) into the output order: disk desc, node asc.
-    fn to_sorted(&self) -> Vec<TopFile> {
+    pub(crate) fn to_sorted(&self) -> Vec<TopFile> {
         let mut ranked: Vec<RankedFile> = self.heap.iter().map(|Reverse(e)| e.clone()).collect();
         ranked.sort_unstable_by(|a, b| b.cmp(a));
         ranked

@@ -405,6 +405,14 @@ impl Scanner {
             dev: root_dev,
         });
 
+        // The root node's interned name is deliberately the FULL scan path
+        // (not its final component): the dump header's `root` field is
+        // `tree.name(root)`, and `Tree::path_of_node` (breadcrumb, flat
+        // paths, deletion re-verification) reconstructs paths by joining
+        // names up the chain starting from it. Changing the stored name
+        // would therefore be a dump-format change. `dir/` ancestor matching
+        // instead special-cases the root to its final path component in the
+        // filter engine (`crate::query`, query-attack-a finding 11).
         let mut owner = Owner::new(
             path.as_os_str().as_encoded_bytes(),
             root_size,
