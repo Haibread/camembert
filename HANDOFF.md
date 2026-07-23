@@ -49,7 +49,7 @@ pitch.
   identity is `Haibread <haibread@users.noreply.github.com>` (set
   repo-locally).
 
-## What is implemented (all merged on main, ~346 tests green)
+## What is implemented (all merged on main, ~416 tests green)
 
 - **Scan engine** (`camembert-core/src/scan/`): work-stealing,
   fd-relative `openat`/`getdents64`/`statx` (fstatat fallback), mount
@@ -120,6 +120,21 @@ pitch.
   tree, warm or `--cold`; mandatory before/after any scan-hot-path
   change. Its first run caught and fixed a 1 s progress-poller stall
   in `--no-ui` (camembert now ~74 ms on the bench tree).
+- **Filter query language + palette** (`camembert-core/src/query.rs`,
+  `camembert/src/ui/palette.rs`): per
+  [query-decisions.md](docs/design/query-decisions.md) D1-D7 — qualifier
+  tokens (bare smartcase substrings, globs, `dir/` ancestors, `>100M`,
+  `older:/newer:`, `kind:`, `ext:`, `is:`, `!` negation, quoting;
+  `( ) | ;` reserved with feature-naming errors), inert broken terms
+  with structured spans, Ctrl-K palette (query-first, `>` commands
+  generated from the keymap) + `/` pre-scoped shortcut, text-input mode
+  suspending global keys, post-scan-only debounced off-thread fold
+  (5-pass, std scoped threads, bit-identical at any thread count;
+  1.9 ms @ 1M/8 threads), hardlink membership by any path via a lazy
+  reverse map (bytes counted once at the canonical), filtered dir
+  totals + residual pill, composition with t/b/donut, dir marks
+  refused under filter, history in XDG state + read-only `[queries]`,
+  `--filter`/FILTER (strict in --no-ui, exit 2; dumps never filtered).
 - **Infra**: pre-commit (fmt, clippy -D warnings, actionlint, hygiene),
   GitHub workflows `quality` + `release` (SHA-pinned), Dependabot,
   dual MIT/Apache-2.0, repository metadata. The GitHub repo is live at
@@ -180,22 +195,20 @@ pitch.
 
 ## Suggested next steps, in value order
 
-1. **Filter query language + Ctrl-K palette** (they ship together —
-   the palette is the language's UI, reserved in the design).
-2. **Freeable phase 2**: btrfs `FIEMAP_EXTENT_SHARED` + hardlink
+1. **Freeable phase 2**: btrfs `FIEMAP_EXTENT_SHARED` + hardlink
    siblings — needs its own per-entry channel design (non-additive
    inclusion-exclusion; see freeable-attack-b.md for why the phase-1
    ledger deliberately did not pre-build it) and the reserved in-bar
    bright segment. (ZFS: show nothing rather than invent.)
-3. **Release engineering**: musl static builds (x86_64 + aarch64) in the
+2. **Release engineering**: musl static builds (x86_64 + aarch64) in the
    release workflow, `--version` embedding, first tag.
-4. Wave 4 per the archived handoff: ssh remote scan, HTML export, watch
+3. Wave 4 per the archived handoff: ssh remote scan, HTML export, watch
    mode (single-mutator design sketched in scan-tree docs), dated cache.
 
 ## How to work on this repo
 
 ```bash
-cargo test --workspace                                  # ~346 tests
+cargo test --workspace                                  # ~416 tests
 cargo clippy --workspace --all-targets -- -D warnings   # zero tolerance
 pre-commit run --all-files
 ```
