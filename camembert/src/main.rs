@@ -20,13 +20,25 @@ use camembert_core::query;
 use camembert_core::scan::{ScanOptions, Scanner, StatxEngine};
 use camembert_core::size::{HumanSize, SignedHumanSize, parse_size};
 
+/// `<cargo package version> (<git short sha>)`, e.g. `0.1.0 (abc1234)`.
+///
+/// The commit is captured by `build.rs` at compile time (`unknown` when
+/// `.git` or `git` itself isn't available, `-dirty`-suffixed for an unclean
+/// worktree).
+const VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("CAMEMBERT_GIT_SHA"),
+    ")"
+);
+
 /// Disk usage analyzer: what grew, what is freeable, what is cold.
 ///
 /// Without a subcommand, scans PATH (interactive browser on a terminal,
 /// summary otherwise). `diff` compares two dumps; `import` converts an
 /// ncdu JSON export into a dump.
 #[derive(Debug, Parser)]
-#[command(version, about, after_help = AFTER_HELP)]
+#[command(version = VERSION, about, after_help = AFTER_HELP)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
