@@ -125,6 +125,12 @@ pub const SIMPLE: &[SimpleKey] = &[
         action: "show this cheatsheet",
         apply: UiState::open_cheatsheet,
     },
+    SimpleKey {
+        codes: &[KeyCode::Char('z')],
+        keys: "z",
+        action: "toggle zen mode (table only: no cards, gauge or wheel)",
+        apply: UiState::toggle_zen,
+    },
 ];
 
 /// Dispatch `code` against [`SIMPLE`]; `true` if a row matched (and its

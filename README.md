@@ -52,6 +52,15 @@ Everything you see is also clickable: table rows, wheel slices, the
 breadcrumb, the errors card (see [Mouse](#mouse-interactive-mode) below)
 — the keyboard map stays complete either way.
 
+Table bars and the donut ease into position over ~150ms on navigation or
+a sort keypress — never longer, and a scan's own live growth is left
+alone (it already updates continuously). `--no-motion` (env `NO_MOTION`,
+any value counts, even empty — same rule as `NO_COLOR`) disables this:
+everything then snaps straight to its target value. Below 100 columns
+the side wheel panel has nowhere to go, so a compact mini-donut takes
+over the header line instead (not a click target, unlike the full
+panel); `z` toggles **zen mode** — table only, no cards/gauge/wheel.
+
 ## Install
 
 From source (Rust stable, edition 2024):
@@ -90,7 +99,7 @@ camembert diff old.cmbt today.cmbt
 
 Every option is also an environment variable (`THREADS`,
 `CROSS_FILESYSTEMS`, `TOP`, `NO_UI`, `OUTPUT`, `THRESHOLD`, `COLOR`,
-`LOG_FILTER`, `LOG_FILE`, …) — see `camembert --help` and
+`NO_MOTION`, `LOG_FILTER`, `LOG_FILE`, …) — see `camembert --help` and
 `camembert <subcommand> --help` for the full reference, including the
 interactive key map and the diff JSON schema.
 
@@ -104,6 +113,7 @@ interactive key map and the diff JSON schema.
 | `Space` `u` `D` | mark for deletion · clear marks · delete (confirm with `y`) |
 | `v` | review marked entries: a scrollable list, `Space` unmarks a row, `D` deletes from there too |
 | `?` | keyboard/mouse cheatsheet (`?`/`Esc` closes) |
+| `z` | toggle zen mode: table only — no metric cards, disk gauge or donut wheel |
 | `q`/`Esc` | quit (cancels a running scan) |
 
 **Deletion is guarded**: mark-then-confirm, mount points refused, every

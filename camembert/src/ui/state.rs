@@ -270,6 +270,17 @@ pub struct UiState {
     /// Hit-testing geometry of the last drawn frame (mouse support,
     /// design slice 3).
     geometry: FrameGeometry,
+    /// `z` zen mode (design slice 5): table-only view — no metric cards,
+    /// no disk gauge, no donut wheel (full or mini). Header, table,
+    /// footer and the basket strip stay.
+    zen: bool,
+    /// Bumped every time the *displayed* rows change identity or order
+    /// for a reason other than live scan progress: a navigation that
+    /// actually changed directory, or a sort keypress. `ui::anim::Motion`
+    /// compares this across frames to know when to start a fresh bar/
+    /// donut animation — a scan's continuous live updates never bump it,
+    /// so the morph never fights the live growth (design slice 5).
+    view_change_seq: u64,
 }
 
 impl UiState {
@@ -291,6 +302,8 @@ impl UiState {
             cheatsheet_open: false,
             hover: None,
             geometry: FrameGeometry::default(),
+            zen: false,
+            view_change_seq: 0,
         };
         state.ensure_sorted();
         state
@@ -386,6 +399,14 @@ impl UiState {
         // position would describe the wrong row until the mouse moves
         // again, so drop it (it is recomputed on the next `Moved` event).
         self.clear_hover();
+        // Only an actual navigation is a "view change" for animation
+        // purposes (design slice 5): a scan's continuous live updates
+        // reapply the same dir over and over and must never retrigger
+        // the bar/donut morph, or it would fight the live growth the
+        // design explicitly says to leave alone.
+        if dir_changed {
+            self.view_change_seq += 1;
+        }
     }
 
     /// Handle a sort keypress; re-sorts immediately.
@@ -394,6 +415,24 @@ impl UiState {
         self.ensure_sorted();
         self.clamp_cursor();
         self.clear_hover(); // order changed under a stale hover position
+        // A sort reorders the donut slices and every bar's screen row
+        // even though no value changed — worth the same reveal/morph
+        // flourish as a navigation (design slice 5).
+        self.view_change_seq += 1;
+    }
+
+    /// See [`Self::view_change_seq`]'s field doc.
+    pub fn view_change_seq(&self) -> u64 {
+        self.view_change_seq
+    }
+
+    /// `z`: toggle zen mode (table-only view, design slice 5).
+    pub fn toggle_zen(&mut self) {
+        self.zen = !self.zen;
+    }
+
+    pub fn zen(&self) -> bool {
+        self.zen
     }
 
     pub fn move_down(&mut self) {
@@ -1355,6 +1394,53 @@ mod tests {
         assert!(state.cheatsheet_open());
         state.close_cheatsheet();
         assert!(!state.cheatsheet_open());
+    }
+
+    #[test]
+    fn zen_mode_toggles() {
+        let mut state = UiState::new(snapshot(1, 0, None, Vec::new(), true));
+        assert!(!state.zen());
+        state.toggle_zen();
+        assert!(state.zen());
+        state.toggle_zen();
+        assert!(!state.zen());
+    }
+
+    #[test]
+    fn view_change_seq_bumps_on_navigation_and_sort_but_not_on_live_updates() {
+        let mut state = UiState::new(snapshot(
+            1,
+            0,
+            None,
+            vec![dir_row(b"sub", 7, 50, 3), file_row(b"f", 1, 1, 0)],
+            false,
+        ));
+        let baseline = state.view_change_seq();
+
+        // A live re-application of the same dir (same generation bumped,
+        // scan progress) must never bump the seq — that would fight the
+        // donut's continuous live growth (design slice 5).
+        state.apply_snapshot(snapshot(
+            2,
+            0,
+            None,
+            vec![dir_row(b"sub", 7, 80, 3), file_row(b"f", 1, 1, 0)],
+            false,
+        ));
+        assert_eq!(
+            state.view_change_seq(),
+            baseline,
+            "same dir, values changed: not a view change"
+        );
+
+        // An actual navigation (dir changes) bumps it.
+        state.descend();
+        state.apply_snapshot(snapshot(3, 7, Some(0), Vec::new(), false));
+        assert_eq!(state.view_change_seq(), baseline + 1, "navigated");
+
+        // A sort keypress bumps it too, even without navigating.
+        state.press_sort(SortKey::Name);
+        assert_eq!(state.view_change_seq(), baseline + 2, "sorted");
     }
 
     #[test]

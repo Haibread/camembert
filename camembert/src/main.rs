@@ -102,6 +102,16 @@ struct ScanArgs {
     /// monochrome with ASCII bars (the wheel needs color and is hidden).
     #[arg(long, env = "COLOR", value_enum, default_value = "auto")]
     color: ui::caps::ColorMode,
+
+    /// Disable micro-animations in the interactive UI (env: NO_MOTION)
+    ///
+    /// Bars and the donut wheel then always render at their exact target
+    /// value instead of easing in over ~150ms on navigation/sort. Like
+    /// `NO_COLOR`, `NO_MOTION` counts if set to any value at all, even
+    /// the empty string — this flag and the env var both just mean
+    /// "off", so (unlike `--color`) there is no typed value to parse.
+    #[arg(long = "no-motion")]
+    no_motion: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -196,8 +206,16 @@ Look & feel (interactive mode):
   Colors and glyphs adapt to the terminal: truecolor -> 256 -> 16 -> mono
   (NO_COLOR honored, --color overrides), and sextant wheel -> half-block
   wheel -> ASCII bars without a wheel. Terminals narrower than 100
-  columns hide the wheel panel. See the README's \"Look & feel\" section
-  for the exact detection rules.
+  columns collapse the side wheel panel into a compact mini-donut on the
+  header line instead (not clickable, unlike the full panel); zen mode
+  (`z`) and the ASCII rung hide the wheel outright regardless of width.
+  See the README's \"Look & feel\" section for the exact detection rules.
+
+  Table proportion bars and the donut wheel ease into position over
+  ~150ms on navigation or a sort keypress (never longer — a scan's live
+  growth is untouched, it already updates continuously); --no-motion
+  (env NO_MOTION, any value counts, even empty, same rule as NO_COLOR)
+  disables this and snaps both straight to their target value.
 
 Dump:
   --output FILE (env: OUTPUT) writes a camembert-dump v1 (.cmbt) after
@@ -233,6 +251,9 @@ Keys (interactive mode):
                    listing count, total size and the first paths;
                    pressing y confirms, any other key cancels
   ?                show the keyboard/mouse cheatsheet; ? or Esc closes it
+  z                toggle zen mode: table only (no metric cards, disk
+                   gauge or donut wheel) — header, table, footer and the
+                   basket strip stay
   q, Esc, Ctrl-C   quit (cancels the scan if still running)
 
   While any of these floating panels (delete confirmation, review list,
@@ -375,6 +396,15 @@ fn init_tracing(cli: &Cli, interactive: bool) -> Result<(), ()> {
 
 // ---- default mode: scan ----
 
+/// Whether animation is disabled: the `--no-motion` flag, or `NO_MOTION`
+/// present in the environment at all — any value, even the empty
+/// string, exactly like `NO_COLOR` (see `ui::caps`). Read directly
+/// rather than through clap's `env` attribute: a plain bool flag's typed
+/// env parsing cannot express "any value at all, including empty".
+fn motion_disabled(cli_flag: bool, env: Option<&str>) -> bool {
+    cli_flag || env.is_some()
+}
+
 fn run_scan(cli: &Cli) -> ExitCode {
     let args = &cli.scan;
     let interactive = !args.no_ui && std::io::stdout().is_terminal();
@@ -399,7 +429,8 @@ fn run_scan(cli: &Cli) -> ExitCode {
 
     if interactive {
         let caps = ui::caps::Caps::detect(&ui::caps::TermEnv::from_env(), args.color);
-        return match ui::run(scanner, &args.path, args.output.clone(), caps) {
+        let animate = !motion_disabled(args.no_motion, std::env::var("NO_MOTION").ok().as_deref());
+        return match ui::run(scanner, &args.path, args.output.clone(), caps, animate) {
             Ok(()) => ExitCode::SUCCESS,
             Err(err) => {
                 // The terminal is restored by now; these are the process's
@@ -703,4 +734,24 @@ fn run_import(args: &ImportArgs) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn motion_disabled_matches_the_no_color_truthy_rule() {
+        assert!(
+            !motion_disabled(false, None),
+            "neither set: motion stays on"
+        );
+        assert!(motion_disabled(true, None), "--no-motion alone");
+        assert!(motion_disabled(false, Some("1")), "NO_MOTION=1");
+        assert!(
+            motion_disabled(false, Some("")),
+            "NO_MOTION set to the empty string still counts"
+        );
+        assert!(motion_disabled(true, Some("0")), "both set: still disabled");
+    }
 }

@@ -34,6 +34,7 @@
 //! keyboard/mouse maps are documented in [`keymap`], the single table the
 //! `?` cheatsheet renders from.
 
+mod anim;
 pub mod caps;
 mod fmt;
 mod keymap;
@@ -76,8 +77,24 @@ use state::{
 use theme::Theme;
 use toast::ToastQueue;
 
-/// Frame budget: poll timeout of the render loop (~30 fps, D5).
+/// Frame budget: poll timeout of the render loop (~30 fps, D5) while
+/// something needs a timely redraw without new input — a running scan,
+/// an in-flight bar/donut animation, or a toast/flash winding down
+/// (design slice 5).
 const FRAME: Duration = Duration::from_millis(33);
+
+/// Poll timeout the rest of the time: the scan is done, nothing is
+/// animating, and no transient note is showing, so nothing on screen
+/// changes without the user doing something. Long enough that it never
+/// wakes the loop on its own (keeping a quiescent UI's CPU cost at
+/// effectively zero between keypresses), short enough to bound the wait
+/// defensively.
+const IDLE_POLL: Duration = Duration::from_secs(3600);
+
+/// Width, in terminal cells, of the header-line mini-donut the wheel
+/// panel collapses to below [`MIN_WHEEL_TERMINAL_WIDTH`] (design
+/// slice 5).
+const MINI_DONUT_WIDTH: u16 = 6;
 
 /// Two clicks on the same cell within this window count as a
 /// double-click (navigate into the row) — independent of the
@@ -98,8 +115,11 @@ const SIGNATURE: &str = "▞ camembert";
 /// Width of the proportion-bar column in the table.
 const BAR_WIDTH: usize = 12;
 
-/// Below this terminal width the wheel panel is hidden entirely and the
-/// table takes the full width (the mini-donut collapse is slice 5).
+/// Below this terminal width the side wheel panel has no room: the table
+/// takes the full width and a compact mini-donut rides the header line
+/// instead ([`draw_mini_donut`], design slice 5). Zen mode (`z`) and the
+/// ASCII glyph rung hide the wheel outright regardless of width — see
+/// [`wheel_layout`].
 const MIN_WHEEL_TERMINAL_WIDTH: u16 = 100;
 
 /// Footer hint while mark/delete keys are inactive during the scan.
@@ -112,6 +132,10 @@ struct RenderCtx {
     theme: Theme,
     /// `None` when statvfs failed (gauge shows "unavailable").
     disk: Option<DiskSpace>,
+    /// Whether micro-animations are enabled (design slice 5):
+    /// `--no-motion`/`NO_MOTION` set this to `false`, in which case bars
+    /// and the donut always render at their target value.
+    animate: bool,
 }
 
 impl RenderCtx {
@@ -145,6 +169,14 @@ impl Flash {
         }
         self.message.as_ref().map(|(text, _)| text.as_str())
     }
+
+    /// Whether a message is set, without checking expiry — cheap enough
+    /// to consult every frame when deciding the render loop's poll
+    /// deadline (design slice 5): a soon-to-expire flash still needs a
+    /// timely redraw to actually disappear on schedule.
+    fn is_set(&self) -> bool {
+        self.message.is_some()
+    }
 }
 
 /// Where the rows come from.
@@ -161,9 +193,17 @@ enum Phase {
 /// Run the interactive UI over a live scan of `path`. Blocks until the
 /// user quits; quitting mid-scan cancels the scan (workers stop, partial
 /// results are dropped). When `output` is set, a dump is written once the
-/// scan completes — never on a mid-scan cancel.
-pub fn run(scanner: Scanner, path: &Path, output: Option<PathBuf>, caps: Caps) -> io::Result<()> {
-    info!(?caps, "terminal capabilities detected");
+/// scan completes — never on a mid-scan cancel. `animate` is `false` for
+/// `--no-motion`/`NO_MOTION` (design slice 5): bars and the donut then
+/// always render at their target value, no easing.
+pub fn run(
+    scanner: Scanner,
+    path: &Path,
+    output: Option<PathBuf>,
+    caps: Caps,
+    animate: bool,
+) -> io::Result<()> {
+    info!(?caps, animate, "terminal capabilities detected");
     let disk = disk_space(path);
     let live = scanner.scan_live(path);
     // ratatui::init enters the alternate screen, enables raw mode, and
@@ -174,6 +214,7 @@ pub fn run(scanner: Scanner, path: &Path, output: Option<PathBuf>, caps: Caps) -
         caps,
         theme: Theme::new(caps.color),
         disk,
+        animate,
     };
     let result = event_loop(&mut terminal, live, output, &ctx);
     disable_mouse_capture();
@@ -282,10 +323,20 @@ fn event_loop(
     // Last left-click's time and cell, for double-click detection —
     // independent of the click-already-selected-row shortcut.
     let mut last_click: Option<(Instant, u16, u16)> = None;
+    // Bar/donut animation state (design slice 5) — see the `anim` module
+    // doc. `ctx.animate` is `false` for `--no-motion`/`NO_MOTION`.
+    let mut motion = anim::Motion::new(ctx.animate);
 
     loop {
-        // 1. Input (drain everything pending; block at most one frame).
-        let mut deadline = FRAME;
+        // 1. Input (drain everything pending; block at most one frame
+        //    while something needs a timely redraw of its own accord —
+        //    otherwise idle: a quiescent UI costs nothing between
+        //    keypresses, design slice 5).
+        let mut deadline = if needs_frequent_polling(&phase, &flash, &toasts, &motion) {
+            FRAME
+        } else {
+            IDLE_POLL
+        };
         while event::poll(deadline)? {
             deadline = Duration::ZERO;
             match event::read()? {
@@ -399,6 +450,7 @@ fn event_loop(
                 spinner,
                 flash_text.as_deref(),
                 &toast_texts,
+                &mut motion,
                 ctx,
             );
         })?;
@@ -406,6 +458,24 @@ fn event_loop(
         // against exactly what is on screen right now.
         ui.set_geometry(geometry);
     }
+}
+
+/// Whether the render loop needs to keep polling at [`FRAME`] cadence
+/// even without new input: a running scan (progress arrives off the
+/// input stream), an in-flight bar/donut animation, or a toast/flash
+/// that still needs to expire on schedule. `false` means nothing on
+/// screen changes until the user does something, so the loop idles at
+/// [`IDLE_POLL`] instead (design slice 5).
+fn needs_frequent_polling(
+    phase: &Phase,
+    flash: &Flash,
+    toasts: &ToastQueue,
+    motion: &anim::Motion,
+) -> bool {
+    matches!(phase, Phase::Scanning(_))
+        || motion.is_active()
+        || flash.is_set()
+        || !toasts.is_empty()
 }
 
 fn spinner_frame(ctx: &RenderCtx, elapsed: Duration) -> char {
@@ -750,6 +820,13 @@ fn serve_local(phase: &Phase, dir: DirId, generation: &mut u64, ui: &mut UiState
 /// Draws one frame and returns the hit-testing geometry mouse events are
 /// matched against next: recomputed every draw so it always describes
 /// exactly what is on screen (design slice 3).
+// Every parameter is an independent per-frame input (frame buffer,
+// immutable UI state, table scroll state, spinner phase, two transient
+// overlay contents, animation state, render context) with no natural
+// subgroup to bundle without inventing an arbitrary struct just to
+// satisfy the lint — same call already made for
+// `ScanOutcome::from_tree` in camembert-core.
+#[allow(clippy::too_many_arguments)]
 fn draw(
     frame: &mut Frame<'_>,
     ui: &UiState,
@@ -757,14 +834,21 @@ fn draw(
     spinner: char,
     flash: Option<&str>,
     toasts: &[String],
+    motion: &mut anim::Motion,
     ctx: &RenderCtx,
 ) -> FrameGeometry {
+    // Once per frame: a navigation/sort since the last frame starts a
+    // fresh animation window (design slice 5) — see the `anim` module.
+    motion.observe(ui.view_change_seq());
+
     let snapshot = ui.snapshot();
     // The basket strip (design slice 4) only takes a row while something
     // is marked — `Length(0)` otherwise, so browsing without ever marking
     // anything never sees the layout shift, same idea as the selection
-    // card below.
+    // card below. Zen mode (`z`, design slice 5) collapses the cards row
+    // and disk gauge the same way: table + footer + basket strip only.
     let basket_height = if ui.marked_summary().is_some() { 1 } else { 0 };
+    let (cards_height, gauge_height) = cards_and_gauge_heights(ui.zen());
     let [
         header_area,
         cards_area,
@@ -774,8 +858,8 @@ fn draw(
         footer_area,
     ] = Layout::vertical([
         Constraint::Length(1),
-        Constraint::Length(3),
-        Constraint::Length(1),
+        Constraint::Length(cards_height),
+        Constraint::Length(gauge_height),
         Constraint::Min(3),
         Constraint::Length(basket_height),
         Constraint::Length(2),
@@ -789,13 +873,23 @@ fn draw(
     let ranks = theme::assign_identity(&disks, theme::IDENTITY.len());
 
     let breadcrumb = draw_header(frame, header_area, ui, spinner, ctx);
-    let errors_card = draw_metric_cards(frame, cards_area, snapshot, ctx);
-    draw_disk_gauge(frame, gauge_area, snapshot, ctx);
+    let errors_card = if ui.zen() {
+        None
+    } else {
+        draw_metric_cards(frame, cards_area, snapshot, ctx)
+    };
+    if !ui.zen() {
+        draw_disk_gauge(frame, gauge_area, snapshot, ctx);
+    }
 
-    // Main split: table (with selection card) left, wheel right — the
-    // wheel hides entirely below MIN_WHEEL_TERMINAL_WIDTH or on ASCII.
-    let show_wheel = !ctx.ascii() && frame.area().width >= MIN_WHEEL_TERMINAL_WIDTH;
-    let (left_area, wheel_area) = if show_wheel {
+    // Main split: table (with selection card) left, wheel right — see
+    // `wheel_layout` for the responsive-collapse/zen-mode rules (design
+    // slice 5).
+    let layout = wheel_layout(frame.area().width, ctx.ascii(), ui.zen());
+    if layout == WheelLayout::Mini {
+        draw_mini_donut(frame, header_area, ui, &ranks, motion, ctx);
+    }
+    let (left_area, wheel_area) = if layout == WheelLayout::Full {
         let [left, right] =
             Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)])
                 .areas(main_area);
@@ -803,7 +897,7 @@ fn draw(
     } else {
         (main_area, None)
     };
-    let show_selection_card = left_area.height >= 9;
+    let show_selection_card = !ui.zen() && left_area.height >= 9;
     let (table_area, card_area) = if show_selection_card {
         let [table, card] =
             Layout::vertical([Constraint::Min(1), Constraint::Length(4)]).areas(left_area);
@@ -812,11 +906,22 @@ fn draw(
         (left_area, None)
     };
 
-    let table = draw_table(frame, table_area, ui, table_state, spinner, &ranks, ctx);
+    let bar_progress = motion.bar_progress();
+    let table = draw_table(
+        frame,
+        table_area,
+        ui,
+        table_state,
+        spinner,
+        &ranks,
+        bar_progress,
+        ctx,
+    );
     if let Some(card_area) = card_area {
         draw_selection_card(frame, card_area, ui, ctx);
     }
-    let wheel = wheel_area.and_then(|wheel_area| draw_wheel(frame, wheel_area, ui, &ranks, ctx));
+    let wheel =
+        wheel_area.and_then(|wheel_area| draw_wheel(frame, wheel_area, ui, &ranks, motion, ctx));
 
     draw_basket_strip(frame, basket_area, ui, ctx);
     draw_footer(frame, footer_area, ui, flash, ctx);
@@ -845,6 +950,39 @@ fn draw(
         errors_card,
         wheel,
     }
+}
+
+/// Which of the three main-panel layouts applies this frame (design
+/// slice 5): the full side donut, the header mini-donut, or neither. A
+/// pure function of exactly what drives the decision, so the threshold
+/// and the zen/ASCII precedence are unit-tested without a terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WheelLayout {
+    Full,
+    Mini,
+    Hidden,
+}
+
+/// Zen mode and the ASCII glyph rung both hide the wheel outright
+/// (there is nothing to click into color-blind ASCII, and zen mode is
+/// "table only" by definition) regardless of width; otherwise the full
+/// side panel needs [`MIN_WHEEL_TERMINAL_WIDTH`] columns and the
+/// header-line mini-donut takes over below it.
+fn wheel_layout(terminal_width: u16, ascii: bool, zen: bool) -> WheelLayout {
+    if ascii || zen {
+        WheelLayout::Hidden
+    } else if terminal_width >= MIN_WHEEL_TERMINAL_WIDTH {
+        WheelLayout::Full
+    } else {
+        WheelLayout::Mini
+    }
+}
+
+/// Row heights of the metric-cards line and the disk-gauge line —
+/// collapsed to zero in zen mode (design slice 5's `z`: table + footer +
+/// basket strip only, see [`draw`]).
+fn cards_and_gauge_heights(zen: bool) -> (u16, u16) {
+    if zen { (0, 0) } else { (3, 1) }
 }
 
 /// Header line: signature glyph, clickable breadcrumb path, scan status
@@ -1009,6 +1147,9 @@ fn draw_disk_gauge(frame: &mut Frame<'_>, area: Rect, snapshot: &ViewSnapshot, c
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+// Same call as `draw`'s: each parameter is an independent per-frame
+// input, none of them a natural subgroup.
+#[allow(clippy::too_many_arguments)]
 fn draw_table(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1016,6 +1157,7 @@ fn draw_table(
     table_state: &mut TableState,
     spinner: char,
     ranks: &[Option<usize>],
+    bar_progress: f64,
     ctx: &RenderCtx,
 ) -> TableGeometry {
     let theme = &ctx.theme;
@@ -1091,8 +1233,16 @@ fn draw_table(
             .copied()
             .flatten()
             .map(|rank| theme.identity(rank));
-        let bar = Span::from(wheel::proportion_bar(frac, BAR_WIDTH, ctx.ascii()))
-            .fg(identity.unwrap_or(muted));
+        // Eased bar fill (design slice 5): the percentage text above
+        // shows the real value immediately, only the bar itself grows in
+        // — `bar_progress` is a uniform 0->1 reveal shared by every row
+        // in the view, restarted on the next navigation/sort.
+        let bar = Span::from(wheel::proportion_bar(
+            frac * bar_progress,
+            BAR_WIDTH,
+            ctx.ascii(),
+        ))
+        .fg(identity.unwrap_or(muted));
         let name = String::from_utf8_lossy(&row.name).into_owned();
         let name = if row.is_dir {
             Span::from(format!("{name}/")).bold()
@@ -1221,6 +1371,7 @@ fn draw_wheel(
     area: Rect,
     ui: &UiState,
     ranks: &[Option<usize>],
+    motion: &mut anim::Motion,
     ctx: &RenderCtx,
 ) -> Option<WheelGeometry> {
     let theme = &ctx.theme;
@@ -1242,7 +1393,12 @@ fn draw_wheel(
         .rows_indexed()
         .map(|(index, row)| (row.disk, ranks.get(index).copied().flatten()))
         .collect();
-    let (fracs, slice_ranks) = wheel::build_slices(&slice_rows, snapshot.totals.disk);
+    let (target_fracs, slice_ranks) = wheel::build_slices(&slice_rows, snapshot.totals.disk);
+    // Donut morph (design slice 5): eases from whatever was last drawn
+    // into `target_fracs` on a navigation/sort — during a live scan the
+    // donut already grows continuously and `motion` never triggers (see
+    // `UiState::view_change_seq`), so this never fights that growth.
+    let fracs = motion.donut_fracs(&target_fracs);
     let mut geometry = None;
     if !fracs.is_empty() && donut_area.width >= 2 && donut_area.height >= 2 {
         let colors: Vec<Color> = slice_ranks
@@ -1299,6 +1455,68 @@ fn draw_wheel(
     ];
     frame.render_widget(Paragraph::new(caption), caption_area);
     geometry
+}
+
+/// Responsive collapse (design slice 5, [`wheel_layout`]): below
+/// [`MIN_WHEEL_TERMINAL_WIDTH`] the side donut panel has no room, so a
+/// compact version rides the right end of the header line instead — the
+/// same slice data (identity colors, motion-eased fractions) as the full
+/// wheel, just a handful of cells instead of a whole panel.
+///
+/// Decorative only, by design: unlike the full wheel's slices, these
+/// cells are never added to [`FrameGeometry`] and are not click targets.
+/// Hit-testing a shape this small reliably (sub-cell precision, shared
+/// with the header's breadcrumb/status text) is not worth the
+/// complexity for a feature whose whole point is staying out of the
+/// way on a narrow terminal — clicking is still available once the
+/// terminal is wide enough for the real panel, or via the keyboard.
+fn draw_mini_donut(
+    frame: &mut Frame<'_>,
+    header_area: Rect,
+    ui: &UiState,
+    ranks: &[Option<usize>],
+    motion: &mut anim::Motion,
+    ctx: &RenderCtx,
+) {
+    if header_area.width < MINI_DONUT_WIDTH + 2 {
+        return; // no room even for the compact form
+    }
+    let area = Rect {
+        x: header_area.x + header_area.width - MINI_DONUT_WIDTH,
+        y: header_area.y,
+        width: MINI_DONUT_WIDTH,
+        height: 1,
+    };
+    let theme = &ctx.theme;
+    let snapshot = ui.snapshot();
+    let slice_rows: Vec<(u64, Option<usize>)> = ui
+        .rows_indexed()
+        .map(|(index, row)| (row.disk, ranks.get(index).copied().flatten()))
+        .collect();
+    let (target_fracs, slice_ranks) = wheel::build_slices(&slice_rows, snapshot.totals.disk);
+    let fracs = motion.donut_fracs(&target_fracs);
+    if fracs.is_empty() {
+        return;
+    }
+    let colors: Vec<Color> = slice_ranks
+        .iter()
+        .map(|rank| rank.map_or(theme.color(theme::MUTED), |r| theme.identity(r)))
+        .collect();
+    let cells = match ctx.caps.glyphs {
+        GlyphLevel::Sextant => wheel::compose_sextants(&wheel::rasterize(
+            &fracs,
+            2 * area.width as usize,
+            3 * area.height as usize,
+            wheel::SEXTANT_ASPECT,
+        )),
+        GlyphLevel::HalfBlock | GlyphLevel::Ascii => wheel::compose_half_blocks(&wheel::rasterize(
+            &fracs,
+            area.width as usize,
+            2 * area.height as usize,
+            wheel::HALF_BLOCK_ASPECT,
+        )),
+    };
+    blit_wheel(frame, area, &cells, &colors);
 }
 
 /// Copy a composed wheel-cell grid into the frame buffer, mapping slice
@@ -1739,7 +1957,15 @@ mod tests {
                 capacity: 100_000,
                 used: 40_000,
             }),
+            animate: true,
         }
+    }
+
+    /// A disabled `Motion` for tests that do not care about animation:
+    /// bars/donut always render at their exact target value, matching
+    /// what every pre-slice-5 assertion here already expected.
+    fn no_motion() -> anim::Motion {
+        anim::Motion::new(false)
     }
 
     /// The cockpit renders without panicking at every size and capability
@@ -1766,39 +1992,196 @@ mod tests {
                 let ctx = ctx(glyphs, color);
                 let ui = UiState::new(sample_snapshot());
                 let mut table_state = TableState::default();
+                let mut motion = no_motion();
                 let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
                 terminal
                     .draw(|frame| {
-                        draw(frame, &ui, &mut table_state, '⠋', Some("note"), &[], &ctx);
+                        draw(
+                            frame,
+                            &ui,
+                            &mut table_state,
+                            '⠋',
+                            Some("note"),
+                            &[],
+                            &mut motion,
+                            &ctx,
+                        );
                     })
                     .unwrap();
             }
         }
     }
 
-    /// Wide terminal: the wheel panel renders half-block pixels; narrow
-    /// terminal: it disappears and the table takes the full width.
+    /// Wide terminal: the full side wheel panel renders half-block
+    /// pixels well below the header. Narrow terminal (design slice 5):
+    /// the side panel disappears — no half-block pixels below the header
+    /// row — and a compact mini-donut renders in the header row instead.
     #[test]
-    fn wheel_appears_only_on_wide_terminals() {
-        let render = |width: u16| -> String {
+    fn wheel_collapses_to_a_header_mini_donut_below_the_width_threshold() {
+        let draw_at = |width: u16| -> ratatui::buffer::Buffer {
             let ctx = ctx(GlyphLevel::HalfBlock, ColorLevel::Truecolor);
             let ui = UiState::new(sample_snapshot());
             let mut table_state = TableState::default();
+            let mut motion = no_motion();
             let mut terminal = Terminal::new(TestBackend::new(width, 35)).unwrap();
             terminal
                 .draw(|frame| {
-                    draw(frame, &ui, &mut table_state, '⠋', None, &[], &ctx);
+                    draw(
+                        frame,
+                        &ui,
+                        &mut table_state,
+                        '⠋',
+                        None,
+                        &[],
+                        &mut motion,
+                        &ctx,
+                    );
                 })
                 .unwrap();
-            let buffer = terminal.backend().buffer().clone();
-            buffer
-                .content()
-                .iter()
-                .map(|c| c.symbol().to_owned())
-                .collect()
+            terminal.backend().buffer().clone()
         };
-        assert!(render(120).contains('▀'), "wheel pixels on a wide terminal");
-        assert!(!render(80).contains('▀'), "no wheel below 100 columns");
+        let has_half_block_in_row = |buffer: &ratatui::buffer::Buffer, width: u16, row: u16| {
+            let content = buffer.content();
+            (0..width).any(|col| {
+                let idx = row as usize * width as usize + col as usize;
+                matches!(content.get(idx).map(|c| c.symbol()), Some("▀") | Some("▄"))
+            })
+        };
+
+        let wide = draw_at(120);
+        assert!(
+            (5..30).any(|row| has_half_block_in_row(&wide, 120, row)),
+            "full donut panel renders below the header on a wide terminal"
+        );
+
+        let narrow = draw_at(80);
+        assert!(
+            !(5..30).any(|row| has_half_block_in_row(&narrow, 80, row)),
+            "no side panel below 100 columns"
+        );
+        assert!(
+            has_half_block_in_row(&narrow, 80, 0),
+            "mini-donut renders in the header row instead"
+        );
+    }
+
+    /// [`wheel_layout`]'s threshold and precedence, pure and terminal-free
+    /// (design slice 5): the width boundary matches
+    /// [`MIN_WHEEL_TERMINAL_WIDTH`] exactly, and ASCII/zen both override
+    /// width entirely.
+    #[test]
+    fn wheel_layout_threshold_and_precedence() {
+        assert_eq!(
+            wheel_layout(MIN_WHEEL_TERMINAL_WIDTH, false, false),
+            WheelLayout::Full,
+            "exactly at the threshold: full panel"
+        );
+        assert_eq!(
+            wheel_layout(MIN_WHEEL_TERMINAL_WIDTH - 1, false, false),
+            WheelLayout::Mini,
+            "one column short: mini donut"
+        );
+        assert_eq!(
+            wheel_layout(0, false, false),
+            WheelLayout::Mini,
+            "degenerate width still gets a (clipped) mini donut, not a panic"
+        );
+        assert_eq!(
+            wheel_layout(200, true, false),
+            WheelLayout::Hidden,
+            "ASCII: no wheel at any width, full or mini"
+        );
+        assert_eq!(
+            wheel_layout(200, false, true),
+            WheelLayout::Hidden,
+            "zen mode: no wheel at any width, even one wide enough for Full"
+        );
+        assert_eq!(
+            wheel_layout(50, true, true),
+            WheelLayout::Hidden,
+            "ascii and zen both hidden: still just Hidden, not a panic/conflict"
+        );
+    }
+
+    /// [`cards_and_gauge_heights`] collapses both rows to zero in zen
+    /// mode and keeps their normal heights otherwise (design slice 5).
+    #[test]
+    fn cards_and_gauge_heights_collapse_in_zen_mode() {
+        assert_eq!(cards_and_gauge_heights(false), (3, 1));
+        assert_eq!(cards_and_gauge_heights(true), (0, 0));
+    }
+
+    /// `z` zen mode (design slice 5): metric cards, disk gauge and the
+    /// donut wheel all disappear — header, table and footer remain. The
+    /// errors-card hit-test area is `None` too, consistent with nothing
+    /// being drawn there (mouse hit-testing must match what's on screen).
+    #[test]
+    fn zen_mode_hides_cards_gauge_and_wheel() {
+        // `markable_snapshot` (unlike `sample_snapshot`) has no hardlinks
+        // and a completed scan, so the footer's own "provisional totals
+        // (hardlinks)" note never fires and can't be confused with the
+        // "total" metric card below.
+        let ctx = ctx(GlyphLevel::HalfBlock, ColorLevel::Truecolor);
+        let mut ui = UiState::new(markable_snapshot());
+        let mut table_state = TableState::default();
+        let mut motion = no_motion();
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+
+        let mut geometry = FrameGeometry::default();
+        terminal
+            .draw(|frame| {
+                geometry = draw(
+                    frame,
+                    &ui,
+                    &mut table_state,
+                    '⠋',
+                    None,
+                    &[],
+                    &mut motion,
+                    &ctx,
+                );
+            })
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_owned())
+            .collect();
+        assert!(content.contains("total"), "normal view: cards present");
+        assert!(content.contains("disk"), "normal view: gauge present");
+        assert!(content.contains('▀'), "normal view: wheel present");
+
+        ui.toggle_zen();
+        terminal
+            .draw(|frame| {
+                geometry = draw(
+                    frame,
+                    &ui,
+                    &mut table_state,
+                    '⠋',
+                    None,
+                    &[],
+                    &mut motion,
+                    &ctx,
+                );
+            })
+            .unwrap();
+        let content: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_owned())
+            .collect();
+        assert!(!content.contains("total"), "zen: no metric cards");
+        assert!(!content.contains("disk"), "zen: no disk gauge");
+        assert!(!content.contains('▀'), "zen: no wheel, full or mini");
+        assert!(
+            geometry.errors_card.is_none(),
+            "zen: no errors card to hit-test"
+        );
     }
 
     /// ASCII rung: no wheel, `#` bars, plain borders — and still no
@@ -1808,10 +2191,20 @@ mod tests {
         let ctx = ctx(GlyphLevel::Ascii, ColorLevel::Mono);
         let ui = UiState::new(sample_snapshot());
         let mut table_state = TableState::default();
+        let mut motion = no_motion();
         let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
         terminal
             .draw(|frame| {
-                draw(frame, &ui, &mut table_state, '|', None, &[], &ctx);
+                draw(
+                    frame,
+                    &ui,
+                    &mut table_state,
+                    '|',
+                    None,
+                    &[],
+                    &mut motion,
+                    &ctx,
+                );
             })
             .unwrap();
         let content: String = terminal
@@ -1829,10 +2222,20 @@ mod tests {
     fn render(ui: &UiState, toasts: &[String], flash: Option<&str>) -> String {
         let ctx = ctx(GlyphLevel::HalfBlock, ColorLevel::Truecolor);
         let mut table_state = TableState::default();
+        let mut motion = no_motion();
         let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
         terminal
             .draw(|frame| {
-                draw(frame, ui, &mut table_state, '⠋', flash, toasts, &ctx);
+                draw(
+                    frame,
+                    ui,
+                    &mut table_state,
+                    '⠋',
+                    flash,
+                    toasts,
+                    &mut motion,
+                    &ctx,
+                );
             })
             .unwrap();
         terminal
@@ -1907,10 +2310,20 @@ mod tests {
         for (width, height) in [(120, 35), (40, 10), (10, 5), (3, 2), (1, 1)] {
             let ctx = ctx(GlyphLevel::HalfBlock, ColorLevel::Truecolor);
             let mut table_state = TableState::default();
+            let mut motion = no_motion();
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
                 .draw(|frame| {
-                    draw(frame, &ui, &mut table_state, '⠋', None, &[], &ctx);
+                    draw(
+                        frame,
+                        &ui,
+                        &mut table_state,
+                        '⠋',
+                        None,
+                        &[],
+                        &mut motion,
+                        &ctx,
+                    );
                 })
                 .unwrap();
         }
@@ -1933,10 +2346,20 @@ mod tests {
         for (width, height) in [(120, 35), (40, 10), (10, 5), (3, 2), (1, 1)] {
             let ctx = ctx(GlyphLevel::HalfBlock, ColorLevel::Truecolor);
             let mut table_state = TableState::default();
+            let mut motion = no_motion();
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
                 .draw(|frame| {
-                    draw(frame, &ui, &mut table_state, '⠋', None, &[], &ctx);
+                    draw(
+                        frame,
+                        &ui,
+                        &mut table_state,
+                        '⠋',
+                        None,
+                        &[],
+                        &mut motion,
+                        &ctx,
+                    );
                 })
                 .unwrap();
         }
