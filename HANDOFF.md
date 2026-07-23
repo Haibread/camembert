@@ -49,7 +49,7 @@ pitch.
   identity is `Haibread <haibread@users.noreply.github.com>` (set
   repo-locally).
 
-## What is implemented (all merged on main, ~260 tests green)
+## What is implemented (all merged on main, ~310 tests green)
 
 - **Scan engine** (`camembert-core/src/scan/`): work-stealing,
   fd-relative `openat`/`getdents64`/`statx` (fstatat fallback), mount
@@ -98,6 +98,23 @@ pitch.
   (marked files by `(dev,ino)` + files *inside* marked dirs by path
   containment, coverage-honest), `--no-proc-sweep`/`NO_PROC_SWEEP`.
   Nothing in tree/dump/diff (D8 isolation).
+- **Flat view + pattern breakdown** (`camembert-core/src/flat.rs`,
+  `camembert/src/ui/flatview.rs`): per
+  [flat-view-decisions.md](docs/design/flat-view-decisions.md) D1–D6 —
+  `t` (top files, cap `flat_cap` default 1000) / `b` (category
+  breakdown) as in-place modes, contextual Esc, disjoint
+  first-match/outermost-wins groups (presets + `[patterns]` in
+  camembert.toml, per-key-resilient config parse), dual engine: live
+  provisional accumulation on the scan owner (~66 ns/node, memoized
+  interned-name globs, denormalized basenames) + exact frozen-arena
+  fold post-scan, recomputed per deletion epoch at render; donut shows
+  mode data; `--no-ui` summary prints top files (`--top`).
+- **Bench harness** (`scripts/bench-compare.sh`, CLAUDE.md
+  "Benchmarks"): hyperfine comparison vs du/dust/dua/pdu/diskus
+  (+ ncdu/gdu when installed) on a deterministic 200k-file synthetic
+  tree, warm or `--cold`; mandatory before/after any scan-hot-path
+  change. Its first run caught and fixed a 1 s progress-poller stall
+  in `--no-ui` (camembert now ~74 ms on the bench tree).
 - **Infra**: pre-commit (fmt, clippy -D warnings, actionlint, hygiene),
   GitHub workflows `quality` + `release` (SHA-pinned), Dependabot,
   dual MIT/Apache-2.0, repository metadata. The GitHub repo is live at
@@ -128,6 +145,12 @@ pitch.
   open-file warning matches by path text — mount-namespace divergence
   gives false negatives (advisory only); unprivileged sweeps see ~28 %
   of processes on a desktop (coverage line says so).
+- Flat view: full paths (and Enter-jump/marking on flat rows) are
+  post-scan only — the live provisional view shows basenames
+  (denormalized onto `TopFile`; the scan arena is not shared with the
+  UI thread); breakdown drill-down is deferred to the query language;
+  group-level marking ("mark every node_modules") is a deliberate
+  fast-follow with its own guard design.
 - TUI: the design's "excluded mounts dim italic" styling is not
   implemented (no excluded-row rendering exists yet — the theme
   mechanism has a slot for it); the header mini-donut is decorative,
@@ -137,29 +160,25 @@ pitch.
 
 ## Suggested next steps, in value order
 
-1. **Flat view + pattern aggregation** (`node_modules` = 14 GiB
-   cumulative): same aggregation machinery over the frozen arena;
-   rayon-friendly (see option C's frozen-structure idea in the
-   scan-tree dossier).
-2. **Filter query language + Ctrl-K palette** (they ship together —
+1. **Filter query language + Ctrl-K palette** (they ship together —
    the palette is the language's UI, reserved in the design).
-3. **Freeable phase 2**: btrfs `FIEMAP_EXTENT_SHARED` + hardlink
+2. **Freeable phase 2**: btrfs `FIEMAP_EXTENT_SHARED` + hardlink
    siblings — needs its own per-entry channel design (non-additive
    inclusion-exclusion; see freeable-attack-b.md for why the phase-1
    ledger deliberately did not pre-build it) and the reserved in-bar
    bright segment. (ZFS: show nothing rather than invent.)
-4. **io_uring batched statx** with runtime detection + fallback (spec'd
+3. **io_uring batched statx** with runtime detection + fallback (spec'd
    in the original handoff §3; the completion invariant it needs is
    already documented in owner.rs).
-5. **Release engineering**: musl static builds (x86_64 + aarch64) in the
+4. **Release engineering**: musl static builds (x86_64 + aarch64) in the
    release workflow, `--version` embedding, first tag.
-6. Wave 4 per the archived handoff: ssh remote scan, HTML export, watch
+5. Wave 4 per the archived handoff: ssh remote scan, HTML export, watch
    mode (single-mutator design sketched in scan-tree docs), dated cache.
 
 ## How to work on this repo
 
 ```bash
-cargo test --workspace                                  # ~260 tests
+cargo test --workspace                                  # ~310 tests
 cargo clippy --workspace --all-targets -- -D warnings   # zero tolerance
 pre-commit run --all-files
 ```
