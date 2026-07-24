@@ -20,7 +20,9 @@ Every disk analyzer tells you what is big. **camembert** is built for the
 questions you actually have during an incident:
 
 - **What grew since yesterday?** — `camembert diff` two scans, sorted by
-  growth, in streaming constant memory.
+  growth, in streaming constant memory (see
+  [`camembert diff`](#camembert-diff--what-changed-between-two-scans)
+  below).
 - **What can I actually free?** — freeable ≠ size: hardlinks are counted
   once and attributed deterministically; deleted-but-open files holding
   disk space are found and shown (see [Freeable](#freeable-deleted-but-open-files)
@@ -665,6 +667,105 @@ zstdcat today.cmbt | jq -r 'select(.t == "d") | [.td, .path] | @tsv' \
 Sibling order is raw-byte sorted, which is what makes `diff` a
 streaming merge-join: two 10M-entry dumps diff in megabytes of RAM,
 not gigabytes.
+
+## `camembert import` — bring ncdu exports along
+
+```bash
+camembert import old-ncdu-export.json -o old.cmbt
+
+# or from stdin (gzip NOT handled — decompress first):
+zcat old-ncdu-export.json.gz | camembert import - -o old.cmbt
+```
+
+Converts an `ncdu -o` JSON export (ncdu 1.x, minor versions 0–2; newer
+minors import with a warning, unknown fields ignored) into a camembert
+dump, streamed through a hand-rolled JSON lexer (handles the non-UTF-8
+byte sequences pre-2.5 ncdu exports can contain). Hardlinks are
+deduplicated and canonically attributed exactly like a fresh scan, and
+the result is a first-class **ordered** dump (siblings sorted by raw
+name bytes, subtree totals computed) — diffable against anything else,
+including a fresh scan of the same tree:
+
+```bash
+camembert import old-ncdu.json -o old.cmbt && camembert diff old.cmbt fresh.cmbt
+```
+
+| Argument | Env | What it does |
+| --- | --- | --- |
+| `input` | — | the ncdu JSON export to convert; `-` reads stdin |
+| `-o`/`--output` | `OUTPUT` | where to write the camembert dump (`.cmbt`); `-` writes stdout |
+
+**Field mapping** (ncdu → dump): `name` → `n` (raw bytes, re-encoded),
+`asize`/`dsize` → `a`/`d`, `ino`/`nlink`/`hlnkc` → `i`/`l` with
+`(dev,ino)` hardlink deduplication and canonical smallest-path
+attribution, `read_error` → `err`, excluded `otherfs`/`othfs`/`kernfs`
+→ a never-scanned directory stub with `ex`, an absent `dev` inherits
+the parent's.
+
+**Not carried (documented losses)**:
+
+- `uid`/`gid`/`mode` (ncdu's extended `-e` info) are dropped;
+- pattern/`frmlink` exclusion reasons collapse to `ex:"otherfs"`;
+- `mtime` is `0` when the export was made without `ncdu -e`;
+- the `dev` of a non-hardlinked file is dropped;
+- `hlnkc` without `ino` (very old exports) cannot be deduplicated and
+  counts fully;
+- the ncdu metadata block is ignored (as ncdu itself documents).
+
+**Exit codes**: `0` OK, `2` error (unreadable input, or the dump could
+not be written).
+
+## `camembert diff` — what changed between two scans
+
+```bash
+camembert diff yesterday.cmbt today.cmbt
+
+# Monitoring probe: exit 1 if growth exceeds the threshold
+camembert diff yesterday.cmbt today.cmbt --threshold 500M --json
+```
+
+Streams both dumps through a constant-memory merge-join — never loads
+either tree into memory, the same property that makes two 10M-entry
+dumps diff in megabytes of RAM, not gigabytes (see
+[The dump format](#the-dump-format) above) — and reports the total
+disk/apparent/entry delta plus every entry's change kind: **added**,
+**removed**, **grown**, **shrunk**, **touched** (same sizes, different
+mtime), **type-changed** (file ↔ symlink/device/directory).
+
+| Flag | Env | What it does |
+| --- | --- | --- |
+| `--top` | `TOP` | directories and entries in each top list (default 20) |
+| `--json` | `JSON_OUTPUT` | JSON Lines instead of human-readable text |
+| `--threshold` | `THRESHOLD` | exit 1 when total disk growth exceeds this size — turns the diff into a monitoring probe |
+
+**Output** (default, human-readable): a summary line (total disk/
+apparent/entry delta and change counts), then "Top N directories by
+growth" (signed subtree disk delta from the dump totals — canonical
+hardlink attribution — biggest growth first, shrinkage negative) and
+"Top N entries by growth".
+
+**JSON Lines** (`--json`/`JSON_OUTPUT`), one object per line:
+
+```jsonl
+{"t":"summary","oldRoot":S,"newRoot":S,"diskDelta":I,"apparentDelta":I,"entryDelta":I,"added":N,"removed":N,"grown":N,"shrunk":N,"touched":N,"typeChanged":N,"dirsAdded":N,"dirsRemoved":N}
+{"t":"dir","path":S,"change":"added|removed|changed","diskDelta":I,"apparentDelta":I,"entryDelta":I}
+{"t":"entry","path":S,"change":"added|removed|grown|shrunk|touched|typeChanged","diskDelta":I,"apparentDelta":I}
+```
+
+Paths are percent-encoded like dump names (non-UTF-8 bytes as `%XX`);
+integers with magnitude ≥ 2^53 are emitted as decimal strings, exactly
+like the dump format itself — parse both shapes.
+
+**Monitoring probe**: `camembert diff old.cmbt new.cmbt --threshold 2G`
+exits 1 when the tree grew by more than 2 GiB (0 otherwise) without
+printing anything beyond the normal report — wire it straight into a
+check.
+
+**Exit codes**: `0` OK (and, with `--threshold`, growth within
+budget), `1` growth exceeded `--threshold`, `2` error. Both dumps must
+be **ordered** (header `"ordered":true` — the default writer output)
+and **complete** (their `e` end marker present); an unordered or
+truncated dump is refused with exit code 2.
 
 ## Honest numbers
 
