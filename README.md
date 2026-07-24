@@ -950,7 +950,7 @@ trail lives in [`docs/design/`](docs/design/).
 ## Development
 
 ```bash
-cargo test --workspace          # the suite (~559 tests)
+cargo test --workspace          # the suite (~582 tests)
 pre-commit install              # fmt + clippy -D warnings + hygiene hooks
 ```
 
@@ -958,7 +958,8 @@ The workspace splits a pure core library
 ([`camembert-core/`](camembert-core/)) from the TUI/CLI frontend
 ([`camembert/`](camembert/)); design decisions are recorded in
 [`docs/design/`](docs/design/) and are binding. See
-[HANDOFF.md](HANDOFF.md) for the current project state.
+[HANDOFF.md](HANDOFF.md) for the current project state, and
+[CHANGELOG.md](CHANGELOG.md) for what changed between releases.
 
 ## License
 
