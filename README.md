@@ -75,7 +75,9 @@ counts but no directory tree can show you. When it finds enough to be
 worth mentioning (≥ 100 MiB **and** ≥ 1% of the filesystem), the disk
 gauge grows a clickable "· X.X GiB freeable" suffix and a one-time toast
 points at `f`, which opens a scrollable panel: each file's last-known
-path, the holding process(es), and its size. See
+path, the holding process(es), and its size, under a one-line
+[confidence verdict](#the-confidence-verdict) saying how much of the
+system the sweep could actually read. See
 [Freeable](#freeable-deleted-but-open-files) below for exactly what this
 does and doesn't cover.
 
@@ -262,7 +264,9 @@ process in a different mount namespace whose open-file path doesn't
 textually match the marked directory). The same dialog also carries the
 [reclaim oracle](#reclaim-oracle-freeable-phase-2)'s quantified
 exclusive/shared/unfreeable byte estimate once it has finished mapping
-the selection's extents (started the instant each entry was marked).
+the selection's extents (started the instant each entry was marked),
+headed by a one-line [confidence verdict](#the-confidence-verdict) saying
+how far that estimate can be trusted.
 
 While at least one entry is marked, a one-line **basket strip** appears
 above the footer (count + total size) — it disappears again once nothing
@@ -509,6 +513,53 @@ shared extents and hardlink siblings are phase 2):
   stale the instant the sweep finishes; a `.cmbt` dump loaded later has
   no ledger at all — the hint lives in the live TUI only.
 
+### The confidence verdict
+
+Every caveat above is worth stating, and stating all of them at once
+turns an honest figure into an unreadable one. So both places a freeable
+number drives a decision — the top of the `f` panel, and the top of the
+`D` confirmation dialog — open with a one-line verdict:
+
+```
+confidence: fragmentary — 140 of 505 processes readable
+confidence: partial — 300.0 MiB not estimated, compressed mount
+confidence: measured — every marked file accounted for
+confidence: no figure — still mapping the selection
+```
+
+It is a **headline above** the detail lines, never a replacement: every
+caveat keeps its own place underneath, including the one the verdict was
+derived from. The graded word carries the level in plain text, so a
+monochrome terminal reads it exactly as well as a truecolor one; color
+only reinforces it.
+
+- **measured** — nothing camembert can measure is missing. Act on the
+  number.
+- **partial** — a named part is missing, but the majority was read. Act
+  on the number knowing which way it is wrong (understating, except on a
+  compressed mount, where allocated-logical bytes can exceed the physical
+  reclaim).
+- **fragmentary** — more than half of what the figure is built from could
+  not be read, *or* the figure may overstate (a pre-6.1 kernel's extent
+  sharing bit). What is shown is still real — on an unprivileged desktop
+  the processes you *can* read are usually the ones holding your own
+  files — it just doesn't bound anything yet. The reason names what to
+  fix; the detail lines say how (`run as root for the full view`).
+- **no figure** — nothing to grade at all: the feature is off
+  (`--no-proc-sweep`, `--no-fiemap`), the pass hasn't landed yet, or
+  `/proc` was unreadable. Never a fallback number in its place.
+
+The verdict grades exactly one figure. In the confirmation dialog that is
+the *reclaim estimate*; whether the open-file check saw the whole process
+table is a different question, answered in that advisory's own line. Two
+gaps deliberately never move the verdict, because they are invisible by
+construction and so identical on every run: btrfs sibling subvolumes
+outside the scan root, and mmap-only holders. They stay unconditional
+caveats. Neither does *scope* — bytes on other crossed filesystems and
+RAM-backed inodes are excluded from the root-filesystem headline on
+purpose, and a figure that is exact for what it claims is not a doubtful
+one.
+
 ## Reclaim oracle (freeable phase 2)
 
 Deleting a selection doesn't always free `Σ disk`: on extent-sharing
@@ -549,9 +600,11 @@ bucketed rather than as one optimistic number:
   caveat that the exclusive figure may overstate under concurrent writes.
 - **`--no-fiemap`/`NO_FIEMAP`** disables the oracle outright — no job ever
   spawns, no `FS_IOC_FIEMAP` call is ever made, and the confirmation
-  dialog falls back to the phase-1 hardlink-only wording. Same shape as
-  `--no-proc-sweep`: flag/env only, no `camembert.toml` key. Also
-  disables the ambient exclusive floor below.
+  dialog falls back to the phase-1 hardlink-only wording, with its
+  [confidence verdict](#the-confidence-verdict) reading `no figure —
+  extent mapping is off (--no-fiemap)` rather than inventing a
+  disk-size stand-in. Same shape as `--no-proc-sweep`: flag/env only, no
+  `camembert.toml` key. Also disables the ambient exclusive floor below.
 
 ### Ambient exclusive floor
 
@@ -854,7 +907,11 @@ truncated dump is refused with exit code 2.
 - Freeable (deleted-but-open files) states its scope and its gaps out
   loud — root-filesystem-only, btrfs multi-subvolume under-counting,
   mmap-only blind spot, RAM-backed split — see
-  [Freeable](#freeable-deleted-but-open-files).
+  [Freeable](#freeable-deleted-but-open-files). Enough caveats to drown
+  a number in, which is why every place a freeable figure drives a
+  decision opens with a one-line
+  [confidence verdict](#the-confidence-verdict) grading it, above the
+  caveats rather than instead of them.
 
 ## Roadmap
 

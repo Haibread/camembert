@@ -623,6 +623,18 @@ Freeable (deleted-but-open files):
   coverage line (\"N of M processes readable — run as root for the full
   view\") whenever /proc access was partial.
 
+  Confidence verdict: the panel and the delete-confirmation dialog each
+  open with one line grading the figure below it — \"confidence:
+  measured\" (nothing measurable is missing), \"partial\" (a named part
+  is missing, the majority was read), \"fragmentary\" (more than half
+  the inputs were unreadable, or the figure may overstate) or \"no
+  figure\" (the feature is off, the pass hasn't landed, /proc was
+  unreadable — never a fallback number in its place). The reason names
+  the one or two dominant limiters; every detailed caveat keeps its own
+  line underneath, and the graded word is plain text so the level reads
+  without color. The dialog's verdict grades the reclaim estimate; the
+  open-file advisory carries its own coverage caveat separately.
+
   What phase 1 covers and doesn't: scoped to the scan root's own
   filesystem only (the same one the disk gauge describes) — a btrfs
   layout split across several subvolume-mounted `st_dev`s shares one

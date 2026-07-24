@@ -55,7 +55,7 @@ pitch.
   identity is `Haibread <haibread@users.noreply.github.com>` (set
   repo-locally).
 
-## What is implemented (all merged on main, ~559 tests green)
+## What is implemented (all merged on main, ~582 tests green)
 
 - **Scan engine** (`camembert-core/src/scan/`): work-stealing,
   fd-relative `openat`/`getdents64`/`statx` (fstatat fallback), mount
@@ -155,6 +155,18 @@ pitch.
   (`Coverage::Exceeds` wording instead of a fabricated 100%), and Esc
   now ascends from tree view instead of quitting (user request,
   recorded in query-decisions D6).
+- **Freeable confidence verdict** (`camembert-core/src/confidence.rs`):
+  the answer to the product review's "the UI is drowning in uncertainty
+  rather than communicating it". One `Verdict` — three graded rungs
+  (`measured`/`partial`/`fragmentary`) plus an ungraded `no figure` —
+  derived only from signals the sweep and the oracle already compute,
+  with the rule, its two half-boundaries and every deliberate
+  non-signal documented on the type. Rendered as a headline **above**
+  the existing caveat lines (which are unchanged) at the top of the `f`
+  panel and the top of the delete-confirm modal; a pending oracle
+  grades as an absence and flips in place when the report lands. Level
+  is carried in plain text (mono-readable), color only reinforces via
+  theme slots. No new CLI surface.
 - **Flat view + pattern breakdown** (`camembert-core/src/flat.rs`,
   `camembert/src/ui/flatview.rs`): per
   [flat-view-decisions.md](docs/design/flat-view-decisions.md) D1–D6 —
@@ -341,7 +353,7 @@ pitch.
 ## How to work on this repo
 
 ```bash
-cargo test --workspace                                  # ~559 tests
+cargo test --workspace                                  # ~582 tests
 cargo clippy --workspace --all-targets -- -D warnings   # zero tolerance
 pre-commit run --all-files
 ```
