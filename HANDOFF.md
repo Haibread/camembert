@@ -211,9 +211,15 @@ pitch.
   lands directly on `main`). **v0.2.0 is released** (2026-07-24: reclaim
   oracle, ambient exclusive floor, confidence verdict, errno plumbing,
   deletion TOCTOU fix, and the breaking
-  `--cross-filesystems` → `--one-filesystem` swap); v0.1.0 was
-  end-to-end verified (sha256 + static-pie + version output checked
-  from the published artifact).
+  `--cross-filesystems` → `--one-filesystem` swap), and **end-to-end
+  verified from the published artifacts**: both sha256 sums check out,
+  both binaries are statically linked, the x86_64 one runs a real scan
+  and reports `camembert 0.2.0 (3d07b34)` — the tag's commit. One
+  discrepancy found while verifying: **the aarch64 binary is static but
+  not PIE** (the x86_64 one is `static-pie`), so it runs without ASLR;
+  the earlier "static-pie" claim only ever held for x86_64. Not a
+  regression — same workflow as v0.1.0, whose verification only covered
+  x86_64 — but worth fixing.
 - **Infra**: pre-commit (fmt, clippy -D warnings, actionlint, hygiene),
   GitHub workflows `quality` + `release` (SHA-pinned), Dependabot,
   dual MIT/Apache-2.0, repository metadata. The GitHub repo is live at
