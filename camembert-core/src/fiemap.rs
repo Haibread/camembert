@@ -45,6 +45,10 @@
 //! 32-byte [`crate::tree::Node`], dumps, or diff — plain data in, plain
 //! data out.
 
+mod floor;
+
+pub use floor::{FloorMap, compute_floor, reaggregate_floor};
+
 use std::io;
 use std::path::Path;
 
