@@ -70,8 +70,25 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
-      - name: create the GitHub release with generated notes
+      - name: extract this version's section from the changelog
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          awk -v v="$version" '
+            index($0, "## [" v "]") == 1 { inside = 1; next }
+            inside && /^## \[/ { exit }
+            inside { print }
+          ' CHANGELOG.md > release-notes.md
+          if [ ! -s release-notes.md ]; then
+            echo "CHANGELOG.md has no section for $version" >&2
+            exit 1
+          fi
+      - name: create the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" --generate-notes artifacts/*
+        run: >-
+          gh release create "$TAG"
+          --notes-file release-notes.md --generate-notes
+          artifacts/*
