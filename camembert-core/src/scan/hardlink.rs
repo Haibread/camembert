@@ -9,10 +9,28 @@
 //! aggregates reproducible across scans of an identical tree. This module
 //! moves each inode's contribution from the first-seen link's ancestor
 //! chain to the canonical link's: plain single-threaded arithmetic,
-//! subtract along one chain, add along the other. Global (root) totals are
-//! unchanged by construction — both chains end at the root.
+//! subtract along one chain, add along the other.
+//!
+//! # Which size the group carries, and what the root total does
+//!
+//! The subtraction uses the **first-seen** link's recorded size and the
+//! addition uses the **canonical** link's recorded size. They are two
+//! `statx` snapshots of the same inode taken at different points in the
+//! scan, so they normally agree — and then the two chains, both ending at
+//! the root, cancel above their lowest common ancestor and **root totals
+//! are unchanged**. If a concurrent rewrite between those two `statx` calls
+//! made them differ, the **canonical link's recorded size wins for the
+//! whole group** and the root total shifts by (canonical − first-seen)
+//! accordingly. That is the only reconciliation that keeps the tree's real
+//! invariant intact: **every directory aggregate stays equal to the sum of
+//! its own entry lines** (subtree-aggregate consistency, which the dump
+//! writer and diff depend on). Each chain moves by exactly the size of the
+//! node that lives on it, so at every ancestor the change equals the sum of
+//! its children's changes — patching a residual delta at the root alone
+//! would instead break parent = sum-of-children somewhere below it.
 
 use rustc_hash::FxHashMap;
+use tracing::debug;
 
 use crate::tree::{DirId, NodeFlags, NodeId, Tree};
 
@@ -107,14 +125,30 @@ pub(crate) fn reattribute(tree: &mut Tree, links: &[HardlinkLink]) -> u64 {
         let old_chain = parent_dir(tree, counted);
         let new_chain = parent_dir(tree, canonical);
         if old_chain != new_chain {
-            // Subtract what the first-seen link contributed, add the
-            // canonical link's own recorded sizes (same inode, so they
-            // normally agree; using each node's own values keeps every
-            // directory total consistent with its entry lines).
-            let sub = tree.node(counted).size();
-            let add = tree.node(canonical).size();
-            tree.retract_delta(old_chain, sub.apparent, sub.real, 1);
-            tree.apply_delta(new_chain, add.apparent, add.real, 1, 0);
+            // Retract the first-seen link's recorded size from its chain and
+            // apply the canonical link's recorded size to the canonical
+            // chain — each node moves by exactly its own size, so every
+            // directory aggregate stays equal to the sum of its own entry
+            // lines (subtree-aggregate consistency; module docs). The two
+            // are `statx` snapshots of one inode: normally identical, and
+            // then the root nets out. A concurrent rewrite between the
+            // snapshots can make them diverge — the canonical size then
+            // wins for the group and the root shifts by (applied -
+            // retracted), the only reconciliation that keeps parent =
+            // sum-of-children everywhere.
+            let retracted = tree.node(counted).size();
+            let applied = tree.node(canonical).size();
+            if retracted != applied {
+                debug!(
+                    retracted_apparent = retracted.apparent,
+                    applied_apparent = applied.apparent,
+                    "hardlink re-attribution size drift (inode rewritten between \
+                     the two statx snapshots); canonical link's size wins for the \
+                     group, root total shifts accordingly"
+                );
+            }
+            tree.retract_delta(old_chain, retracted.apparent, retracted.real, 1);
+            tree.apply_delta(new_chain, applied.apparent, applied.real, 1, 0);
         }
         tree.set_hardlink_extra(counted, true);
         tree.set_hardlink_extra(canonical, false);
@@ -179,7 +213,11 @@ mod tests {
     }
 
     fn link_entry(name: &[u8], ino: u64) -> BatchEntry {
-        let mut e = entry(name, Kind::File, 1000, 1024);
+        link_entry_sized(name, ino, 1000, 1024)
+    }
+
+    fn link_entry_sized(name: &[u8], ino: u64, apparent: u64, disk: u64) -> BatchEntry {
+        let mut e = entry(name, Kind::File, apparent, disk);
         e.nlink = 2;
         e.ino = ino;
         e
@@ -287,6 +325,82 @@ mod tests {
                 "every link of an nlink>1 inode stays a hardlink after finalize"
             );
         }
+    }
+
+    #[test]
+    fn reattribution_with_size_drift_lets_the_canonical_size_win() {
+        // A concurrent rewrite changed the inode between the scan's two
+        // statx snapshots: the first-seen link (zzz/link1) recorded
+        // 1000/1024, the canonical link (aaa/link0, smallest path) recorded
+        // 2000/2048. Per the module's documented semantics the canonical
+        // size wins for the whole group; the root total shifts by the
+        // difference, and every directory aggregate stays equal to the sum
+        // of its own entry lines.
+        let mut owner = Owner::new(b"/r", Size::default(), 0, 1, Arc::default());
+        owner.handle_batch(batch(
+            ROOT_TOKEN,
+            vec![dir_entry(b"aaa", 1), dir_entry(b"zzz", 2)],
+        ));
+        // zzz integrated first, so its link is the first-seen/counted one.
+        owner.handle_batch(batch(2, vec![link_entry_sized(b"link1", 42, 1000, 1024)]));
+        owner.handle_batch(batch(1, vec![link_entry_sized(b"link0", 42, 2000, 2048)]));
+        assert!(owner.root_complete());
+
+        let root = owner.root();
+        let (mut tree, _, links) = owner.into_parts();
+        let mut dirs = tree.dir_ids();
+        let _ = dirs.next(); // root
+        let aaa = dirs.next().unwrap();
+        let zzz = dirs.next().unwrap();
+        assert_eq!(tree.name(tree.dir(aaa).node), b"aaa");
+        assert_eq!(tree.name(tree.dir(zzz).node), b"zzz");
+
+        // Before: first-seen attribution counted the 1000/1024 snapshot
+        // under zzz. Subtree-aggregate consistency holds (root = Σ children).
+        assert_eq!(
+            (tree.dir(aaa).ta, tree.dir(aaa).td, tree.dir(aaa).tn),
+            (4096, 4096, 1)
+        );
+        assert_eq!(
+            (tree.dir(zzz).ta, tree.dir(zzz).td, tree.dir(zzz).tn),
+            (4096 + 1000, 4096 + 1024, 2)
+        );
+        let root_before = (tree.dir(root).ta, tree.dir(root).td, tree.dir(root).tn);
+        assert_eq!(tree.dir(root).ta, tree.dir(aaa).ta + tree.dir(zzz).ta);
+        assert_eq!(tree.dir(root).td, tree.dir(aaa).td + tree.dir(zzz).td);
+
+        assert_eq!(reattribute(&mut tree, &links), 1);
+
+        // After: the canonical link0's 2000/2048 snapshot is the group's
+        // ground truth; zzz keeps only its own directory inode.
+        assert_eq!(
+            (tree.dir(aaa).ta, tree.dir(aaa).td, tree.dir(aaa).tn),
+            (4096 + 2000, 4096 + 2048, 2)
+        );
+        assert_eq!(
+            (tree.dir(zzz).ta, tree.dir(zzz).td, tree.dir(zzz).tn),
+            (4096, 4096, 1)
+        );
+
+        // The root total *shifted* by (canonical - first-seen) — the
+        // invariant is not "root unchanged" once the snapshots disagree.
+        // The link count nets to zero (one link out of zzz, one into aaa).
+        assert_eq!(
+            (tree.dir(root).ta, tree.dir(root).td, tree.dir(root).tn),
+            (
+                root_before.0 + (2000 - 1000),
+                root_before.1 + (2048 - 1024),
+                root_before.2,
+            )
+        );
+
+        // Crucially, parent = sum-of-children still holds at the root for
+        // the size aggregates: the delta rode up the two chains, it was
+        // never patched in at the top. (`tn` counts every real entry,
+        // hardlink extras included, so it is not a naive child-sum — that
+        // is orthogonal to the size invariant F2 is about.)
+        assert_eq!(tree.dir(root).ta, tree.dir(aaa).ta + tree.dir(zzz).ta);
+        assert_eq!(tree.dir(root).td, tree.dir(aaa).td + tree.dir(zzz).td);
     }
 
     #[test]

@@ -711,7 +711,9 @@ impl ScanOutcome {
     /// first-seen link to its **canonical owner** — the link with the
     /// smallest full path under the raw-byte, component-wise comparator
     /// (dump-format decision D2). Per-directory subtree totals shift
-    /// accordingly; global (root) totals are unchanged. Idempotent and
+    /// accordingly; global (root) totals are unchanged unless a concurrent
+    /// rewrite changed an inode mid-scan, in which case the canonical link's
+    /// recorded size wins for the group (see [`hardlink`]). Idempotent and
     /// cheap when the tree has no hardlinks; both CLI modes call it right
     /// after scan completion (scan-tree D3: off the scan's critical path),
     /// making live first-seen totals final.
