@@ -202,10 +202,18 @@ pitch.
   `--filter`/FILTER (strict in --no-ui, exit 2; dumps never filtered).
 - **Releases**: tag-triggered workflow builds static musl binaries
   (x86_64 + aarch64, native runners) with sha256 sums attached to the
-  GitHub Release (notes categorized via `.github/release.yaml` labels);
-  `--version` embeds the build commit (build.rs, `-dirty` aware).
-  **v0.1.0 is released and end-to-end verified** (sha256 + static-pie +
-  version output checked from the published artifact).
+  GitHub Release; `--version` embeds the build commit (build.rs,
+  `-dirty` aware). Release notes come from
+  [CHANGELOG.md](CHANGELOG.md) — the workflow extracts the tag's
+  section and passes it as `--notes-file`, failing the job if there is
+  none, then appends GitHub's generated notes (label categories in
+  `.github/release.yaml` only ever catch dependabot PRs, since work
+  lands directly on `main`). **v0.2.0 is released** (2026-07-24: reclaim
+  oracle, ambient exclusive floor, confidence verdict, errno plumbing,
+  deletion TOCTOU fix, and the breaking
+  `--cross-filesystems` → `--one-filesystem` swap); v0.1.0 was
+  end-to-end verified (sha256 + static-pie + version output checked
+  from the published artifact).
 - **Infra**: pre-commit (fmt, clippy -D warnings, actionlint, hygiene),
   GitHub workflows `quality` + `release` (SHA-pinned), Dependabot,
   dual MIT/Apache-2.0, repository metadata. The GitHub repo is live at
