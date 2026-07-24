@@ -42,6 +42,7 @@ mod fmt;
 mod freeable_panel;
 mod history;
 mod keymap;
+mod oracle;
 mod osc11;
 mod palette;
 mod state;
@@ -176,6 +177,11 @@ struct RenderCtx {
     /// index refresh — for paranoid environments and containers with a
     /// masked `/proc`.
     no_proc_sweep: bool,
+    /// `--no-fiemap`/`NO_FIEMAP` (freeable phase 2, D3): disables the
+    /// mark-time selection oracle outright — no job ever spawns, no
+    /// `FS_IOC_FIEMAP` call is ever made. Consulted once, at
+    /// [`event_loop`] startup, to build [`oracle::OracleRuntime`].
+    no_fiemap: bool,
     /// Flat-view config (D2/D4: presets + `[patterns]` + `flat_cap`) —
     /// kept around post-scan to recompute the authoritative
     /// [`flat::fold`] on a render-time epoch mismatch (see
@@ -269,8 +275,12 @@ fn write_outcome(lock: &RwLock<ScanOutcome>) -> std::sync::RwLockWriteGuard<'_, 
 /// light background, before the alternate screen opens. `no_proc_sweep` is
 /// `--no-proc-sweep`/`NO_PROC_SWEEP` (freeable phase 1, D7): disables both
 /// the scan-end `/proc` sweep and the pre-deletion open-file index
-/// refresh. `flat_config` (D2/D4) is what `main` already handed the
-/// scanner via `Scanner::with_flat` — kept here too so post-scan
+/// refresh. `no_fiemap` is `--no-fiemap`/`NO_FIEMAP` (freeable phase 2,
+/// D3): disables the mark-time selection oracle outright — no job ever
+/// spawns, and the confirm modal's oracle slot stays
+/// [`oracle::OracleSlot::Disabled`] all session. `flat_config` (D2/D4) is
+/// what `main` already handed the scanner via `Scanner::with_flat` — kept
+/// here too so post-scan
 /// deletions can recompute the authoritative [`flat::fold`] (the scanner
 /// itself only needed it to seed the live accumulator). `startup_toasts`
 /// (D4) surfaces config-time warnings collected before the UI existed —
@@ -290,6 +300,7 @@ pub fn run(
     animate: bool,
     theme_choice: Option<ThemeName>,
     no_proc_sweep: bool,
+    no_fiemap: bool,
     flat_config: FlatConfig,
     startup_toasts: Vec<String>,
     saved_queries: Vec<(String, String)>,
@@ -300,6 +311,7 @@ pub fn run(
         animate,
         ?theme_choice,
         no_proc_sweep,
+        no_fiemap,
         "terminal capabilities detected"
     );
     let theme_name = resolve_theme_name(theme_choice);
@@ -315,6 +327,7 @@ pub fn run(
         disk,
         animate,
         no_proc_sweep,
+        no_fiemap,
         flat_config,
     };
     let result = event_loop(
@@ -489,6 +502,10 @@ fn event_loop(
     // sweep's result lands, polled non-blockingly below (step 2.5) — never
     // set at all under `--no-proc-sweep`/`NO_PROC_SWEEP`.
     let mut sweep_rx: Option<Receiver<Ledger>> = None;
+    // Freeable phase 2 D4: the mark-time selection oracle's session-long
+    // runtime (job channel, per-inode/per-device caches, per-mark landed
+    // results) — `ctx.no_fiemap` disables it outright (no job ever spawns).
+    let mut oracle_rt = oracle::OracleRuntime::new(ctx.no_fiemap);
     // D6: the palette's clock/IO-owning runtime (history file, the
     // debounce timer, the off-thread filter fold's channel) — kept out of
     // `PaletteState`/`UiState` the same way `Flash`/`sweep_rx` are kept out
@@ -503,12 +520,20 @@ fn event_loop(
         //    while something needs a timely redraw of its own accord —
         //    otherwise idle: a quiescent UI costs nothing between
         //    keypresses, design slice 5).
-        let mut deadline =
-            if needs_frequent_polling(&phase, &flash, &toasts, &motion, &sweep_rx, &palette_rt) {
-                FRAME
-            } else {
-                IDLE_POLL
-            };
+        let mut deadline = if needs_frequent_polling(
+            &phase,
+            &flash,
+            &toasts,
+            &motion,
+            &sweep_rx,
+            &palette_rt,
+            &ui,
+            &oracle_rt,
+        ) {
+            FRAME
+        } else {
+            IDLE_POLL
+        };
         while event::poll(deadline)? {
             deadline = Duration::ZERO;
             match event::read()? {
@@ -524,6 +549,7 @@ fn event_loop(
                         ctx.no_proc_sweep,
                         &mut palette_rt,
                         &ctx.flat_config,
+                        &mut oracle_rt,
                     ) {
                         Action::Quit => {
                             if let Phase::Scanning(live) = phase {
@@ -649,6 +675,22 @@ fn event_loop(
             }
         }
 
+        // 2.55. Selection oracle job results landed? (freeable phase 2 D4,
+        // attack-a finding [1]'s redesigned contract — polled
+        // non-blockingly, same idiom as the freeable sweep just above.) If
+        // the confirm modal is open, its oracle slot is re-assembled and
+        // updated *in place* so a "computing…" state resolves to the
+        // quantified answer without the user closing and reopening it.
+        if oracle_rt.poll(ui.flat_epoch(), |node| ui.is_marked(node))
+            && ui.confirm().is_some()
+            && let Phase::Done(lock) = &phase
+        {
+            let marks: Vec<NodeId> = ui.marks().iter().map(|mark| mark.node).collect();
+            let hardlink_groups = read_outcome(lock).hardlink_groups();
+            let slot = oracle::build_slot(&oracle_rt, &marks, &hardlink_groups);
+            ui.set_confirm_oracle(slot);
+        }
+
         // 2.6. Filter fold (D5): debounced trigger, then a non-blocking
         // poll of whatever is currently in flight — same shape as the
         // freeable sweep just above, applied to the query engine instead.
@@ -757,10 +799,14 @@ fn spawn_freeable_sweep(root_dev: u64) -> Option<Receiver<Ledger>> {
 /// input stream), an in-flight bar/donut animation, a toast/flash that
 /// still needs to expire on schedule, a freeable sweep whose result
 /// hasn't landed yet (D4 — `sweep_rx` is `Some` from scan end until
-/// `try_recv` succeeds), or the filter palette waiting out its debounce
-/// window / a fold already in flight (D5). `false` means nothing on
-/// screen changes until the user does something, so the loop idles at
+/// `try_recv` succeeds), the filter palette waiting out its debounce
+/// window / a fold already in flight (D5), or the freeable-2 selection
+/// oracle: any job still in flight, or the confirm modal open with its
+/// slot still [`oracle::OracleSlot::Pending`] (the spinner needs a timely
+/// redraw even between job landings). `false` means nothing on screen
+/// changes until the user does something, so the loop idles at
 /// [`IDLE_POLL`] instead (design slice 5).
+#[allow(clippy::too_many_arguments)]
 fn needs_frequent_polling(
     phase: &Phase,
     flash: &Flash,
@@ -768,6 +814,8 @@ fn needs_frequent_polling(
     motion: &anim::Motion,
     sweep_rx: &Option<Receiver<Ledger>>,
     palette_rt: &PaletteRuntime,
+    ui: &UiState,
+    oracle_rt: &oracle::OracleRuntime,
 ) -> bool {
     matches!(phase, Phase::Scanning(_))
         || motion.is_active()
@@ -776,6 +824,14 @@ fn needs_frequent_polling(
         || sweep_rx.is_some()
         || palette_rt.last_edit.is_some()
         || palette_rt.fold_rx.is_some()
+        || oracle_rt.has_pending()
+        || matches!(
+            ui.confirm(),
+            Some(ConfirmState {
+                oracle: oracle::OracleSlot::Pending,
+                ..
+            })
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -1075,6 +1131,7 @@ fn handle_key(
     no_proc_sweep: bool,
     palette_rt: &mut PaletteRuntime,
     flat_config: &FlatConfig,
+    oracle_rt: &mut oracle::OracleRuntime,
 ) -> Action {
     // The palette (D6) is the topmost rung: while open, it owns the
     // keyboard except Esc/Enter/arrows/Home/End/Backspace/Delete/Ctrl-C —
@@ -1089,6 +1146,7 @@ fn handle_key(
             no_proc_sweep,
             palette_rt,
             flat_config,
+            oracle_rt,
         );
     }
     // The confirmation modal captures every key: `y` confirms, anything
@@ -1098,7 +1156,7 @@ fn handle_key(
             return Action::Quit;
         }
         if code == KeyCode::Char('y') {
-            execute_deletion(ui, phase, generation, toasts);
+            execute_deletion(ui, phase, generation, toasts, oracle_rt);
         } else {
             ui.cancel_confirm();
         }
@@ -1108,12 +1166,21 @@ fn handle_key(
         match code {
             KeyCode::Down | KeyCode::Char('j') => ui.review_move_down(),
             KeyCode::Up | KeyCode::Char('k') => ui.review_move_up(),
-            KeyCode::Char(' ') => ui.unmark_at_review_cursor(),
+            KeyCode::Char(' ') => {
+                let node = ui
+                    .review()
+                    .and_then(|review| ui.marks().get(review.cursor))
+                    .map(|mark| mark.node);
+                ui.unmark_at_review_cursor();
+                if let Some(node) = node {
+                    oracle_rt.mark_removed(node);
+                }
+            }
             // `D` is natural from inside the list too: close it and open
             // the same confirm modal `D` opens from the main view.
             KeyCode::Char('D') => {
                 ui.close_review();
-                open_delete_confirm(ui, phase, flash, no_proc_sweep);
+                open_delete_confirm(ui, phase, flash, no_proc_sweep, oracle_rt);
             }
             KeyCode::Char('v') | KeyCode::Esc => ui.close_review(),
             _ => {}
@@ -1171,10 +1238,18 @@ fn handle_key(
                 try_ascend(ui, phase);
             }
         }
-        KeyCode::Char(' ') => try_toggle_mark(ui, phase, flash),
-        KeyCode::Char('D') => open_delete_confirm(ui, phase, flash, no_proc_sweep),
+        KeyCode::Char(' ') => try_toggle_mark(ui, phase, flash, oracle_rt),
+        KeyCode::Char('D') => open_delete_confirm(ui, phase, flash, no_proc_sweep, oracle_rt),
         KeyCode::Char('v') => try_open_review(ui, flash),
         KeyCode::Char('f') => open_freeable_panel(ui, phase),
+        // `u` needs to reach the oracle runtime too (clear its per-mark
+        // results/pending), context `keymap::SIMPLE` doesn't carry — same
+        // reason the sort keys and mark/delete/review keys are
+        // hand-written here (module docs on `keymap`).
+        KeyCode::Char('u') => {
+            ui.unmark_all();
+            oracle_rt.clear_marks();
+        }
         // The sort keys are mode-aware (D3: a group total has no mtime or
         // error count) and need the flash queue to say so when refused —
         // context the stateless `keymap::SIMPLE` table doesn't carry (see
@@ -1186,10 +1261,9 @@ fn handle_key(
         KeyCode::Char('m') => try_sort(ui, flash, SortKey::Mtime),
         KeyCode::Char('c') => try_sort(ui, flash, SortKey::Items),
         KeyCode::Char('e') => try_sort(ui, flash, SortKey::Errors),
-        // Every other key (movement, `p`, `u`, `?`, `t`, `b`, `z`) is
-        // stateless enough to live in the keymap dispatch table
-        // (`ui::keymap`) — the single source the `?` cheatsheet also
-        // renders from.
+        // Every other key (movement, `p`, `?`, `t`, `b`, `z`) is stateless
+        // enough to live in the keymap dispatch table (`ui::keymap`) — the
+        // single source the `?` cheatsheet also renders from.
         _ => {
             keymap::dispatch_simple(code, ui);
         }
@@ -1213,6 +1287,7 @@ fn handle_palette_key(
     no_proc_sweep: bool,
     rt: &mut PaletteRuntime,
     flat_config: &FlatConfig,
+    oracle_rt: &mut oracle::OracleRuntime,
 ) -> Action {
     if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
         return Action::Quit; // the one safety hatch that survives inside the palette
@@ -1222,7 +1297,9 @@ fn handle_palette_key(
         // filter (attack finding 12's off-by-one): whatever was last
         // applied while typing stays active.
         KeyCode::Esc => ui.close_palette(),
-        KeyCode::Enter => return palette_enter(ui, phase, flash, no_proc_sweep, rt, flat_config),
+        KeyCode::Enter => {
+            return palette_enter(ui, phase, flash, no_proc_sweep, rt, flat_config, oracle_rt);
+        }
         KeyCode::Left => {
             if let Some(p) = ui.palette_mut() {
                 p.move_left();
@@ -1321,6 +1398,7 @@ fn palette_move_selection(ui: &mut UiState, rt: &PaletteRuntime, up: bool) {
 /// typing" signal the debounce exists to infer from silence — and closes
 /// the palette either way, leaving whatever filter is now active in
 /// place.
+#[allow(clippy::too_many_arguments)]
 fn palette_enter(
     ui: &mut UiState,
     phase: &mut Phase,
@@ -1328,6 +1406,7 @@ fn palette_enter(
     no_proc_sweep: bool,
     rt: &mut PaletteRuntime,
     flat_config: &FlatConfig,
+    oracle_rt: &mut oracle::OracleRuntime,
 ) -> Action {
     let Some(mode) = ui.palette().map(palette::PaletteState::mode) else {
         return Action::Continue;
@@ -1347,7 +1426,7 @@ fn palette_enter(
             let action = filtered.get(selected).map(|&i| commands[i].action);
             ui.close_palette();
             if let Some(action) = action {
-                return execute_command(action, ui, phase, flash, no_proc_sweep);
+                return execute_command(action, ui, phase, flash, no_proc_sweep, oracle_rt);
             }
         }
         PaletteMode::Query => {
@@ -1387,11 +1466,14 @@ fn execute_command(
     phase: &mut Phase,
     flash: &mut Flash,
     no_proc_sweep: bool,
+    oracle_rt: &mut oracle::OracleRuntime,
 ) -> Action {
     match action {
         CommandAction::Simple(apply) => apply(ui),
         CommandAction::ReviewMarks => try_open_review(ui, flash),
-        CommandAction::DeleteMarked => open_delete_confirm(ui, phase, flash, no_proc_sweep),
+        CommandAction::DeleteMarked => {
+            open_delete_confirm(ui, phase, flash, no_proc_sweep, oracle_rt);
+        }
         CommandAction::FreeablePanel => open_freeable_panel(ui, phase),
         CommandAction::ClearFilter => ui.clear_filter(),
         CommandAction::Quit => return Action::Quit,
@@ -1641,22 +1723,55 @@ fn handle_hover(col: u16, row: u16, ui: &mut UiState) {
 /// Mode-aware (D3): flat rows mark real nodes into the same shared basket;
 /// breakdown rows aren't markable at all (a group isn't a single node —
 /// group-level marking is a deliberate fast-follow, D6).
-fn try_toggle_mark(ui: &mut UiState, phase: &Phase, flash: &mut Flash) {
+fn try_toggle_mark(
+    ui: &mut UiState,
+    phase: &Phase,
+    flash: &mut Flash,
+    oracle_rt: &mut oracle::OracleRuntime,
+) {
     if matches!(phase, Phase::Scanning(_)) {
         flash.set(DELETION_LOCKED);
         return;
     }
     match ui.mode() {
-        ViewMode::Tree => match ui.toggle_mark() {
-            Ok(()) => {}
-            Err(MarkRefusal::ScanRunning) => flash.set(DELETION_LOCKED),
-            Err(MarkRefusal::MountPoint) => {
-                flash.set("mount points cannot be marked for deletion");
+        ViewMode::Tree => {
+            let node = ui.selected().map(|row| row.node);
+            match ui.toggle_mark() {
+                Ok(()) => {
+                    if let Some(node) = node {
+                        notify_oracle_mark_change(ui, phase, oracle_rt, node);
+                    }
+                }
+                Err(MarkRefusal::ScanRunning) => flash.set(DELETION_LOCKED),
+                Err(MarkRefusal::MountPoint) => {
+                    flash.set("mount points cannot be marked for deletion");
+                }
+                Err(MarkRefusal::FilterActive) => flash.set(DIR_MARK_FILTER_LOCKED),
             }
-            Err(MarkRefusal::FilterActive) => flash.set(DIR_MARK_FILTER_LOCKED),
-        },
-        ViewMode::FlatTop => try_toggle_mark_flat(ui, phase, flash),
+        }
+        ViewMode::FlatTop => try_toggle_mark_flat(ui, phase, flash, oracle_rt),
         ViewMode::Breakdown => flash.set("marking is not available in the breakdown view"),
+    }
+}
+
+/// Freeable phase 2 D4: tell the oracle runtime about a mark that just
+/// flipped state — `node` is the row's identity captured *before* the
+/// `toggle_mark`/`toggle_mark_flat` call that may have added or removed
+/// it; `ui.is_marked(node)` afterwards says which happened. Post-scan
+/// only (marking itself is refused during a scan, so `phase` is always
+/// `Phase::Done` here — the `let else` is defensive, never fatal).
+fn notify_oracle_mark_change(
+    ui: &UiState,
+    phase: &Phase,
+    oracle_rt: &mut oracle::OracleRuntime,
+    node: NodeId,
+) {
+    if ui.is_marked(node) {
+        if let Phase::Done(lock) = phase {
+            oracle_rt.mark_added(Arc::clone(lock), node, ui.flat_epoch());
+        }
+    } else {
+        oracle_rt.mark_removed(node);
     }
 }
 
@@ -1665,7 +1780,12 @@ fn try_toggle_mark(ui: &mut UiState, phase: &Phase, flash: &mut Flash) {
 /// same shared basket tree-mode marking uses. Only possible post-scan —
 /// same reason as [`try_jump_flat_row`] (the live accumulator's
 /// `TopFile` has no path to resolve).
-fn try_toggle_mark_flat(ui: &mut UiState, phase: &Phase, flash: &mut Flash) {
+fn try_toggle_mark_flat(
+    ui: &mut UiState,
+    phase: &Phase,
+    flash: &mut Flash,
+    oracle_rt: &mut oracle::OracleRuntime,
+) {
     let Phase::Done(lock) = phase else {
         flash.set(DELETION_LOCKED);
         return;
@@ -1685,8 +1805,10 @@ fn try_toggle_mark_flat(ui: &mut UiState, phase: &Phase, flash: &mut Flash) {
         .path
         .clone()
         .unwrap_or_else(|| outcome.tree().path_of_node(row.node));
-    match ui.toggle_mark_flat(row.node, path, row.disk) {
-        Ok(()) => {}
+    let node = row.node;
+    let disk = row.disk;
+    match ui.toggle_mark_flat(node, path, disk) {
+        Ok(()) => notify_oracle_mark_change(ui, phase, oracle_rt, node),
         Err(MarkRefusal::ScanRunning) => flash.set(DELETION_LOCKED),
         Err(MarkRefusal::MountPoint) => {
             debug!("unreachable: flat rows are always regular files, never mount points");
@@ -1707,9 +1829,17 @@ fn try_open_review(ui: &mut UiState, flash: &mut Flash) {
 }
 
 /// `D`: open the confirmation modal over the marked entries, computing the
-/// hardlink warning from the frozen arena and, unless `no_proc_sweep` (D7),
-/// the D6 pre-deletion open-file advisory.
-fn open_delete_confirm(ui: &mut UiState, phase: &Phase, flash: &mut Flash, no_proc_sweep: bool) {
+/// hardlink warning from the frozen arena, unless `no_proc_sweep` (D7) the
+/// D6 pre-deletion open-file advisory, and the freeable-2 D4 selection
+/// oracle's slot (`build_slot`: `Disabled` under `--no-fiemap`, `Pending`
+/// while any marked node's job hasn't landed, else `Ready`).
+fn open_delete_confirm(
+    ui: &mut UiState,
+    phase: &Phase,
+    flash: &mut Flash,
+    no_proc_sweep: bool,
+    oracle_rt: &oracle::OracleRuntime,
+) {
     let Phase::Done(lock) = phase else {
         flash.set(DELETION_LOCKED);
         return;
@@ -1727,7 +1857,9 @@ fn open_delete_confirm(ui: &mut UiState, phase: &Phase, flash: &mut Flash, no_pr
     } else {
         pre_deletion_open_warning(ui)
     };
-    ui.open_confirm(hardlinks, open_warning);
+    let hardlink_groups = outcome.hardlink_groups();
+    let oracle_slot = oracle::build_slot(oracle_rt, &nodes, &hardlink_groups);
+    ui.open_confirm(hardlinks, open_warning, oracle_slot);
 }
 
 /// D6: refresh the open-file index (unfiltered sweep, same ~25ms cost as
@@ -1852,6 +1984,7 @@ fn execute_deletion(
     phase: &mut Phase,
     generation: &mut u64,
     toasts: &mut ToastQueue,
+    oracle_rt: &mut oracle::OracleRuntime,
 ) {
     let Phase::Done(lock) = phase else {
         // The modal only opens post-scan, but never delete on a stale
@@ -1884,6 +2017,10 @@ fn execute_deletion(
             // computed against the arena as it stood before this delete —
             // regardless of which mode/surface this deletion came from.
             ui.bump_flat_epoch();
+            // Freeable phase 2 D4: the frozen arena just changed under
+            // every cached oracle fact (inode maps, per-mark results,
+            // in-flight job identities) -- invalidate them all.
+            oracle_rt.on_deletion();
         }
         if report.failed > 0 || report.skipped > 0 {
             toasts.push(format!(
@@ -2176,7 +2313,7 @@ fn draw(
     if let Some(palette) = ui.palette() {
         draw_palette_modal(frame, palette, ui, phase, saved_queries, ctx);
     } else if let Some(confirm) = ui.confirm() {
-        draw_confirm_modal(frame, ui, confirm, ctx);
+        draw_confirm_modal(frame, ui, confirm, ctx, spinner);
     } else if let Some(review) = ui.review() {
         draw_review_modal(frame, ui, review, ctx);
     } else if ui.freeable_open() {
@@ -3524,6 +3661,7 @@ fn draw_confirm_modal(
     ui: &UiState,
     confirm: &ConfirmState,
     ctx: &RenderCtx,
+    spinner: char,
 ) {
     /// Paths listed in full before the "… and N more" ellipsis.
     const MAX_PATHS: usize = 8;
@@ -3550,7 +3688,13 @@ fn draw_confirm_modal(
             Span::from(format!("  … and {} more", count - MAX_PATHS)).dim(),
         ));
     }
-    if confirm.hardlink_files > 0 {
+    // Freeable phase 2 D4 (attack-a finding [1]'s redesigned contract):
+    // `Ready` replaces the phase-1 qualitative hardlink sentence with the
+    // quantified D4 wording; `Pending`/`Disabled` keep it — see
+    // `oracle::OracleSlot`'s doc for what each variant means.
+    let show_phase1_hardlink_note =
+        !matches!(confirm.oracle, oracle::OracleSlot::Ready(_)) && confirm.hardlink_files > 0;
+    if show_phase1_hardlink_note {
         lines.push(Line::default());
         lines.push(Line::from(
             Span::from(format!(
@@ -3563,6 +3707,28 @@ fn draw_confirm_modal(
             Span::from("freed once every link to an inode is deleted")
                 .fg(theme.color(theme::ACCENT)),
         ));
+    }
+    match &confirm.oracle {
+        oracle::OracleSlot::Disabled => {}
+        oracle::OracleSlot::Pending => {
+            lines.push(Line::default());
+            let spin = if ctx.animate { spinner } else { '…' };
+            lines.push(Line::from(
+                Span::from(oracle::pending_line(spin)).fg(theme.color(theme::ACCENT)),
+            ));
+        }
+        oracle::OracleSlot::Ready(view) => {
+            let wording = oracle::ready_wording(view);
+            lines.push(Line::default());
+            for line in &wording.summary {
+                lines.push(Line::from(
+                    Span::from(line.clone()).fg(theme.color(theme::ACCENT)),
+                ));
+            }
+            for line in &wording.caveats {
+                lines.push(Line::from(Span::from(line.clone()).dim()));
+            }
+        }
     }
     // D6: advisory only — never blocks `y` — so it just adds a line, same
     // as the hardlink note above.
@@ -3999,6 +4165,7 @@ mod tests {
             }),
             animate: true,
             no_proc_sweep: false,
+            no_fiemap: false,
             flat_config: FlatConfig::default(),
         }
     }
@@ -4482,11 +4649,61 @@ mod tests {
 
         let mut confirming = UiState::new(markable_snapshot());
         confirming.toggle_mark().unwrap();
-        confirming.open_confirm(0, None);
+        confirming.open_confirm(0, None, oracle::OracleSlot::Disabled);
         let content = render(&confirming, &toasts, None);
         assert!(
             !content.contains("dump written"),
             "confirm modal open: toast suppressed"
+        );
+    }
+
+    /// Freeable phase 2 D4: `Pending` keeps the phase-1 qualitative
+    /// hardlink note (it is the only figure known so far) and adds the
+    /// spinner line — attack-a finding [1]'s "computing…" state.
+    #[test]
+    fn confirm_modal_pending_slot_shows_hardlink_note_and_spinner() {
+        let mut ui = UiState::new(markable_snapshot());
+        ui.toggle_mark().unwrap();
+        ui.open_confirm(3, None, oracle::OracleSlot::Pending);
+        let content = render(&ui, &[], None);
+        assert!(
+            content.contains("hardlinked file(s)"),
+            "phase-1 note kept while pending"
+        );
+        assert!(
+            content.contains("estimating actual reclaim"),
+            "pending spinner line shown"
+        );
+    }
+
+    /// `Ready` replaces the phase-1 qualitative hardlink sentence with the
+    /// quantified D4 wording and any caveats — the redesigned in-place
+    /// update contract (attack-a finding [1]).
+    #[test]
+    fn confirm_modal_ready_slot_replaces_hardlink_note_with_quantified_wording() {
+        let mut ui = UiState::new(markable_snapshot());
+        ui.toggle_mark().unwrap();
+        let view = oracle::OracleView {
+            report: camembert_core::fiemap::OracleReport {
+                exclusive: 4096,
+                shared_within: 2048,
+                ..Default::default()
+            },
+            compressed: true,
+            old_kernel: false,
+            truncated_files: 0,
+            truncated_disk: 0,
+        };
+        ui.open_confirm(3, None, oracle::OracleSlot::Ready(view));
+        let content = render(&ui, &[], None);
+        assert!(
+            !content.contains("hardlinked file(s)"),
+            "Ready replaces the phase-1 qualitative note"
+        );
+        assert!(content.contains("frees"), "quantified wording shown");
+        assert!(
+            content.contains("compressed mount"),
+            "compressed caveat shown"
         );
     }
 
@@ -4623,8 +4840,13 @@ mod tests {
         // A fresh runtime per call is fine here: none of the pre-existing
         // routing tests exercise the palette (their own dedicated tests
         // below construct/thread a `PaletteRuntime` explicitly instead).
+        // The oracle runtime is `disabled: true` for the same reason —
+        // these are routing tests, not oracle behavior tests (see
+        // `ui::oracle::tests` for those), and a disabled runtime never
+        // spawns a thread, keeping this helper synchronous.
         let mut palette_rt = PaletteRuntime::new(Vec::new());
         let flat_config = FlatConfig::default();
+        let mut oracle_rt = oracle::OracleRuntime::new(true);
         handle_key(
             code,
             KeyModifiers::NONE,
@@ -4636,6 +4858,7 @@ mod tests {
             false, // no_proc_sweep: not under test here
             &mut palette_rt,
             &flat_config,
+            &mut oracle_rt,
         )
     }
 
@@ -4946,7 +5169,8 @@ mod tests {
         let (mut ui, mut phase) = done_ui_with_one_file();
         let (mut generation, mut flash, mut toasts) = (1u64, Flash::new(), ToastQueue::new());
         ui.toggle_mark().expect("marking the only row succeeds");
-        open_delete_confirm(&mut ui, &phase, &mut flash, false);
+        let oracle_rt = oracle::OracleRuntime::new(true);
+        open_delete_confirm(&mut ui, &phase, &mut flash, false, &oracle_rt);
         assert!(ui.confirm().is_some());
 
         // `v` is not `y`: the confirm modal treats it as "cancel", not as
@@ -5023,7 +5247,8 @@ mod tests {
         let (mut ui, mut phase) = done_ui_with_one_file();
         let (mut generation, mut flash, mut toasts) = (1u64, Flash::new(), ToastQueue::new());
         ui.toggle_mark().expect("marking the only row succeeds");
-        open_delete_confirm(&mut ui, &phase, &mut flash, false);
+        let oracle_rt = oracle::OracleRuntime::new(true);
+        open_delete_confirm(&mut ui, &phase, &mut flash, false, &oracle_rt);
         assert!(ui.confirm().is_some());
 
         press(

@@ -197,6 +197,21 @@ struct ScanArgs {
     #[arg(long = "no-proc-sweep")]
     no_proc_sweep: bool,
 
+    /// Disable the freeable-2 selection oracle in the interactive UI (env:
+    /// NO_FIEMAP)
+    ///
+    /// Skips every `FS_IOC_FIEMAP` call: no mark-time reclaim estimate, and
+    /// the delete confirmation dialog falls back to the phase-1
+    /// hardlink-only advisory (a later slice's ambient in-bar "shared"
+    /// segment is disabled the same way). For filesystems or containers
+    /// where the ioctl is unavailable, undesired, or where the per-mark
+    /// `open`+FIEMAP cost on a large selection isn't wanted. Like
+    /// NO_PROC_SWEEP, any value at all counts as set, even the empty
+    /// string; there is no camembert.toml key for this (see the README's
+    /// Reclaim oracle section).
+    #[arg(long = "no-fiemap")]
+    no_fiemap: bool,
+
     /// Filter query applied to the scan (env: FILTER)
     ///
     /// Same grammar as the interactive Ctrl-K/`/` palette: whitespace-
@@ -778,13 +793,18 @@ fn run_scan(cli: &Cli) -> ExitCode {
             args.no_proc_sweep,
             std::env::var("NO_PROC_SWEEP").ok().is_some(),
         );
+        // Freeable phase 2, D3: flag + env only, same shape as
+        // no_proc_sweep — no camembert.toml key.
+        let no_fiemap =
+            config::resolve_no_fiemap(args.no_fiemap, std::env::var("NO_FIEMAP").ok().is_some());
         debug!(
             ?color,
             ?theme_choice,
             no_motion,
             no_proc_sweep,
+            no_fiemap,
             flat_cap = flat_config.cap,
-            "resolved color/theme/motion/proc-sweep (CLI > env > camembert.toml, no-proc-sweep: CLI > env only)"
+            "resolved color/theme/motion/proc-sweep/fiemap (CLI > env > camembert.toml, no-proc-sweep/no-fiemap: CLI > env only)"
         );
         let caps = ui::caps::Caps::detect(&ui::caps::TermEnv::from_env(), color);
         let animate = !no_motion;
@@ -800,6 +820,7 @@ fn run_scan(cli: &Cli) -> ExitCode {
             animate,
             theme_choice,
             no_proc_sweep,
+            no_fiemap,
             flat_config,
             startup_toasts,
             file_config.queries.clone(),

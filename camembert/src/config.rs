@@ -266,6 +266,15 @@ pub fn resolve_no_proc_sweep(cli_flag: bool, env_set: bool) -> bool {
     cli_flag || env_set
 }
 
+/// Whether the freeable-2 selection oracle ends up disabled (D3,
+/// `docs/design/freeable2-decisions.md`): `--no-fiemap`/`NO_FIEMAP`,
+/// presence semantics and no-`camembert.toml`-key shape identical to
+/// [`resolve_no_proc_sweep`] — same rationale, different feature (this one
+/// gates FIEMAP calls, not `/proc` reads).
+pub fn resolve_no_fiemap(cli_flag: bool, env_set: bool) -> bool {
+    cli_flag || env_set
+}
+
 /// Flat-view top-N cap (D4): the config file's `flat_cap`, or
 /// [`DEFAULT_FLAT_CAP`] — config-file only, no CLI flag or env var (the
 /// decisions doc doesn't call for one, unlike `no_proc_sweep`).
@@ -370,6 +379,20 @@ mod tests {
         assert!(resolve_no_proc_sweep(false, true), "NO_PROC_SWEEP alone");
         assert!(
             resolve_no_proc_sweep(true, true),
+            "both set: still disabled (OR, not XOR)"
+        );
+    }
+
+    #[test]
+    fn resolve_no_fiemap_flag_or_env_only_no_config_key() {
+        assert!(
+            !resolve_no_fiemap(false, false),
+            "nothing set: the oracle stays enabled"
+        );
+        assert!(resolve_no_fiemap(true, false), "--no-fiemap alone");
+        assert!(resolve_no_fiemap(false, true), "NO_FIEMAP alone");
+        assert!(
+            resolve_no_fiemap(true, true),
             "both set: still disabled (OR, not XOR)"
         );
     }

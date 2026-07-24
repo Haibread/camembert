@@ -147,7 +147,7 @@ camembert /var --no-ui --filter '*.log >100M !older:1y'
 
 Every option is also an environment variable (`THREADS`,
 `CROSS_FILESYSTEMS`, `STATX_ENGINE`, `TOP`, `NO_UI`, `OUTPUT`, `FILTER`,
-`THRESHOLD`, `COLOR`, `THEME`, `NO_MOTION`, `NO_PROC_SWEEP`,
+`THRESHOLD`, `COLOR`, `THEME`, `NO_MOTION`, `NO_PROC_SWEEP`, `NO_FIEMAP`,
 `LOG_FILTER`, `LOG_FILE`, …) — see `camembert --help` and
 `camembert <subcommand> --help` for the full reference, including the
 interactive key map and the diff JSON schema.
@@ -165,6 +165,7 @@ interactive key map and the diff JSON schema.
 | `--theme` | `THEME` | `tokyo-night`/`light`/`high-contrast` |
 | `--no-motion` | `NO_MOTION` | disable bar/donut easing animations |
 | `--no-proc-sweep` | `NO_PROC_SWEEP` | disable the freeable `/proc` sweep (gauge suffix, `f` panel, toast, pre-deletion open-file check) |
+| `--no-fiemap` | `NO_FIEMAP` | disable the freeable-2 selection oracle (mark-time reclaim estimate in the delete confirmation) — see [Reclaim oracle](#reclaim-oracle-freeable-phase-2) |
 | `--log-filter` | `LOG_FILTER` | `tracing` filter directive |
 | `--log-file` | `LOG_FILE` | write diagnostics to a file instead of discarding them |
 
@@ -249,7 +250,10 @@ directly) — and adds an advisory line naming the busiest few. It never
 blocks `y`, and says so plainly when it could only see part of the
 process table rather than staying silent (the same caveat also covers a
 process in a different mount namespace whose open-file path doesn't
-textually match the marked directory).
+textually match the marked directory). The same dialog also carries the
+[reclaim oracle](#reclaim-oracle-freeable-phase-2)'s quantified
+exclusive/shared/unfreeable byte estimate once it has finished mapping
+the selection's extents (started the instant each entry was marked).
 
 While at least one entry is marked, a one-line **basket strip** appears
 above the footer (count + total size) — it disappears again once nothing
@@ -495,6 +499,49 @@ shared extents and hardlink siblings are phase 2):
   stale the instant the sweep finishes; a `.cmbt` dump loaded later has
   no ledger at all — the hint lives in the live TUI only.
 
+## Reclaim oracle (freeable phase 2)
+
+Deleting a selection doesn't always free `Σ disk`: on extent-sharing
+filesystems the same physical bytes can back a `cp --reflink` copy or a
+snapshot outside the selection, and hardlinked files only free anything
+once *every* link is gone. camembert answers this per-selection, honestly
+bucketed rather than as one optimistic number:
+
+- **Marking is the trigger.** The instant you mark a file or directory
+  (`Space`), camembert starts mapping its extents off the UI thread — by
+  the time you press `D`, the answer is usually already there.
+- **The `D` confirmation dialog** replaces the old "N hardlinked files"
+  sentence with a quantified line once every marked entry's mapping has
+  landed: `frees ≥ X exclusive` (guaranteed, understates rather than
+  overstates), `+ up to Y shared only within the marked set` (freed only
+  if the *whole* selection goes), `Z shared elsewhere will not be freed`
+  (pinned by something outside the selection — a snapshot, another
+  hardlink, an unscanned file), and `W not estimated` (delalloc or
+  unmapped — never guessed into a bucket). While mapping is still running
+  for any marked entry, the dialog shows a spinner
+  ("estimating actual reclaim…") instead and **updates in place** the
+  moment the last one lands; `y` deletes on whatever is known at that
+  instant, waiting is never required.
+- **Units are allocated-logical bytes** — the same unit as the `disk`
+  column (`Σ fe_length`, not the physical on-disk footprint). On a
+  `compress`-mounted filesystem the real reclaim can be smaller than the
+  figure shown; the dialog adds a caveat line when any marked file sits on
+  one, since the kernel doesn't expose compressed byte counts to an
+  unprivileged FIEMAP call.
+- **Filesystem tiers**: btrfs and XFS get the full extent-aware oracle
+  (`FS_IOC_FIEMAP`, no root required). ext4 and every other filesystem
+  without reflink get an exact hardlink-only figure (`disk` *is*
+  exclusive there — no extent claims needed). ZFS shows nothing at all,
+  by design: block cloning is pool-level with no per-file API, so even
+  the hardlink-only tier could be wrong — no figure beats a guess.
+- **Kernel ≥ 6.1**: `FIEMAP_EXTENT_SHARED` is only trusted from the btrfs
+  backref rewrite onward; on an older kernel the oracle still runs, with a
+  caveat that the exclusive figure may overstate under concurrent writes.
+- **`--no-fiemap`/`NO_FIEMAP`** disables the oracle outright — no job ever
+  spawns, no `FS_IOC_FIEMAP` call is ever made, and the confirmation
+  dialog falls back to the phase-1 hardlink-only wording. Same shape as
+  `--no-proc-sweep`: flag/env only, no `camembert.toml` key.
+
 ## Configuration
 
 Beyond flags and environment variables, camembert reads an optional TOML
@@ -605,15 +652,17 @@ Scan engine (including media-adaptive threading and io_uring-batched
 statx with a sync fallback), live TUI, dump v1, diff, ncdu import,
 guarded deletion, freeable phase 1 (deleted-but-open files), flat view
 and pattern aggregation, and the filter query language with a Ctrl-K
-command palette are implemented. Next: freeable phase 2 (btrfs shared
-extents, hardlink siblings), group/bulk marking under a filter,
+command palette are implemented. Freeable phase 2 slice 1 (the mark-time
+selection oracle above) is implemented; next: freeable phase 2 slice 2
+(the ambient exclusive-byte floor computed after scan end and the
+reserved in-bar "shared" segment), group/bulk marking under a filter,
 per-owner views, remote scan over ssh, and an HTML report export. The
 full design trail lives in [`docs/design/`](docs/design/).
 
 ## Development
 
 ```bash
-cargo test --workspace          # the suite (~260 tests)
+cargo test --workspace          # the suite (~480 tests)
 pre-commit install              # fmt + clippy -D warnings + hygiene hooks
 ```
 

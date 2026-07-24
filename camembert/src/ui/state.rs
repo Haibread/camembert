@@ -14,6 +14,7 @@ use camembert_core::tree::{DirId, NodeId};
 use camembert_core::view::{Row, ViewSnapshot};
 
 use super::freeable_panel::{FreeableGroup, OpenWarning};
+use super::oracle::OracleSlot;
 use super::palette::PaletteState;
 
 /// Which table mode is active (D3, `docs/design/flat-view-decisions.md`):
@@ -146,6 +147,12 @@ pub struct ConfirmState {
     /// check was skipped outright (`--no-proc-sweep`/`NO_PROC_SWEEP`, D7)
     /// — either way, no warning line at all. Never blocks confirmation.
     pub open_warning: Option<OpenWarning>,
+    /// Freeable phase 2 D4: the selection oracle's current answer.
+    /// Assembled once at open time and **updated in place** as marks'
+    /// jobs land (attack-a finding [1]'s redesigned contract — the
+    /// modal's original "never updates after it opens" behavior is gone).
+    /// See [`super::oracle`].
+    pub oracle: OracleSlot,
 }
 
 /// State of the `v` review-list modal, opened by [`UiState::open_review`]:
@@ -789,14 +796,25 @@ impl UiState {
     /// D6 pre-deletion advisory, computed by the caller from a fresh
     /// [`camembert_core::freeable::open_file_index`] (`None` when nothing
     /// marked is open, or `--no-proc-sweep`/`NO_PROC_SWEEP` skipped the
-    /// check outright, D7).
-    pub fn open_confirm(&mut self, hardlink_files: u64, open_warning: Option<OpenWarning>) -> bool {
+    /// check outright, D7). `oracle` is the freeable-2 D4 selection
+    /// oracle's slot, assembled by the caller from
+    /// [`super::oracle::build_slot`] — `Disabled`/`Pending`/`Ready`
+    /// depending on `--no-fiemap` and whether every marked node's job has
+    /// landed yet; [`Self::set_confirm_oracle`] updates it in place while
+    /// the modal stays open.
+    pub fn open_confirm(
+        &mut self,
+        hardlink_files: u64,
+        open_warning: Option<OpenWarning>,
+        oracle: OracleSlot,
+    ) -> bool {
         if self.marks.is_empty() || !self.snapshot.stats.root_complete {
             return false;
         }
         self.confirm = Some(ConfirmState {
             hardlink_files,
             open_warning,
+            oracle,
         });
         true
     }
@@ -805,6 +823,18 @@ impl UiState {
     /// belongs to the modal.
     pub fn confirm(&self) -> Option<&ConfirmState> {
         self.confirm.as_ref()
+    }
+
+    /// Update the confirm modal's oracle slot in place (D4, attack-a
+    /// finding [1]'s redesigned contract): called whenever a marked node's
+    /// job result lands while the modal is open, so a "computing…" state
+    /// resolves to the quantified answer without the user closing and
+    /// reopening it. A no-op if the modal isn't open (a stale/late poll
+    /// after cancel/confirm).
+    pub fn set_confirm_oracle(&mut self, oracle: OracleSlot) {
+        if let Some(confirm) = &mut self.confirm {
+            confirm.oracle = oracle;
+        }
     }
 
     /// Close the modal without deleting (any key but `y`).
@@ -1744,7 +1774,10 @@ mod tests {
         let mut state = UiState::new(snapshot(1, 0, None, markable_rows(), false));
         assert_eq!(state.toggle_mark(), Err(MarkRefusal::ScanRunning));
         assert!(state.marks().is_empty());
-        assert!(!state.open_confirm(0, None), "confirm locked out too");
+        assert!(
+            !state.open_confirm(0, None, OracleSlot::Disabled),
+            "confirm locked out too"
+        );
         assert!(state.confirm().is_none());
     }
 
@@ -1811,13 +1844,13 @@ mod tests {
     fn confirm_modal_state_machine() {
         let mut state = UiState::new(snapshot(1, 0, None, markable_rows(), true));
         assert!(
-            !state.open_confirm(0, None),
+            !state.open_confirm(0, None, OracleSlot::Disabled),
             "nothing marked: refuses to open"
         );
         assert!(state.take_confirmed_marks().is_none(), "nothing to confirm");
 
         state.toggle_mark().unwrap();
-        assert!(state.open_confirm(2, None));
+        assert!(state.open_confirm(2, None, OracleSlot::Disabled));
         assert_eq!(state.confirm().unwrap().hardlink_files, 2);
 
         // Esc / any non-y key: cancel, marks intact.
@@ -1826,7 +1859,7 @@ mod tests {
         assert_eq!(state.marks().len(), 1, "cancel keeps the marks");
 
         // Reopen and confirm: marks handed over and cleared.
-        assert!(state.open_confirm(0, None));
+        assert!(state.open_confirm(0, None, OracleSlot::Disabled));
         let confirmed = state.take_confirmed_marks().expect("modal was open");
         assert_eq!(confirmed.len(), 1);
         assert_eq!(confirmed[0].node, NodeId::from_raw(1));
@@ -2050,12 +2083,12 @@ mod tests {
             top_holders: vec![(123, Some("nginx".to_owned()))],
             partial_coverage: None,
         };
-        assert!(state.open_confirm(0, Some(warning.clone())));
+        assert!(state.open_confirm(0, Some(warning.clone()), OracleSlot::Disabled));
         assert_eq!(state.confirm().unwrap().open_warning, Some(warning));
 
         // No warning (nothing open, or --no-proc-sweep): no line to show.
         state.cancel_confirm();
-        assert!(state.open_confirm(0, None));
+        assert!(state.open_confirm(0, None, OracleSlot::Disabled));
         assert!(state.confirm().unwrap().open_warning.is_none());
     }
 

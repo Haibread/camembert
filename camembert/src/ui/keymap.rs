@@ -10,13 +10,15 @@
 //! it cannot silently drift out of sync with the cheatsheet.
 //!
 //! A handful of keys need context `dispatch_simple` doesn't have (the
-//! scan phase, the flash/toast queues, the confirm/review modal state):
-//! descend/ascend, mark, delete, review, quit. Those stay hand-written in
-//! `ui::handle_key`, and are documented here as [`EXTRA`] purely for the
-//! cheatsheet/footer — kept honest by `ui::tests`' `handle_key` routing
-//! tests (`v_opens_review_and_d_from_within_it_opens_confirm` and
-//! neighbors), which drive each one through the real key handler and
-//! check it does what its entry claims.
+//! scan phase, the flash/toast queues, the confirm/review modal state, the
+//! freeable-2 selection oracle runtime): descend/ascend, mark, delete,
+//! review, clear marks, quit. Those stay hand-written in `ui::handle_key`,
+//! and are documented here as [`EXTRA`] purely for the cheatsheet/footer —
+//! kept honest by `ui::tests`' `handle_key` routing tests
+//! (`v_opens_review_and_d_from_within_it_opens_confirm` and neighbors),
+//! which drive each one through the real key handler and check it does
+//! what its entry claims. `u` (clear all marks) joined this set once it
+//! also needed to clear the oracle's per-mark job state (D4).
 //!
 //! The six sort keys (`d`/`a`/`n`/`m`/`c`/`e`) join that hand-written set
 //! for the same reason (D3, `docs/design/flat-view-decisions.md`): which
@@ -85,12 +87,6 @@ pub const SIMPLE: &[SimpleKey] = &[
         keys: "p",
         action: "toggle the apparent-size column",
         apply: UiState::toggle_apparent,
-    },
-    SimpleKey {
-        codes: &[KeyCode::Char('u')],
-        keys: "u",
-        action: "clear all marks",
-        apply: UiState::unmark_all,
     },
     SimpleKey {
         codes: &[KeyCode::Char('?')],
@@ -166,6 +162,10 @@ pub const EXTRA: &[ExtraKey] = &[
     ExtraKey {
         keys: "Space",
         action: "mark/unmark the row under the cursor for deletion [tree/flat]",
+    },
+    ExtraKey {
+        keys: "u",
+        action: "clear all marks",
     },
     ExtraKey {
         keys: "v",
