@@ -234,7 +234,7 @@ has proven itself.
 | `Ctrl-K` / `/` | open the filter/command palette — see [Filtering](#filtering) |
 | `?` | keyboard/mouse cheatsheet (`?`/`Esc` closes) |
 | `z` | toggle zen mode: table only — no metric cards, disk gauge or donut wheel |
-| `Esc` | close the palette, else a modal, else leave a flat/breakdown mode, else clear an active filter, else quit (contextual) |
+| `Esc` | close the palette, else a modal, else leave a flat/breakdown mode, else clear an active filter, else go up one directory like `Left` (contextual — never quits; quitting is `q`/`Ctrl-C`) |
 | `q` | quit unconditionally (cancels a running scan); inside the palette, only `Ctrl-C` quits — every other key, `q` included, is text |
 
 **Deletion is guarded**: mark-then-confirm, mount points refused, every

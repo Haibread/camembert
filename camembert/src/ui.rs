@@ -1204,18 +1204,20 @@ fn handle_key(
     }
     match code {
         KeyCode::Char('q') => return Action::Quit,
-        // Contextual Esc ladder (D3, extended by D6/attack-a finding 12):
-        // every modal already returned above, so getting here means none
-        // is open — leave a flat/breakdown mode first, else clear an
-        // active filter, else quit exactly like `q`. `q` itself always
-        // quits regardless of mode or filter (D3: "`q` always quits").
+        // Contextual Esc ladder (D3, extended by D6/attack-a finding 12;
+        // last rung changed by user request 2026-07-24): every modal
+        // already returned above, so getting here means none is open —
+        // leave a flat/breakdown mode first, else clear an active filter,
+        // else ascend one directory exactly like `Left`/`h` (a no-op at
+        // the scan root). Esc never quits; quitting is `q`/Ctrl-C only
+        // (D3: "`q` always quits").
         KeyCode::Esc => {
             if ui.mode() != ViewMode::Tree {
                 ui.leave_mode();
             } else if ui.active_filter().is_some() {
                 ui.clear_filter();
             } else {
-                return Action::Quit;
+                try_ascend(ui, phase);
             }
         }
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => return Action::Quit,
@@ -4991,7 +4993,8 @@ mod tests {
 
     /// `t`/`b` toggle into and back out of their modes through the real
     /// key handler, and `Esc` is contextual: it leaves a flat/breakdown
-    /// mode instead of quitting, but still quits from tree view (D3).
+    /// mode, and from tree view it ascends like `Left` — it never quits
+    /// (user request 2026-07-24; quitting is `q`/Ctrl-C only).
     #[test]
     fn t_b_and_contextual_esc_state_machine_through_handle_key() {
         let (mut ui, mut phase) = done_ui_with_one_file();
@@ -5009,9 +5012,13 @@ mod tests {
         assert!(matches!(action, Action::Continue), "Esc did not quit");
         assert_eq!(ui.mode(), ViewMode::Tree, "Esc left the mode");
 
-        // From tree view, Esc quits.
+        // From tree view at the scan root, Esc is an ascend no-op —
+        // never a quit.
         let action = press_code(KeyCode::Esc, &mut ui, &mut phase);
-        assert!(matches!(action, Action::Quit), "Esc quits from tree view");
+        assert!(
+            matches!(action, Action::Continue),
+            "Esc never quits: at the root it is an ascend no-op"
+        );
 
         // `b` toggles breakdown the same way; `q` always quits, mode or
         // not (D3: "q always quits").

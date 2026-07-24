@@ -72,7 +72,9 @@ as the root node's name, which breaks `dir/` ancestor tokens
 
 - Ctrl-K opens the palette (query-first; `>` prefix = commands
   generated from the keymap tables); `/` opens it pre-scoped to
-  filter. Esc ladder: palette > modal > mode > filter-clear > quit;
+  filter. Esc ladder: palette > modal > mode > filter-clear > quit
+  (amended 2026-07-24 by user request: the last rung is now
+  ascend-one-directory, like `Left` — Esc never quits, `q`/Ctrl-C do);
   while the palette is open, **all single-char global keys are
   suspended** (text-input mode — fixes the `q` kill).
 - History: XDG state dir (`camembert/history`), bounded, written

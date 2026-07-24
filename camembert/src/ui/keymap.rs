@@ -187,7 +187,7 @@ pub const EXTRA: &[ExtraKey] = &[
     ExtraKey {
         keys: "Esc",
         action: "close the palette, else a modal, else leave the flat/breakdown mode, \
-                 else clear an active filter, else quit [from tree]",
+                 else clear an active filter, else go up one directory (never quits)",
     },
     ExtraKey {
         keys: "q, Ctrl-C",
