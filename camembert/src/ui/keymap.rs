@@ -255,6 +255,7 @@ mod tests {
                     items: 1,
                     errors: 0,
                     state: RowState::File,
+                    error_reason: None,
                     mtime: 0,
                 },
                 Row {
@@ -267,6 +268,7 @@ mod tests {
                     items: 1,
                     errors: 0,
                     state: RowState::File,
+                    error_reason: None,
                     mtime: 0,
                 },
             ],

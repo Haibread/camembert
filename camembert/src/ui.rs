@@ -73,6 +73,7 @@ use tracing::{debug, error, info, warn};
 
 use camembert_core::delete;
 use camembert_core::dump::{self, DumpMeta};
+use camembert_core::errno::{self, Severity};
 use camembert_core::fiemap::shared_bit_reliable;
 use camembert_core::flat::{self, FlatConfig};
 use camembert_core::freeable::{self, Ledger};
@@ -2270,24 +2271,6 @@ fn draw(
     // stack, each keeping its own line.
     let pill_height = if ui.active_filter().is_some() { 1 } else { 0 };
     let (cards_height, gauge_height) = cards_and_gauge_heights(ui.zen());
-    let [
-        header_area,
-        cards_area,
-        gauge_area,
-        main_area,
-        pill_area,
-        basket_area,
-        footer_area,
-    ] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(cards_height),
-        Constraint::Length(gauge_height),
-        Constraint::Min(3),
-        Constraint::Length(pill_height),
-        Constraint::Length(basket_height),
-        Constraint::Length(2),
-    ])
-    .areas(frame.area());
 
     // Held for the whole frame (brief, synchronous) — every draw helper
     // below that needs the frozen arena borrows through this one guard
@@ -2298,12 +2281,48 @@ fn draw(
     };
     let outcome: Option<&ScanOutcome> = outcome_guard.as_deref();
 
+    // Post-scan per-errno breakdown for the errors card (design: attach to
+    // the errors card's affordances). Computed from the frozen arena's error
+    // side-table, so it only appears once the scan is done and at least one
+    // error carried a reason; hidden in zen mode like the cards themselves.
+    // It takes its own one-line slot right under the cards row (the same
+    // `Length(0)`-when-empty pattern as the basket strip and filter pill).
+    let error_breakdown = match outcome {
+        Some(outcome) if !ui.zen() => errno::breakdown(outcome.tree().error_reason_counts()),
+        _ => Vec::new(),
+    };
+    let breakdown_height = if error_breakdown.is_empty() { 0 } else { 1 };
+
+    let [
+        header_area,
+        cards_area,
+        breakdown_area,
+        gauge_area,
+        main_area,
+        pill_area,
+        basket_area,
+        footer_area,
+    ] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(cards_height),
+        Constraint::Length(breakdown_height),
+        Constraint::Length(gauge_height),
+        Constraint::Min(3),
+        Constraint::Length(pill_height),
+        Constraint::Length(basket_height),
+        Constraint::Length(2),
+    ])
+    .areas(frame.area());
+
     let breadcrumb = draw_header(frame, header_area, ui, spinner, ctx);
     let errors_card = if ui.zen() {
         None
     } else {
         draw_metric_cards(frame, cards_area, ui, ctx)
     };
+    if breakdown_height > 0 {
+        draw_error_breakdown(frame, breakdown_area, &error_breakdown, ctx);
+    }
     let gauge_freeable = if ui.zen() {
         None
     } else {
@@ -2631,6 +2650,28 @@ fn draw_metric_cards(
         frame.render_widget(text, *card_area);
     }
     errors_card
+}
+
+/// One-line per-errno breakdown under the errors card: each errno with its
+/// count, ordered most-alarming class first (a single `EIO` outranks
+/// thousands of benign `EACCES`), colored by severity. `rows` comes from
+/// [`errno::breakdown`] and is never empty when this is called.
+fn draw_error_breakdown(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    rows: &[(rustix::io::Errno, u64, Severity)],
+    ctx: &RenderCtx,
+) {
+    let theme = &ctx.theme;
+    let mut spans = vec![Span::from(" by reason  ").fg(theme.color(theme::MUTED))];
+    for (i, &(e, count, severity)) in rows.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::from(" · ").fg(theme.color(theme::MUTED)));
+        }
+        let slot = severity_slot(severity);
+        spans.push(Span::from(format!("{} {count}", errno::name(e))).fg(theme.color(slot)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Rounded borders where the glyph ladder allows, plain ASCII otherwise.
@@ -3267,6 +3308,28 @@ fn draw_breakdown_table(
 /// Selection card under the table: humanized mtime, item count, share of
 /// the parent, error count for the row under the cursor — or the
 /// mouse-hovered row while the pointer sits over the table.
+/// Theme slot for an error's severity class: hardware/mount faults stay in
+/// the coral error family, permission denials take the accent (benign but
+/// worth noticing), pure noise is muted.
+fn severity_slot(severity: Severity) -> theme::Slot {
+    match severity {
+        Severity::Alert | Severity::Fault => theme::ERROR,
+        Severity::Denied => theme::ACCENT,
+        Severity::Noise => theme::MUTED,
+    }
+}
+
+/// The consequence half of the selection card's errno note: an unreadable
+/// directory's subtree is unknown (its size is a floor); a failed-stat
+/// entry has no size at all.
+fn error_consequence(is_dir: bool) -> &'static str {
+    if is_dir {
+        "subtree partly unscanned, size shown is a floor"
+    } else {
+        "entry unreadable, size unknown"
+    }
+}
+
 fn draw_selection_card(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -3311,15 +3374,36 @@ fn draw_selection_card(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let sep = Span::from(" · ").fg(theme.color(theme::MUTED));
-    let mut line2 = vec![
-        Span::from(format!("modified {}", fmt::humanize_age(now, row.mtime))),
-        sep.clone(),
-        Span::from(format!("{} items", row.items)),
-    ];
-    if row.errors > 0 {
-        line2.push(sep.clone());
-        line2.push(Span::from(format!("{} errors", row.errors)).fg(theme.color(theme::ERROR)));
-    }
+    // A row that failed its own read (unreadable directory or failed stat)
+    // trades the mtime/items line for a severity-aware errno note: the
+    // errno, its human label, and the consequence (an unreadable directory's
+    // subtree is unknown, so its size is only a floor).
+    let line2 = if let Some(errno) = row.error_reason {
+        let slot = severity_slot(errno::severity(errno));
+        let glyph = if ctx.ascii() { "! " } else { "⚠ " };
+        vec![
+            Span::from(format!(
+                "{glyph}{} — {}",
+                errno::name(errno),
+                errno::label(errno)
+            ))
+            .fg(theme.color(slot))
+            .bold(),
+            sep.clone(),
+            Span::from(error_consequence(row.is_dir)).fg(theme.color(theme::MUTED)),
+        ]
+    } else {
+        let mut line2 = vec![
+            Span::from(format!("modified {}", fmt::humanize_age(now, row.mtime))),
+            sep.clone(),
+            Span::from(format!("{} items", row.items)),
+        ];
+        if row.errors > 0 {
+            line2.push(sep.clone());
+            line2.push(Span::from(format!("{} errors", row.errors)).fg(theme.color(theme::ERROR)));
+        }
+        line2
+    };
     let mut lines = vec![
         Line::from(vec![
             Span::from(format!("{:>9}", HumanSize(row.disk).to_string())).bold(),
@@ -4272,6 +4356,7 @@ mod tests {
             } else {
                 RowState::File
             },
+            error_reason: None,
             mtime: 1_000_000,
         };
         Arc::new(ViewSnapshot {
@@ -4319,6 +4404,7 @@ mod tests {
             items: 1,
             errors: 0,
             state: RowState::File,
+            error_reason: None,
             mtime: 0,
         };
         Arc::new(ViewSnapshot {
@@ -4713,6 +4799,163 @@ mod tests {
     fn cards_and_gauge_heights_collapse_in_zen_mode() {
         assert_eq!(cards_and_gauge_heights(false), (3, 1));
         assert_eq!(cards_and_gauge_heights(true), (0, 0));
+    }
+
+    #[test]
+    fn severity_slot_keeps_alarms_in_the_error_family() {
+        assert_eq!(severity_slot(Severity::Alert), theme::ERROR);
+        assert_eq!(severity_slot(Severity::Fault), theme::ERROR);
+        // Permission denials are benign but worth noticing; noise is muted.
+        assert_eq!(severity_slot(Severity::Denied), theme::ACCENT);
+        assert_eq!(severity_slot(Severity::Noise), theme::MUTED);
+    }
+
+    #[test]
+    fn error_consequence_distinguishes_dir_and_file() {
+        assert!(error_consequence(true).contains("subtree"));
+        assert!(error_consequence(true).contains("floor"));
+        assert!(error_consequence(false).contains("unreadable"));
+    }
+
+    /// The selection card of a row that failed its own read shows the
+    /// errno, its human label, and the consequence (issue #8).
+    #[test]
+    fn selection_card_shows_the_errno_reason() {
+        let reason = camembert_core::errno::from_name("EACCES");
+        assert!(reason.is_some(), "EACCES is a known errno");
+        let snapshot = Arc::new(ViewSnapshot {
+            generation: 1,
+            dir: DirId::from_raw(0),
+            parent: None,
+            path: PathBuf::from("/scan/root"),
+            rows: vec![Row {
+                name: b"locked".to_vec().into_boxed_slice(),
+                node: NodeId::from_raw(1),
+                dir: Some(DirId::from_raw(1)),
+                is_dir: true,
+                apparent: 4096,
+                disk: 4096,
+                items: 1,
+                errors: 1,
+                state: RowState::Error,
+                error_reason: reason,
+                mtime: 1_000_000,
+            }],
+            totals: DirTotals {
+                apparent: 4096,
+                disk: 4096,
+                items: 2,
+                errors: 1,
+            },
+            stats: ScanStats {
+                entries: 2,
+                dirs: 1,
+                errors: 1,
+                disk_bytes: 4096,
+                elapsed: Duration::from_millis(10),
+                root_complete: true,
+            },
+            hardlink_inodes: 0,
+            degraded: false,
+        });
+        let ui = UiState::new(snapshot);
+        let ctx = ctx(GlyphLevel::HalfBlock, ColorLevel::Truecolor);
+        let mut table_state = TableState::default();
+        let mut motion = no_motion();
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &ui,
+                    &Phase::Transitioning,
+                    &mut table_state,
+                    '⠋',
+                    None,
+                    &[],
+                    &mut motion,
+                    &ctx,
+                    false,
+                    &[],
+                    None,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("EACCES"), "errno name on the card: {text}");
+        assert!(
+            text.contains("permission denied"),
+            "human label on the card: {text}"
+        );
+        assert!(
+            text.contains("subtree"),
+            "consequence for an unreadable dir: {text}"
+        );
+    }
+
+    /// Post-scan, the errors card gains a severity-ordered per-errno
+    /// breakdown line built from the frozen tree's side-table (issue #8).
+    /// Needs a genuinely unreadable directory, so it is meaningful only for
+    /// a non-root run.
+    #[test]
+    fn errors_card_shows_the_per_errno_breakdown() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("keep"), b"data").unwrap();
+        let locked = tmp.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read_dir(&locked).is_ok() {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("skipping: running as root, no unreadable dir");
+            return;
+        }
+
+        let outcome = scan_dir(tmp.path());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(outcome.errors >= 1, "the locked dir produced an error");
+        let stats = view::scan_stats(outcome.tree(), outcome.root(), outcome.elapsed);
+        let snapshot = view::build_snapshot(
+            outcome.tree(),
+            outcome.root(),
+            1,
+            stats,
+            outcome.hardlink_inodes,
+            false,
+        );
+        let ui = UiState::new(Arc::new(snapshot));
+        let phase = Phase::Done(Arc::new(RwLock::new(outcome)));
+
+        let ctx = ctx(GlyphLevel::HalfBlock, ColorLevel::Truecolor);
+        let mut table_state = TableState::default();
+        let mut motion = no_motion();
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &ui,
+                    &phase,
+                    &mut table_state,
+                    '⠋',
+                    None,
+                    &[],
+                    &mut motion,
+                    &ctx,
+                    false,
+                    &[],
+                    None,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        let text: String = buffer.content().iter().map(|c| c.symbol()).collect();
+        assert!(
+            text.contains("by reason"),
+            "the breakdown line is present: {text}"
+        );
+        assert!(text.contains("EACCES"), "the errno is broken out: {text}");
     }
 
     /// `z` zen mode (design slice 5): metric cards, disk gauge and the

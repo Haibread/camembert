@@ -35,6 +35,7 @@ mod interner;
 pub use interner::{NameInterner, NameRef};
 
 use rustc_hash::{FxHashMap, FxHashSet};
+use rustix::io::Errno;
 
 use crate::size::Size;
 
@@ -320,6 +321,13 @@ pub struct Tree {
     /// Tiny (one entry per skipped mount point); feeds the dump's `ex`
     /// field and the UI.
     excluded: FxHashMap<NodeId, ExcludedReason>,
+    /// `errno` of each [`NodeFlags::ERROR`] node (unreadable directory or
+    /// failed stat). A sparse side-table for the same reasons as `excluded`:
+    /// [`NodeFlags`] is full at 3 bits, errors are rare, and severity
+    /// matters (`EIO` must never be buried), so the reason is preserved end
+    /// to end rather than collapsed into the single error bit. Feeds the
+    /// dump's `er` field, the selection card, and the per-errno breakdown.
+    error_reasons: FxHashMap<NodeId, Errno>,
     /// Removed nodes ([`Tree::apply_removal`]). A side set rather than a
     /// node flag: [`NodeFlags`] is full (3 bits), deletions are rare, and
     /// a per-row set lookup at iteration time is cheap. Tombstoned rows
@@ -382,6 +390,31 @@ impl Tree {
 
     pub(crate) fn set_excluded(&mut self, id: NodeId, reason: ExcludedReason) {
         self.excluded.insert(id, reason);
+    }
+
+    /// The `errno` behind a node's [`NodeFlags::ERROR`], when preserved (an
+    /// unreadable directory or a failed stat). `None` for a node without the
+    /// error flag, and for error nodes imported from a source that did not
+    /// carry the reason (e.g. an ncdu export, which records only a boolean).
+    pub fn error_reason(&self, id: NodeId) -> Option<Errno> {
+        self.error_reasons.get(&id).copied()
+    }
+
+    pub(crate) fn set_error_reason(&mut self, id: NodeId, errno: Errno) {
+        self.error_reasons.insert(id, errno);
+    }
+
+    /// Histogram of the preserved error reasons across the whole tree (the
+    /// side-table's values). Powers the errors card's severity-ordered
+    /// per-errno breakdown ([`crate::errno::breakdown`]). Tombstoned nodes
+    /// are already dropped from the table by [`Tree::apply_removal`], so the
+    /// counts stay consistent with the live `te` aggregates after a delete.
+    pub fn error_reason_counts(&self) -> FxHashMap<Errno, u64> {
+        let mut counts: FxHashMap<Errno, u64> = FxHashMap::default();
+        for &errno in self.error_reasons.values() {
+            *counts.entry(errno).or_insert(0) += 1;
+        }
+        counts
     }
 
     /// Raw name bytes of a node.
@@ -531,12 +564,16 @@ impl Tree {
                 // when they were removed — consistent with using the
                 // dir's *current* aggregates as the delta.
                 self.tombstones.insert(node);
+                self.error_reasons.remove(&node);
                 self.removed_dirs += 1;
                 let mut stack = vec![dir];
                 while let Some(d) = stack.pop() {
                     let children: Vec<NodeId> = self.children(d).collect();
                     for child in children {
                         self.tombstones.insert(child);
+                        // Keep the error side-table consistent with the `te`
+                        // aggregates the negative delta subtracts below.
+                        self.error_reasons.remove(&child);
                         if let Some(child_dir) = self.dir_of(child) {
                             self.removed_dirs += 1;
                             stack.push(child_dir);
@@ -549,6 +586,7 @@ impl Tree {
                 let size = n.size();
                 let counted = !n.flags().contains(NodeFlags::HARDLINK_EXTRA);
                 self.tombstones.insert(node);
+                self.error_reasons.remove(&node);
                 RemovalDelta {
                     apparent: if counted { size.apparent } else { 0 },
                     disk: if counted { size.real } else { 0 },
@@ -1117,6 +1155,45 @@ mod tests {
             },
         );
         let _ = tree.apply_removal(orphan_sized);
+    }
+
+    #[test]
+    fn error_reasons_are_stored_and_queryable() {
+        let (mut tree, root, f1, _sub, _sub_node, _leaf) = removal_tree();
+        assert_eq!(tree.error_reason(f1), None, "no reason before it is set");
+        tree.set_error_reason(f1, Errno::ACCESS);
+        assert_eq!(tree.error_reason(f1), Some(Errno::ACCESS));
+        // Untouched nodes stay absent.
+        assert_eq!(tree.error_reason(tree.dir(root).node), None);
+    }
+
+    #[test]
+    fn error_reason_counts_histogram() {
+        let (mut tree, root, f1, _sub, sub_node, leaf) = removal_tree();
+        tree.set_error_reason(f1, Errno::ACCESS);
+        tree.set_error_reason(leaf, Errno::ACCESS);
+        tree.set_error_reason(sub_node, Errno::IO);
+        let _ = root;
+        let counts = tree.error_reason_counts();
+        assert_eq!(counts.get(&Errno::ACCESS), Some(&2));
+        assert_eq!(counts.get(&Errno::IO), Some(&1));
+        assert_eq!(counts.values().sum::<u64>(), 3);
+    }
+
+    #[test]
+    fn removal_drops_error_reasons() {
+        let (mut tree, _root, f1, _sub, sub_node, leaf) = removal_tree();
+        tree.set_error_reason(f1, Errno::ACCESS);
+        tree.set_error_reason(leaf, Errno::IO);
+        // Removing the file drops just its reason.
+        tree.apply_removal(f1).expect("file removal");
+        assert_eq!(tree.error_reason(f1), None);
+        assert_eq!(tree.error_reason(leaf), Some(Errno::IO));
+        // Removing the subtree drops the descendant's reason too, keeping
+        // the histogram consistent with the subtracted `te`.
+        tree.apply_removal(sub_node).expect("dir removal");
+        assert_eq!(tree.error_reason(leaf), None);
+        assert!(tree.error_reason_counts().is_empty());
     }
 
     #[test]

@@ -74,7 +74,9 @@ pitch.
   `--statx-engine`/STATX_ENGINE experimental override).
 - **Tree** (`tree.rs`): 32-byte nodes, run-list children (D2), subtree
   aggregates, tombstoned removal with negative-delta propagation,
-  excluded-reason side map.
+  excluded-reason side map, **error-reason side map** (`errno` of every
+  unreadable dir / failed stat, preserved end to end — issue #8; taxonomy +
+  severity in `errno.rs`, dropped on removal to stay consistent with `te`).
 - **TUI** (`camembert/src/ui/`): browse-during-scan (arc-swap view
   snapshots, latest-wins nav cell, 33 ms cadence), dashboard cockpit
   (metric cards, statvfs disk gauge, table + donut wheel with identity
@@ -93,7 +95,10 @@ pitch.
   detection in a bounded raw-mode termios window (rustix, no thread).
 - **Dump v1** (`dump.rs` + `dump/read.rs`): ordered writer (`-o`,
   `.part`+rename, seekable zstd, `zstdcat|jq`-compatible — verified) and
-  streaming reader (torn-frame tolerant, number-or-string u64s).
+  streaming reader (torn-frame tolerant, number-or-string u64s). **Minor 1**
+  adds the optional `er` error-reason field (portable errno name; issue #8),
+  round-trips into the tree side-table. TUI: selection-card errno note +
+  severity-ordered per-errno breakdown under the errors card.
 - **Diff** (`diff.rs`, `camembert diff`): streaming merge-join, bounded
   memory, Added/Removed/Grown/Shrunk/Touched/TypeChanged, `--json`,
   `--threshold` (exit 1 = growth exceeded; 2 = error).

@@ -1395,6 +1395,7 @@ mod tests {
             items: 1,
             errors: 0,
             state: RowState::File,
+            error_reason: None,
             mtime,
         }
     }
@@ -1410,6 +1411,7 @@ mod tests {
             items,
             errors: 0,
             state: RowState::Scanning,
+            error_reason: None,
             mtime: 0,
         }
     }

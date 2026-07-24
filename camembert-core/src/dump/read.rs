@@ -29,9 +29,11 @@ use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::Path;
 
+use rustix::io::Errno;
 use serde_json::Value;
 
 use super::decode_name;
+use crate::errno;
 
 /// Errors that abort reading a dump. Truncation is *not* an error (see
 /// module docs); malformed JSON on a line is, because it means the input
@@ -105,6 +107,10 @@ pub struct DirBlock {
     pub totals: Option<Totals>,
     /// The directory itself could not be read.
     pub err: bool,
+    /// The `errno` behind `err`, when the dump preserved it (`er` field);
+    /// `None` for an error without a recorded reason or an unrecognized
+    /// value. Repopulates the tree's error side-table on load.
+    pub error_reason: Option<Errno>,
     /// Excluded reason (`"otherfs"`, `"kernfs"`, …) for never-scanned
     /// mount-point stubs; unknown values preserved opaquely.
     pub ex: Option<String>,
@@ -135,6 +141,10 @@ pub struct Entry {
     pub dev: Option<u64>,
     /// stat/read failed; sizes are zero.
     pub err: bool,
+    /// The `errno` behind `err`, when the dump preserved it (`er` field);
+    /// `None` for an error without a recorded reason or an unrecognized
+    /// value.
+    pub error_reason: Option<Errno>,
     /// Excluded reason, unknown values preserved opaquely.
     pub ex: Option<String>,
 }
@@ -341,6 +351,7 @@ impl<R: Read> DumpReader<R> {
             nd: u64_field(value, "nd").map_err(at)?.unwrap_or(0),
             totals,
             err: bool_field(value, "err"),
+            error_reason: str_field(value, "er").and_then(errno::from_name),
             ex: str_field(value, "ex").map(str::to_owned),
             entries: Vec::new(),
         })
@@ -360,6 +371,7 @@ impl<R: Read> DumpReader<R> {
             nlink: u64_field(value, "l").map_err(at)?,
             dev: u64_field(value, "dev").map_err(at)?.or(self.defaults.dev),
             err: bool_field(value, "err"),
+            error_reason: str_field(value, "er").and_then(errno::from_name),
             ex: str_field(value, "ex").map(str::to_owned),
         })
     }

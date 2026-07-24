@@ -436,7 +436,7 @@ fn handle_entry(
                 nlink: stat.nlink,
                 ino: stat.ino,
                 dev: stat.dev,
-                error: false,
+                error: None,
                 child_token: None,
                 excluded: None,
             };
@@ -470,7 +470,7 @@ fn handle_entry(
                                 "mount point unreadable"
                             );
                             section.sums.errors += 1;
-                            entry.error = true;
+                            entry.error = Some(errno);
                         }
                         MountKind::Unreadable(_) => {
                             // We were not going to descend anyway.
@@ -510,7 +510,7 @@ fn handle_entry(
                 nlink: 0,
                 ino: 0,
                 dev: 0,
-                error: true,
+                error: Some(errno),
                 child_token: None,
                 excluded: None,
             }

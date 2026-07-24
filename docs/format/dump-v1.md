@@ -71,13 +71,15 @@ unknown `t` (see §10).
 ### 6.1 Header (`t:"h"`)
 
 ```json
-{"t":"h","format":"camembert-dump","v":1,"minor":0,"prog":"camembert",
+{"t":"h","format":"camembert-dump","v":1,"minor":1,"prog":"camembert",
  "progver":"0.1.0","ts":1753142400,"root":"/var","dev":"64769",
  "sem":"blocks","ext":true,"ordered":true,"allino":false}
 ```
 
 - `format` must be `camembert-dump`; `v` is the major version (readers
-  refuse a major they don't know), `minor` the additive level.
+  refuse a major they don't know), `minor` the additive level. **Minor 1**
+  adds the optional `er` error-reason field (§6.2, §6.4); minor-0 readers
+  ignore it (§10).
 - `root`: scan root path (encoded like names). `dev`: its device (string).
 - `sem`: size semantics of defaults — `"blocks"` (st_blocks×512, the
   default) or `"apparent"`.
@@ -104,6 +106,13 @@ next `d`.
   at finalize). Subtree totals apply hardlink attribution (§8).
 - `err:true`: the directory itself could not be read (`nf`/`nd` 0, totals
   cover the directory inode only).
+- `er`: the errno behind `err`, as a **portable name string** (`"EACCES"`,
+  `"EIO"`, `"ESTALE"`, …), or the raw errno number as a decimal string for
+  errnos outside the common taxonomy. Present only alongside `err:true`, and
+  only when the reason was preserved (a scan preserves it; an ncdu import
+  records only the boolean). Readers that don't recognize the value keep it
+  opaque (§10). Severity is the point: `EIO` (failing disk) must never be
+  buried, `EACCES` is benign.
 - Subdirectories are **not** repeated as entry lines in the parent block;
   parenthood is implied by `path`.
 
@@ -133,6 +142,7 @@ style).
 | `l` | nlink | when `nlink>1` |
 | `dev` | device (string) | when ≠ block default |
 | `err` | `true`: stat/read failed | on error |
+| `er` | errno name (`"EACCES"`, `"EIO"`, …) or decimal string; the reason behind `err` | minor 1; when the reason is known |
 | `ex` | excluded: `"pattern"` `"otherfs"` `"kernfs"` `"frmlink"` | when excluded |
 
 The `ex` enum values are ncdu-compatible; unknown values must be preserved

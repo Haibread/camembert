@@ -46,9 +46,11 @@ pub(crate) struct BatchEntry {
     pub ino: u64,
     /// `st_dev` of the entry (hardlink registry key, other-fs detection).
     pub dev: u64,
-    /// stat failed; sizes are zero and only `kind` (from `d_type`, may be
-    /// [`Kind::Other`]) is known.
-    pub error: bool,
+    /// stat failed: the `errno`, preserved end to end so the owner can
+    /// record *why* (severity matters — `EIO` ≠ `EACCES`). `Some` implies
+    /// sizes are zero and only `kind` (from `d_type`, may be [`Kind::Other`])
+    /// is known.
+    pub error: Option<Errno>,
     /// For child directories that will be scanned: the token the worker
     /// assigned to the child's own future batches.
     pub child_token: Option<u64>,

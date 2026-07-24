@@ -231,9 +231,12 @@ impl Owner {
         if let Some(errno) = batch.dir_error {
             // Unreadable directory: state Error, counted in te up the
             // chain ("comptabiliser l'illisible"), then completed like any
-            // other dir so the cascade proceeds.
+            // other dir so the cascade proceeds. The errno is preserved on
+            // the directory's node (severity matters — EIO ≠ EACCES).
             debug!(?dir, %errno, "directory unreadable");
+            let dir_node = self.tree.dir(dir).node;
             self.tree.mark_error(dir);
+            self.tree.set_error_reason(dir_node, errno);
             self.tree.apply_delta(dir, 0, 0, 0, 1);
             self.progress.add_errors(1);
             self.tree.release_token(dir);
@@ -253,7 +256,7 @@ impl Owner {
 
         for entry in batch.entries {
             let mut flags = NodeFlags::default();
-            if entry.error {
+            if entry.error.is_some() {
                 flags.insert(NodeFlags::ERROR);
             }
             if entry.excluded.is_some() {
@@ -283,6 +286,10 @@ impl Owner {
 
             if let Some(reason) = entry.excluded {
                 self.tree.set_excluded(node, reason);
+            }
+            if let Some(errno) = entry.error {
+                // Preserve the failed stat's errno alongside the ERROR flag.
+                self.tree.set_error_reason(node, errno);
             }
 
             if is_hardlink {
@@ -386,7 +393,7 @@ mod tests {
             nlink: 1,
             ino: 0,
             dev: 1,
-            error: false,
+            error: None,
             child_token: None,
             excluded: None,
         }
@@ -402,7 +409,7 @@ mod tests {
             nlink: 2,
             ino: 0,
             dev: 1,
-            error: false,
+            error: None,
             child_token: Some(token),
             excluded: None,
         }
@@ -415,7 +422,7 @@ mod tests {
             sums.apparent += e.apparent;
             sums.disk += e.disk;
             sums.count += 1;
-            if e.error {
+            if e.error.is_some() {
                 sums.errors += 1;
             }
             if e.child_token.is_some() {

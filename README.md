@@ -589,6 +589,36 @@ non-shared:
 - **`--no-fiemap`/`NO_FIEMAP`** disables the floor together with the
   oracle: no background pass, no bright segment, no card line.
 
+## Error reporting
+
+A failed read is never just a number. camembert preserves the **errno**
+of every failing directory read and stat, end to end — scan → tree →
+dump → TUI — because severity matters: `EACCES` is benign ("rerun as
+root"), `EIO` means the disk may be failing and must never be buried,
+`ESTALE` is a broken network mount, `ELOOP`/`ENOENT` are noise.
+
+- **Selection card** — a row that failed its own read (an unreadable
+  directory, or an entry whose stat failed) shows the reason inline, e.g.
+  `⚠ EACCES — permission denied · subtree partly unscanned, size shown is
+  a floor`. An unreadable directory's subtree is unknown, so its size is a
+  floor, not a total.
+- **Errors card breakdown** — once the scan finishes, a one-line
+  per-errno breakdown appears under the metric cards, ordered by
+  **severity class first** (a single `EIO` outranks thousands of benign
+  `EACCES`), not by count: `by reason  EIO 12 · EACCES 3390 · ELOOP 2`.
+  Coloured by severity; hidden in zen mode (`z`) like the cards. Sort the
+  table by subtree error count with `e` (or by clicking the errors card).
+- **Dumps** — `.cmbt` dumps carry the reason as a portable name in the
+  optional `er` field (`"EACCES"`, `"EIO"`, …; a raw number for exotic
+  errnos), an additive **minor-1** field readers of older minors ignore.
+  It survives a write→read round trip and repopulates the tree's error
+  side-table. See [the dump spec](docs/format/dump-v1.md) §6.2/§6.4.
+
+A directory whose listing was cut short mid-read (a `getdents` failure
+after some entries) is counted in the error total but has no single node
+to attribute an errno to, so it is not broken out by reason — every
+error that maps to a node is.
+
 ## Configuration
 
 Beyond flags and environment variables, camembert reads an optional TOML
@@ -782,7 +812,9 @@ truncated dump is refused with exit code 2.
   (smallest-path) link — deterministic across scans, so diffs never
   show phantom growth.
 - Unreadable directories never abort a scan and never vanish: the
-  summary lists exactly where reads failed; in the TUI, sort with `e`.
+  summary lists exactly where reads failed, the errno reason is preserved
+  end to end (see [Error reporting](#error-reporting)); in the TUI, sort
+  with `e`.
 - Kernel pseudo-filesystems (`/proc`, `/sys`, cgroups…) are never
   descended into, even though crossing filesystem boundaries is the
   default (`--one-filesystem` restricts a scan to the root's own

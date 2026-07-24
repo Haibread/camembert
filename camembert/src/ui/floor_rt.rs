@@ -425,6 +425,7 @@ mod tests {
             disk,
             items: 1,
             errors: 0,
+            error_reason: None,
             state: camembert_core::view::RowState::File,
             mtime: 0,
         }

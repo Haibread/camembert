@@ -28,6 +28,8 @@ use std::time::{Duration, Instant};
 use arc_swap::{ArcSwap, ArcSwapOption};
 
 use crate::flat::{Accumulator, FlatSummary};
+use rustix::io::Errno;
+
 use crate::tree::{DirId, DirState, NodeFlags, NodeId, Tree};
 
 /// Normal snapshot publication cadence (D5: ≈30 fps).
@@ -79,6 +81,11 @@ pub struct Row {
     /// Subtree error count for scanned dirs; 1 for a failed-stat entry.
     pub errors: u64,
     pub state: RowState,
+    /// The `errno` behind this row's own error, when preserved: for an
+    /// unreadable directory ([`RowState::Error`]) or a failed-stat entry.
+    /// `None` for healthy rows and for errors imported without a reason.
+    /// Drives the selection card's severity note.
+    pub error_reason: Option<Errno>,
     /// mtime in unix seconds (the entry's own).
     pub mtime: i64,
 }
@@ -206,21 +213,30 @@ pub fn build_snapshot(
                         DirState::Complete => RowState::Complete,
                         DirState::Error => RowState::Error,
                     },
+                    // Only an unreadable directory carries a reason on its
+                    // own node; skip the side-table probe otherwise.
+                    error_reason: (m.state == DirState::Error)
+                        .then(|| tree.error_reason(node_id))
+                        .flatten(),
                     mtime: node.mtime(),
                 }
             }
-            None => Row {
-                name: tree.name(node_id).into(),
-                node: node_id,
-                dir: None,
-                is_dir,
-                apparent: node.size().apparent,
-                disk: node.size().real,
-                items: 1,
-                errors: u64::from(node.flags().contains(NodeFlags::ERROR)),
-                state: RowState::File,
-                mtime: node.mtime(),
-            },
+            None => {
+                let errored = node.flags().contains(NodeFlags::ERROR);
+                Row {
+                    name: tree.name(node_id).into(),
+                    node: node_id,
+                    dir: None,
+                    is_dir,
+                    apparent: node.size().apparent,
+                    disk: node.size().real,
+                    items: 1,
+                    errors: u64::from(errored),
+                    state: RowState::File,
+                    error_reason: errored.then(|| tree.error_reason(node_id)).flatten(),
+                    mtime: node.mtime(),
+                }
+            }
         };
         rows.push(row);
     }

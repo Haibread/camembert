@@ -11,6 +11,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
 
+use camembert_core::dump::read::DumpReader;
 use camembert_core::dump::{DumpMeta, decode_name, write_dump, write_dump_to_path};
 use camembert_core::scan::{ScanOptions, Scanner};
 
@@ -213,13 +214,17 @@ fn dump_of_a_real_scan_holds_the_spec_invariants() {
         "inode counted exactly once at the root"
     );
 
-    // Unreadable dir: err:true, zero children (non-root runs only).
+    // Unreadable dir: err:true, zero children, and the preserved errno
+    // (minor-1 `er` field) — EACCES for a chmod-000 directory (non-root
+    // runs only).
     if fixture.locked {
+        assert_eq!(h["minor"], 1, "the er field is a minor-1 addition");
         let locked_d = d_lines
             .iter()
             .find(|l| l["path"].as_str().unwrap().ends_with("/locked"))
             .expect("locked d line");
         assert_eq!(locked_d["err"], true);
+        assert_eq!(locked_d["er"], "EACCES", "errno preserved by name");
         assert_eq!(locked_d["nf"], 0);
         assert_eq!(locked_d["nd"], 0);
         assert!(outcome.errors >= 1);
@@ -272,6 +277,62 @@ fn dump_of_a_real_scan_holds_the_spec_invariants() {
             .expect("x-indexed frame contains a d line");
         assert_eq!(first_d["path"], p, "x maps the frame to its first d path");
     }
+}
+
+/// The errno of an unreadable directory survives the whole pipeline:
+/// scan → tree side-table → dump `er` field → reader `error_reason`.
+/// Meaningful only for a non-root run, where `locked/` is actually
+/// unreadable (root reads anything).
+#[test]
+fn errno_round_trips_through_the_dump() {
+    let fixture = build_fixture();
+    if !fixture.locked {
+        restore_locked(&fixture);
+        eprintln!("skipping: running as root, no unreadable dir to test");
+        return;
+    }
+    let root_path = fixture.dir.path().to_path_buf();
+
+    let scanner = Scanner::new(ScanOptions::default());
+    let mut outcome = scanner.scan(&root_path).expect("scan");
+    outcome.finalize_hardlinks();
+    restore_locked(&fixture);
+
+    // Scan side: the tree side-table holds EACCES for the locked dir.
+    let counts = outcome.tree().error_reason_counts();
+    assert!(
+        counts
+            .iter()
+            .any(|(&e, _)| camembert_core::errno::name(e) == "EACCES"),
+        "the tree side-table preserved the EACCES reason: {:?}",
+        counts
+            .keys()
+            .map(|&e| camembert_core::errno::name(e).into_owned())
+            .collect::<Vec<_>>()
+    );
+
+    // Dump side: write, then read back block by block and find the errno on
+    // the locked directory's block.
+    let ts = SystemTime::UNIX_EPOCH + Duration::from_secs(1_753_142_400);
+    let mut bytes = Vec::new();
+    write_dump(&outcome, &mut bytes, &DumpMeta { timestamp: ts }).expect("write_dump");
+
+    let mut reader = DumpReader::new(&bytes[..]).expect("read back");
+    let mut locked_reason = None;
+    while let Some(block) = reader.next_block().expect("block") {
+        if block.path.ends_with(b"/locked") {
+            locked_reason = Some(block.error_reason);
+        }
+    }
+    assert!(reader.is_complete(), "clean e marker");
+    let reason = locked_reason
+        .expect("locked block present")
+        .expect("er present");
+    assert_eq!(
+        camembert_core::errno::name(reason),
+        "EACCES",
+        "reader repopulates the reason from the dump"
+    );
 }
 
 #[test]

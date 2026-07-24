@@ -521,7 +521,7 @@ mod tests {
             nlink: 1,
             ino: 0,
             dev: 1,
-            error: false,
+            error: None,
             child_token: None,
             excluded: None,
         }
@@ -544,7 +544,7 @@ mod tests {
             nlink: 1,
             ino: 0,
             dev: 1,
-            error: false,
+            error: None,
             child_token: Some(token),
             excluded: None,
         }

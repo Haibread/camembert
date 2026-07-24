@@ -52,6 +52,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rustc_hash::FxHashMap;
 use tracing::debug;
 
+use crate::errno;
 use crate::scan::{HardlinkLink, ScanOutcome};
 use crate::tree::{DirId, DirState, ExcludedReason, Kind, NodeFlags, NodeId, Tree};
 
@@ -156,7 +157,7 @@ fn write_records<W: Write>(
     let root_path = encode_name(tree.name(root_meta.node));
     let mut header = JsonLine::new();
     header.str("t", "h").str("format", "camembert-dump");
-    header.u64("v", 1).u64("minor", 0);
+    header.u64("v", 1).u64("minor", 1);
     header
         .str("prog", "camembert")
         .str("progver", env!("CARGO_PKG_VERSION"));
@@ -208,6 +209,9 @@ fn write_records<W: Write>(
                     .u64("te", u64::from(meta.te));
                 if meta.state == DirState::Error {
                     d.bool("err", true);
+                    if let Some(e) = tree.error_reason(meta.node) {
+                        d.str("er", errno::name(e).as_ref());
+                    }
                 }
                 fw.write_line(d.finish().as_bytes())?;
 
@@ -244,6 +248,9 @@ fn write_records<W: Write>(
                     .u64("te", u64::from(err));
                 if err {
                     d.bool("err", true);
+                    if let Some(e) = tree.error_reason(node_id) {
+                        d.str("er", errno::name(e).as_ref());
+                    }
                 }
                 if flags.contains(NodeFlags::EXCLUDED) {
                     let reason = match tree.excluded_reason(node_id) {
@@ -300,6 +307,9 @@ fn entry_line(
     }
     if node.flags().contains(NodeFlags::ERROR) {
         line.bool("err", true);
+        if let Some(e) = tree.error_reason(id) {
+            line.str("er", errno::name(e).as_ref());
+        }
     }
     if node.flags().contains(NodeFlags::EXCLUDED) {
         // Non-directory excluded entries (spec §6.4 `ex`): the scanner
@@ -475,7 +485,7 @@ mod tests {
         assert_eq!(h["t"], "h");
         assert_eq!(h["format"], "camembert-dump");
         assert_eq!(h["v"], 1);
-        assert_eq!(h["minor"], 0);
+        assert_eq!(h["minor"], 1);
         assert_eq!(h["prog"], "camembert");
         assert_eq!(h["progver"], env!("CARGO_PKG_VERSION"));
         assert_eq!(h["ts"], 1_753_142_400_u64);
