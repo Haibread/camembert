@@ -75,13 +75,13 @@ use camembert_core::dump::{self, DumpMeta};
 use camembert_core::flat::{self, FlatConfig};
 use camembert_core::freeable::{self, Ledger};
 use camembert_core::query::{self, ApplyOptions, FilterResult, HardlinkIndex, Query};
-use camembert_core::scan::{LiveScan, ScanOutcome, Scanner};
+use camembert_core::scan::{LiveScan, ScanOutcome, Scanner, path_on_compressed_mount};
 use camembert_core::size::HumanSize;
 use camembert_core::tree::{DirId, NodeFlags, NodeId, Tree};
 use camembert_core::view::{self, RowState};
 
 use caps::{Caps, GlyphLevel};
-use fmt::DiskSpace;
+use fmt::{Coverage, DiskSpace};
 use palette::{CommandAction, PaletteMode};
 use state::{
     ConfirmState, FrameGeometry, MarkRefusal, ReviewState, SortKey, TableGeometry, UiState,
@@ -416,9 +416,14 @@ fn disk_space(path: &Path) -> Option<DiskSpace> {
         Ok(vfs) => {
             let capacity = vfs.f_blocks.saturating_mul(vfs.f_frsize);
             let free = vfs.f_bfree.saturating_mul(vfs.f_frsize);
+            // statvfs `used` is physical (post-compression); the scan's
+            // size totals are logical (`st_blocks`). On a compressed mount
+            // the two are different units, so the gauge must know which it
+            // is comparing — see `DiskSpace::coverage`.
             Some(DiskSpace {
                 capacity,
                 used: capacity.saturating_sub(free),
+                compressed: path_on_compressed_mount(path),
             })
         }
         Err(err) => {
@@ -2547,15 +2552,28 @@ fn draw_disk_gauge(
         return None;
     };
     let used = disk.used_fraction();
-    let coverage = disk.coverage_fraction(snapshot.stats.disk_bytes);
+    let scan_disk_bytes = snapshot.stats.disk_bytes;
+    // Logical (Σ st_blocks) vs physical (statvfs) — see `DiskSpace::coverage`.
+    // On a compressed mount the scan legitimately outweighs on-disk `used`;
+    // say so instead of clamping to a fabricated "covers 100% of used".
+    let coverage_label = match disk.coverage(scan_disk_bytes) {
+        Coverage::Fraction(f) => format!("this scan covers {:.0}% of used", f * 100.0),
+        Coverage::Exceeds { compressed: true } => {
+            "scan logical exceeds on-disk (compressed mount)".to_string()
+        }
+        Coverage::Exceeds { compressed: false } => {
+            "scan exceeds used (changed mid-scan)".to_string()
+        }
+        Coverage::Unknown => "coverage unavailable".to_string(),
+    };
     let freeable_bytes = ui
         .freeable_ledger()
         .map_or(0, Ledger::root_fs_freeable_bytes);
     let mut text = format!(
-        " {} · {:.0}% used · this scan covers {:.0}% of used",
+        " {} · {:.0}% used · {}",
         HumanSize(disk.capacity),
         used * 100.0,
-        coverage * 100.0,
+        coverage_label,
     );
     if freeable_bytes > 0 {
         text.push_str(&format!(" · {} freeable", HumanSize(freeable_bytes)));
@@ -2572,7 +2590,8 @@ fn draw_disk_gauge(
         ('█', '█', '░')
     };
     let used_cells = (used * bar_width as f64).round() as usize;
-    let covered_cells = (used * coverage * bar_width as f64).round() as usize;
+    let cover = disk.coverage_bar_fraction(scan_disk_bytes);
+    let covered_cells = (used * cover * bar_width as f64).round() as usize;
     let covered_cells = covered_cells.min(used_cells);
     let mut spans = vec![
         Span::from(label).fg(theme.color(theme::MUTED)),
@@ -4164,6 +4183,7 @@ mod tests {
             disk: Some(DiskSpace {
                 capacity: 100_000,
                 used: 40_000,
+                compressed: false,
             }),
             animate: true,
             no_proc_sweep: false,
@@ -4177,6 +4197,62 @@ mod tests {
     /// what every pre-slice-5 assertion here already expected.
     fn no_motion() -> anim::Motion {
         anim::Motion::new(false)
+    }
+
+    /// The disk gauge compares the scan's *logical* footprint against the
+    /// filesystem's *physical* `used`. When they coincide it prints a real
+    /// percentage; on a compressed mount, where logical routinely exceeds
+    /// physical, it says so plainly instead of clamping to a fabricated
+    /// "covers 100% of used". Renders the actual widget; the two rows are
+    /// printed under `--nocapture` so the wording is inspectable.
+    #[test]
+    fn disk_gauge_states_logical_vs_physical_honestly() {
+        // `sample_snapshot`'s scan footprint (logical) is 10_000 bytes.
+        let render = |disk: DiskSpace| -> String {
+            let mut render_ctx = ctx(GlyphLevel::Ascii, ColorLevel::Truecolor);
+            render_ctx.disk = Some(disk);
+            let ui = UiState::new(sample_snapshot());
+            let mut terminal = Terminal::new(TestBackend::new(110, 1)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw_disk_gauge(frame, frame.area(), &ui, &render_ctx);
+                })
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol().to_owned())
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        };
+
+        // Logical (10_000) < physical used (40_000): an ordinary percentage.
+        let fraction = render(DiskSpace {
+            capacity: 100_000,
+            used: 40_000,
+            compressed: false,
+        });
+        // Logical (10_000) > physical used (6_000) on a compressed mount:
+        // the honest message rather than a clamped, misleading 100%.
+        let compressed = render(DiskSpace {
+            capacity: 100_000,
+            used: 6_000,
+            compressed: true,
+        });
+
+        eprintln!("\n  [fraction]   {fraction}\n  [compressed] {compressed}\n");
+
+        assert!(
+            fraction.contains("this scan covers 25% of used"),
+            "fraction row: {fraction}"
+        );
+        assert!(
+            compressed.contains("scan logical exceeds on-disk (compressed mount)"),
+            "compressed row: {compressed}"
+        );
     }
 
     /// D6: the palette modal (query mode empty/typed/erroring, command

@@ -4,15 +4,46 @@
 use std::time::Duration;
 
 /// Disk space of the filesystem holding the scan root (statvfs), in
-/// bytes. Captured once at UI startup.
+/// bytes. Captured once at UI startup. `compressed` records whether the
+/// scan root sits on a transparently-compressed mount (btrfs `compress=`,
+/// detected once via mountinfo) — it changes what a coverage comparison
+/// *means* (see [`DiskSpace::coverage`]).
 #[derive(Debug, Clone, Copy)]
 pub struct DiskSpace {
     pub capacity: u64,
     pub used: u64,
+    pub compressed: bool,
+}
+
+/// How much of the filesystem's occupied space a scan accounts for.
+///
+/// Coverage compares two quantities that are **not the same unit** on a
+/// compressed filesystem: the scan's *logical* footprint (Σ `st_blocks`,
+/// what `du` and the size columns report) against statvfs's *physical*
+/// `used` (what the disk actually holds, post-compression). When they
+/// coincide (no compression), the ratio is a real percentage; when they
+/// don't, the scan's logical bytes can — and routinely do — exceed
+/// physical `used`, so a clamped "100%" would be a lie about what the
+/// scan covers. This enum keeps the two cases distinct instead.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Coverage {
+    /// No occupied space to compare against (empty / degenerate mount).
+    Unknown,
+    /// The scan accounts for this fraction, in `[0, 1]`, of physical
+    /// `used`. Only produced when the logical footprint does not exceed
+    /// physical `used`, so it never needs clamping.
+    Fraction(f64),
+    /// The scan's logical footprint exceeds physical `used`. Expected and
+    /// routine on a `compressed` mount (logical > on-disk); off one it is
+    /// a transient (mid-scan hardlink attribution, or the filesystem
+    /// shrinking underneath the scan). The flag lets the caller word the
+    /// two honestly rather than collapsing both into a bogus percentage.
+    Exceeds { compressed: bool },
 }
 
 impl DiskSpace {
-    /// Fraction of capacity occupied, in `[0, 1]`.
+    /// Fraction of capacity occupied, in `[0, 1]`. Both terms are
+    /// statvfs physical bytes, so this is always a truthful percentage.
     pub fn used_fraction(&self) -> f64 {
         if self.capacity == 0 {
             return 0.0;
@@ -20,15 +51,30 @@ impl DiskSpace {
         (self.used as f64 / self.capacity as f64).clamp(0.0, 1.0)
     }
 
-    /// Fraction of the *occupied* space covered by this scan's total,
-    /// clamped to `[0, 1]` — a scan can transiently exceed `used`
-    /// (hardlinks pre-finalization, concurrent writes), and claiming
-    /// more than 100% coverage would be dishonest.
-    pub fn coverage_fraction(&self, scan_disk_bytes: u64) -> f64 {
+    /// Classify how much of physical `used` this scan's logical footprint
+    /// accounts for. See [`Coverage`] for why "logical exceeds physical"
+    /// is a first-class answer rather than a clamped 100%.
+    pub fn coverage(&self, scan_disk_bytes: u64) -> Coverage {
         if self.used == 0 {
-            return 0.0;
+            return Coverage::Unknown;
         }
-        (scan_disk_bytes as f64 / self.used as f64).clamp(0.0, 1.0)
+        if scan_disk_bytes > self.used {
+            return Coverage::Exceeds {
+                compressed: self.compressed,
+            };
+        }
+        Coverage::Fraction(scan_disk_bytes as f64 / self.used as f64)
+    }
+
+    /// Fill fraction, in `[0, 1]`, for the gauge's "covered" segment. An
+    /// `Exceeds` scan fills the whole occupied region (it accounts for at
+    /// least all of physical `used`); `Unknown` fills nothing.
+    pub fn coverage_bar_fraction(&self, scan_disk_bytes: u64) -> f64 {
+        match self.coverage(scan_disk_bytes) {
+            Coverage::Unknown => 0.0,
+            Coverage::Fraction(f) => f,
+            Coverage::Exceeds { .. } => 1.0,
+        }
     }
 }
 
@@ -151,18 +197,49 @@ mod tests {
         let disk = DiskSpace {
             capacity: 1000,
             used: 400,
+            compressed: false,
         };
         assert!((disk.used_fraction() - 0.4).abs() < 1e-9);
-        assert!((disk.coverage_fraction(100) - 0.25).abs() < 1e-9);
-        // Scan bigger than used: clamped, never > 100%.
-        assert!((disk.coverage_fraction(9999) - 1.0).abs() < 1e-9);
+        assert_eq!(disk.coverage(100), Coverage::Fraction(0.25));
+        assert!((disk.coverage_bar_fraction(100) - 0.25).abs() < 1e-9);
         // Degenerate filesystems never divide by zero.
         let empty = DiskSpace {
             capacity: 0,
             used: 0,
+            compressed: false,
         };
         assert_eq!(empty.used_fraction(), 0.0);
-        assert_eq!(empty.coverage_fraction(5), 0.0);
+        assert_eq!(empty.coverage(5), Coverage::Unknown);
+        assert_eq!(empty.coverage_bar_fraction(5), 0.0);
+    }
+
+    #[test]
+    fn coverage_logical_exceeds_physical_is_not_clamped() {
+        // Uncompressed: a scan larger than `used` is a transient (hardlink
+        // attribution mid-scan, a shrinking filesystem) — reported as
+        // such, never as a fabricated 100%.
+        let plain = DiskSpace {
+            capacity: 1000,
+            used: 400,
+            compressed: false,
+        };
+        assert_eq!(
+            plain.coverage(9999),
+            Coverage::Exceeds { compressed: false }
+        );
+        // Compressed: logical > physical is the *expected* steady state,
+        // and the flag records it so the gauge can say why.
+        let zstd = DiskSpace {
+            capacity: 1000,
+            used: 400,
+            compressed: true,
+        };
+        assert_eq!(zstd.coverage(9999), Coverage::Exceeds { compressed: true });
+        // Both fill the whole occupied segment of the bar.
+        assert!((plain.coverage_bar_fraction(9999) - 1.0).abs() < 1e-9);
+        assert!((zstd.coverage_bar_fraction(9999) - 1.0).abs() < 1e-9);
+        // Exactly equal is still a truthful 100% fraction, not "exceeds".
+        assert_eq!(zstd.coverage(400), Coverage::Fraction(1.0));
     }
 
     #[test]

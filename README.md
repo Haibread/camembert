@@ -640,7 +640,14 @@ not gigabytes.
 - Kernel pseudo-filesystems (`/proc`, `/sys`, cgroups…) are never
   descended into, even with `--cross-filesystems`.
 - The disk gauge tells you how much of the *occupied* filesystem your
-  scan actually covers — a total without context is half a lie.
+  scan actually covers — a total without context is half a lie. The
+  coverage compares the scan's **logical** footprint (`st_blocks`)
+  against the kernel's **physical** `used` (statvfs), and those are
+  different units on a transparently-compressed mount (btrfs `compress=`):
+  logical routinely exceeds on-disk. Rather than clamp that to a
+  fabricated "covers 100% of used", the gauge says so plainly — *"scan
+  logical exceeds on-disk (compressed mount)"* — so a compressed
+  filesystem never makes the bar quietly lie.
 - Freeable (deleted-but-open files) states its scope and its gaps out
   loud — root-filesystem-only, btrfs multi-subvolume under-counting,
   mmap-only blind spot, RAM-backed split — see
