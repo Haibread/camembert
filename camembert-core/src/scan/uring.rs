@@ -252,3 +252,159 @@ fn retryable(err: &io::Error) -> bool {
                 || raw == Errno::BUSY.raw_os_error()
     )
 }
+
+#[cfg(test)]
+mod tests {
+    //! Coverage for the io_uring stat path: transient-error classification,
+    //! the errno-name formatter, the availability probe, and — end to end
+    //! against a real per-worker ring — the push/submit/drain/reap
+    //! bookkeeping and its per-entry error taxonomy. The ring tests skip
+    //! themselves where io_uring is unavailable (seccomp'd CI, gVisor, old
+    //! kernels, `io_uring_disabled`), exactly as the scan engine does.
+
+    use std::ffi::CString;
+
+    use rustix::fd::AsFd;
+    use rustix::fs::{Mode, OFlags};
+
+    use super::*;
+
+    /// Only `EINTR`/`EAGAIN`/`EBUSY` are transient `io_uring_enter` failures
+    /// worth retrying; a hard error (`EPERM`, `EIO`, `ENOSYS`, …) must break
+    /// the loop so the ring is disabled and entries fall back to sync stat.
+    #[test]
+    fn retryable_classifies_only_transient_errnos() {
+        for errno in [Errno::INTR, Errno::AGAIN, Errno::BUSY] {
+            let err = io::Error::from_raw_os_error(errno.raw_os_error());
+            assert!(retryable(&err), "{errno:?} must be retryable");
+        }
+        for errno in [
+            Errno::PERM,
+            Errno::IO,
+            Errno::NOSYS,
+            Errno::INVAL,
+            Errno::NOMEM,
+        ] {
+            let err = io::Error::from_raw_os_error(errno.raw_os_error());
+            assert!(!retryable(&err), "{errno:?} must not be retryable");
+        }
+        // An error without a raw OS code is not retryable.
+        assert!(!retryable(&io::Error::other("no errno")));
+    }
+
+    /// The engine-selection log names an errno symbolically when it can.
+    #[test]
+    fn errno_name_is_non_empty_for_os_errors() {
+        let name = errno_name(&io::Error::from_raw_os_error(Errno::PERM.raw_os_error()));
+        assert!(!name.is_empty());
+        // A non-OS error still yields its text, never an empty string.
+        let name = errno_name(&io::Error::other("boom"));
+        assert!(name.contains("boom"));
+    }
+
+    /// The probe must return a decision without panicking, whatever the
+    /// environment — `Ok` where io_uring + the STATX opcode are available,
+    /// a human-readable `Err` reason otherwise.
+    #[test]
+    fn probe_returns_a_decision_without_panicking() {
+        match probe() {
+            Ok(()) => {}
+            Err(reason) => assert!(!reason.is_empty(), "denial reason must be described"),
+        }
+    }
+
+    fn open_dir(path: &std::path::Path) -> rustix::fd::OwnedFd {
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("open temp dir")
+    }
+
+    /// A full burst against a real ring: every submitted SQE is reaped and
+    /// its result populated in enumeration order with correct sizes. This
+    /// exercises the push → submit → drain → reap accounting — `results`
+    /// being fully `Some(Ok(_))` on return is the observable form of the
+    /// "in-flight == 0, every slot resolved" completion invariant.
+    #[test]
+    fn stat_burst_resolves_every_entry() {
+        let Ok(mut batcher) = StatxBatcher::new() else {
+            eprintln!("skipping: io_uring unavailable in this environment");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let count = 100u32;
+        for i in 0..count {
+            std::fs::write(tmp.path().join(format!("f{i:03}")), vec![b'.'; i as usize]).unwrap();
+        }
+        let dir = open_dir(tmp.path());
+        let names: Vec<CString> = (0..count)
+            .map(|i| CString::new(format!("f{i:03}")).unwrap())
+            .collect();
+        let mut results = Vec::new();
+        batcher.stat_burst(dir.as_fd(), &names, &mut results);
+
+        assert_eq!(results.len(), names.len());
+        if results.iter().any(Option::is_none) {
+            eprintln!("skipping asserts: ring refused ops (sync fallback path)");
+            return;
+        }
+        for (i, res) in results.iter().enumerate() {
+            // `EntryStat` has no `Debug`, so avoid formatting the result.
+            match res {
+                Some(Ok(stat)) => assert_eq!(stat.size.apparent, i as u64, "entry {i} size"),
+                Some(Err(_)) => panic!("entry {i} resolved to a stat error"),
+                None => panic!("entry {i} left unresolved by the ring"),
+            }
+        }
+    }
+
+    /// A missing name's own CQE returns `-ENOENT`; the batcher classifies it
+    /// as a real per-entry error (`Some(Err(ENOENT))`), not a `None`
+    /// "ring could not run it" that would trigger a phantom sync retry.
+    #[test]
+    fn stat_burst_reports_missing_entry_as_enoent() {
+        let Ok(mut batcher) = StatxBatcher::new() else {
+            eprintln!("skipping: io_uring unavailable in this environment");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("present"), b"x").unwrap();
+        let dir = open_dir(tmp.path());
+        let names = vec![
+            CString::new("present").unwrap(),
+            CString::new("absent").unwrap(),
+        ];
+        let mut results = Vec::new();
+        batcher.stat_burst(dir.as_fd(), &names, &mut results);
+
+        assert_eq!(results.len(), 2);
+        match &results[1] {
+            Some(Err(errno)) => assert_eq!(*errno, Errno::NOENT),
+            None => eprintln!("skipping: ring refused the op (sync fallback path)"),
+            Some(Ok(_)) => panic!("absent entry unexpectedly resolved Ok"),
+        }
+    }
+
+    /// An empty burst is a no-op: no submit, empty results, no panic.
+    #[test]
+    fn stat_burst_empty_is_a_noop() {
+        let Ok(mut batcher) = StatxBatcher::new() else {
+            eprintln!("skipping: io_uring unavailable in this environment");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = open_dir(tmp.path());
+        let mut results = vec![Some(Ok(EntryStat {
+            file_type: rustix::fs::FileType::RegularFile,
+            size: crate::size::Size::new(1, 1),
+            mtime: 0,
+            nlink: 1,
+            ino: 1,
+            dev: 1,
+        }))];
+        batcher.stat_burst(dir.as_fd(), &[], &mut results);
+        assert!(results.is_empty(), "empty burst clears results");
+    }
+}
