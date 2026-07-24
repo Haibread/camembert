@@ -83,7 +83,7 @@ use camembert_core::tree::{DirId, NodeFlags, NodeId, Tree};
 use camembert_core::view::{self, RowState};
 
 use caps::{Caps, GlyphLevel};
-use fmt::{Coverage, DiskSpace};
+use fmt::DiskSpace;
 use palette::{CommandAction, PaletteMode};
 use state::{
     ConfirmState, FrameGeometry, MarkRefusal, ReviewState, SortKey, TableGeometry, UiState,
@@ -2270,7 +2270,7 @@ fn draw(
     let gauge_freeable = if ui.zen() {
         None
     } else {
-        draw_disk_gauge(frame, gauge_area, ui, ctx)
+        draw_disk_gauge(frame, gauge_area, ui, outcome, ctx)
     };
 
     // Main split: table (with selection card) left, wheel right — see
@@ -2608,7 +2608,15 @@ fn card_block(ctx: &RenderCtx) -> Block<'static> {
 /// Disk gauge line: statvfs capacity of the scanned filesystem — how much
 /// is occupied, and how much of the occupied space this scan accounts
 /// for. Coverage is clamped to 100% (mid-scan hardlink attribution and
-/// concurrent writes can transiently overshoot). When the freeable ledger
+/// concurrent writes can transiently overshoot). When the scan spans more
+/// than one filesystem (`outcome.device_count() > 1` — crossing mounts is
+/// the CLI default, see `--one-filesystem`), a percentage against this one
+/// statvfs would be dishonest (the scan total includes bytes from *other*
+/// filesystems, RAM-backed `tmpfs` included), so the caption says so
+/// instead of a logical-vs-physical `Coverage` comparison — see
+/// [`fmt::DiskSpace::coverage_caption`] for the full priority rule.
+/// `outcome` is `None` mid-scan (no tree to count devices over yet), which
+/// is treated as single-device. When the freeable ledger
 /// has root-fs freeable bytes (D5), a clickable " · X.X GiB freeable"
 /// suffix appears and this returns the gauge's screen rect for that
 /// hit-test; `None` when there's nothing to click through to (no ledger
@@ -2618,6 +2626,7 @@ fn draw_disk_gauge(
     frame: &mut Frame<'_>,
     area: Rect,
     ui: &UiState,
+    outcome: Option<&ScanOutcome>,
     ctx: &RenderCtx,
 ) -> Option<(u16, u16, u16, u16)> {
     let theme = &ctx.theme;
@@ -2633,19 +2642,15 @@ fn draw_disk_gauge(
     };
     let used = disk.used_fraction();
     let scan_disk_bytes = snapshot.stats.disk_bytes;
+    let device_count = outcome.map_or(1, ScanOutcome::device_count);
     // Logical (Σ st_blocks) vs physical (statvfs) — see `DiskSpace::coverage`.
     // On a compressed mount the scan legitimately outweighs on-disk `used`;
-    // say so instead of clamping to a fabricated "covers 100% of used".
-    let coverage_label = match disk.coverage(scan_disk_bytes) {
-        Coverage::Fraction(f) => format!("this scan covers {:.0}% of used", f * 100.0),
-        Coverage::Exceeds { compressed: true } => {
-            "scan logical exceeds on-disk (compressed mount)".to_string()
-        }
-        Coverage::Exceeds { compressed: false } => {
-            "scan exceeds used (changed mid-scan)".to_string()
-        }
-        Coverage::Unknown => "coverage unavailable".to_string(),
-    };
+    // say so instead of clamping to a fabricated "covers 100% of used". A
+    // scan spanning multiple filesystems (crossing mounts is the default)
+    // makes the whole comparison against one statvfs dishonest, regardless
+    // of compression, so that wording takes priority — see
+    // `DiskSpace::coverage_caption`.
+    let coverage_label = disk.coverage_caption(scan_disk_bytes, device_count);
     let freeable_bytes = ui
         .freeable_ledger()
         .map_or(0, Ledger::root_fs_freeable_bytes);
@@ -4343,7 +4348,7 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(110, 1)).unwrap();
             terminal
                 .draw(|frame| {
-                    draw_disk_gauge(frame, frame.area(), &ui, &render_ctx);
+                    draw_disk_gauge(frame, frame.area(), &ui, None, &render_ctx);
                 })
                 .unwrap();
             terminal

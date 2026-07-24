@@ -76,6 +76,33 @@ impl DiskSpace {
             Coverage::Exceeds { .. } => 1.0,
         }
     }
+
+    /// The gauge's coverage caption. A scan spanning more than one
+    /// filesystem (`device_count > 1` — crossing mounts is the CLI default,
+    /// `--one-filesystem` opts out) makes any percentage against this one
+    /// statvfs dishonest: the scan total then includes bytes from *other*
+    /// filesystems (RAM-backed `tmpfs` included), not just this one. That
+    /// framing takes priority over [`Coverage`] — including over
+    /// `Exceeds { compressed: true }` — because spanning filesystems is the
+    /// actual cause even when the root happens to also be compressed.
+    /// `device_count` is `1` for an ordinary same-filesystem scan (and for
+    /// a mid-scan gauge, before there is a [`camembert_core::scan::ScanOutcome`]
+    /// to count devices over).
+    pub fn coverage_caption(&self, scan_disk_bytes: u64, device_count: usize) -> String {
+        if device_count > 1 {
+            return format!("spans {device_count} filesystems · gauge shows the scan root's");
+        }
+        match self.coverage(scan_disk_bytes) {
+            Coverage::Fraction(f) => format!("this scan covers {:.0}% of used", f * 100.0),
+            Coverage::Exceeds { compressed: true } => {
+                "scan logical exceeds on-disk (compressed mount)".to_string()
+            }
+            Coverage::Exceeds { compressed: false } => {
+                "scan exceeds used (changed mid-scan)".to_string()
+            }
+            Coverage::Unknown => "coverage unavailable".to_string(),
+        }
+    }
 }
 
 /// "modified X ago" for the selection card: coarse, human units. Future
@@ -211,6 +238,50 @@ mod tests {
         assert_eq!(empty.used_fraction(), 0.0);
         assert_eq!(empty.coverage(5), Coverage::Unknown);
         assert_eq!(empty.coverage_bar_fraction(5), 0.0);
+    }
+
+    /// A scan spanning more than one filesystem (crossing mounts is the CLI
+    /// default; `--one-filesystem` opts out) makes a percentage against one
+    /// statvfs dishonest, so `device_count > 1` wins over every `Coverage`
+    /// case — including `Exceeds { compressed: true }`, since spanning
+    /// filesystems is the actual cause even when the root also happens to
+    /// be compressed.
+    #[test]
+    fn coverage_caption_multi_fs_wins_over_a_percentage() {
+        let disk = DiskSpace {
+            capacity: 1000,
+            used: 400,
+            compressed: false,
+        };
+        assert_eq!(
+            disk.coverage_caption(100, 3),
+            "spans 3 filesystems · gauge shows the scan root's"
+        );
+        // Single device: back to the ordinary percentage.
+        assert_eq!(
+            disk.coverage_caption(100, 1),
+            "this scan covers 25% of used"
+        );
+    }
+
+    #[test]
+    fn coverage_caption_multi_fs_wins_over_compressed_exceeds() {
+        let compressed = DiskSpace {
+            capacity: 1000,
+            used: 400,
+            compressed: true,
+        };
+        // Logical (500) > physical used (400): on its own this would be
+        // "scan logical exceeds on-disk (compressed mount)" — but spanning
+        // filesystems is the actual cause here, so that wording wins.
+        assert_eq!(
+            compressed.coverage_caption(500, 2),
+            "spans 2 filesystems · gauge shows the scan root's"
+        );
+        assert_eq!(
+            compressed.coverage_caption(500, 1),
+            "scan logical exceeds on-disk (compressed mount)"
+        );
     }
 
     #[test]
