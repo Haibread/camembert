@@ -55,3 +55,44 @@ View-snapshot publication targets **33 ms** (≈30 fps). Directories with
 more than ~20k children degrade to a **250 ms** publish cadence for that
 view only, displayed as "updating…"; the render loop itself never blocks
 and never drops below full frame rate.
+
+## Addendum (2026-07-24) — default flips to crossing filesystem boundaries
+
+User decision, not a re-litigation of D1–D5: the scan's mount-boundary
+behavior (the `st_dev` check grafted from D1's engine) now **crosses
+filesystem boundaries by default**. `--cross-filesystems` is removed;
+`--one-filesystem`/`ONE_FILESYSTEM` is the opt-out, restricting a scan to
+the root's own filesystem. Kernel pseudo-filesystems (`/proc`, `/sys`,
+cgroups, …) stay excluded by filesystem magic regardless of this flag —
+unchanged from before.
+
+**Rationale**: bytes on a `tmpfs` or another disk mounted under the scan
+root are real usage of *those* filesystems, not phantom totals invented
+by the scanner — stopping at the first mount point silently hid disk
+usage a user asked to see. The disk gauge's single-filesystem percentage
+is meaningless once a scan spans more than one device, so rather than
+show a dishonest number against only the scan root's statvfs, the gauge
+now captions multi-filesystem scans as "spans N filesystems · gauge
+shows the scan root's" (`ScanOutcome::device_count`) instead of a lying
+percentage.
+
+**Accepted caveats** (documented in `--one-filesystem`'s help text and
+the README's Honest numbers section, not reopened here):
+
+- **btrfs snapshot subvolumes**: descending into subvolumes also walks
+  snapshot subvolumes (e.g. `.snapshots`), which can multiply-count
+  snapshotted data. `--one-filesystem` avoids it.
+- **bind mounts and multi-mounts**: the `st_dev` check cannot see *why*
+  two paths share a device. A bind mount whose source is on the same
+  filesystem is descended as an ordinary directory and double-counted
+  even under `--one-filesystem` (its `st_dev` never differs from its
+  parent's); the same block device mounted at two paths inside the scan
+  is descended twice under the default crossing behavior. Hardlink
+  deduplication only catches `nlink > 1` files, so `nlink == 1` files and
+  directories still double-count in both cases.
+
+A **traversal-dedup dossier** (tracking visited `(st_dev, root inode)`
+pairs to collapse both cases) is planned — see HANDOFF's suggested next
+steps — but is out of scope for this addendum: the caveats above are
+accepted, documented trade-offs of shipping crossing-by-default now
+rather than blocking it on a dedup design.
