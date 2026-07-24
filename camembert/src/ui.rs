@@ -71,6 +71,7 @@ use ratatui::widgets::{
 use ratatui::{DefaultTerminal, Frame};
 use tracing::{debug, error, info, warn};
 
+use camembert_core::confidence::{Confidence, Verdict};
 use camembert_core::delete;
 use camembert_core::dump::{self, DumpMeta};
 use camembert_core::errno::{self, Severity};
@@ -3950,6 +3951,13 @@ fn draw_confirm_modal(
             "Delete {count} entries — {} on disk?",
             HumanSize(disk)
         ))),
+        // The headline verdict for the reclaim estimate, up front where
+        // the decision is made — the quantified oracle lines and their
+        // caveats keep their own places below. It grades the *bytes*
+        // estimate only: whether the open-file advisory saw the whole
+        // process table is a different question, answered in that
+        // advisory's own coverage clause (D6).
+        verdict_line(&oracle::verdict(&confirm.oracle), theme),
         Line::default(),
     ];
     for mark in ui.marks().iter().take(MAX_PATHS) {
@@ -4127,20 +4135,20 @@ fn draw_freeable_modal(frame: &mut Frame<'_>, ui: &UiState, ctx: &RenderCtx) -> 
         .saturating_sub(4)
         .clamp(24, 90)
         .min(area.width.saturating_sub(2));
-    // Reserve: title line, blank, scroll-position note, blank, hint line.
-    const CHROME_LINES: u16 = 5;
+    // Reserve: title line, verdict line, blank, scroll-position note,
+    // blank, hint line.
+    const CHROME_LINES: u16 = 6;
     let visible_rows = area.height.saturating_sub(2 + CHROME_LINES).max(1) as usize;
 
     let Some(ledger) = ui.freeable_ledger() else {
-        let hint = if ctx.no_proc_sweep {
-            "disabled (--no-proc-sweep/NO_PROC_SWEEP)"
-        } else {
-            "no data yet — the sweep runs once the scan completes"
-        };
+        // No ledger: the verdict *is* the whole content (NoFigure, with
+        // the reason distinguishing "switched off" from "not yet"), so it
+        // replaces the hint line rather than sitting above a restatement
+        // of itself.
         let lines = vec![
             Line::from(Span::from("freeable files").bold()),
             Line::default(),
-            Line::from(Span::from(hint).dim()),
+            verdict_line(&Verdict::sweep(None, ctx.no_proc_sweep), theme),
             Line::default(),
             Line::from("f/Esc closes".dim()),
         ];
@@ -4233,6 +4241,14 @@ fn draw_freeable_modal(frame: &mut Frame<'_>, ui: &UiState, ctx: &RenderCtx) -> 
         ))
         .bold(),
     )];
+    // The headline verdict sits directly under the figure it grades and
+    // above every detail line — including the coverage caveat it is
+    // derived from, which keeps its own wording and its "run as root"
+    // advice further down.
+    lines.push(verdict_line(
+        &Verdict::sweep(Some(ledger.coverage()), ctx.no_proc_sweep),
+        theme,
+    ));
     lines.push(Line::default());
     lines.extend(content.into_iter().skip(offset).take(visible_rows));
     lines.push(Line::default());
@@ -4250,6 +4266,31 @@ fn draw_freeable_modal(frame: &mut Frame<'_>, ui: &UiState, ctx: &RenderCtx) -> 
 
     render_floating_modal(frame, ctx, area, width, lines, " freeable ", theme::INFO);
     total
+}
+
+/// The freeable confidence verdict as one styled line, for the two places
+/// a freeable figure drives a decision: the `f` panel's headline and the
+/// delete-confirm modal's.
+///
+/// The graded word carries the level **in text** — a monochrome terminal
+/// reads "fragmentary" exactly as well as a truecolor one — and the color
+/// only reinforces it (never the reverse), through theme slots rather than
+/// literals so every capability rung and every palette downmaps the same
+/// way the rest of the UI does. `ERROR` is deliberate for the bottom rung:
+/// an estimate that may overstate, right before an irreversible deletion,
+/// has earned the alarm color.
+fn verdict_line<'a>(verdict: &Verdict, theme: &Theme) -> Line<'a> {
+    let slot = match verdict.level() {
+        Confidence::Measured => theme::GOOD,
+        Confidence::Partial => theme::ACCENT,
+        Confidence::Fragmentary => theme::ERROR,
+        Confidence::NoFigure => theme::MUTED,
+    };
+    Line::from(vec![
+        Span::from("confidence: ").fg(theme.color(theme::MUTED)),
+        Span::from(verdict.word()).bold().fg(theme.color(slot)),
+        Span::from(format!(" — {}", verdict.reason())).fg(theme.color(theme::MUTED)),
+    ])
 }
 
 /// Shared floating-modal chrome (centered `Clear` + bordered `Paragraph`)
@@ -5078,8 +5119,23 @@ mod tests {
         assert!(!content.contains('█'), "no block glyphs on the ASCII rung");
     }
 
+    /// [`render`] at a chosen color rung, for the "does this still read
+    /// with no color at all?" checks.
+    fn render_at(ui: &UiState, color: ColorLevel) -> String {
+        render_with_caps(ui, &[], None, color)
+    }
+
     fn render(ui: &UiState, toasts: &[String], flash: Option<&str>) -> String {
-        let ctx = ctx(GlyphLevel::HalfBlock, ColorLevel::Truecolor);
+        render_with_caps(ui, toasts, flash, ColorLevel::Truecolor)
+    }
+
+    fn render_with_caps(
+        ui: &UiState,
+        toasts: &[String],
+        flash: Option<&str>,
+        color: ColorLevel,
+    ) -> String {
+        let ctx = ctx(GlyphLevel::HalfBlock, color);
         let mut table_state = TableState::default();
         let mut motion = no_motion();
         let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
@@ -5993,11 +6049,18 @@ mod tests {
                 .collect()
         }
 
+        // Both shapes are now the headline verdict's `NoFigure` reason —
+        // there is no figure to grade, and the reason says which of the
+        // two absences it is.
         let mut enabled_ui = UiState::new(markable_snapshot());
         let content = render_with(false, &mut enabled_ui);
         assert!(
-            content.contains("no data yet"),
+            content.contains("has not finished yet"),
             "enabled, nothing swept yet: {content}"
+        );
+        assert!(
+            content.contains("no figure"),
+            "the verdict headline is rendered in the empty state: {content}"
         );
 
         let mut disabled_ui = UiState::new(markable_snapshot());
@@ -6005,6 +6068,102 @@ mod tests {
         assert!(
             content.contains("no-proc-sweep") || content.contains("disabled"),
             "--no-proc-sweep: says so explicitly: {content}"
+        );
+    }
+
+    /// The confidence verdict is a headline **above** the detail lines,
+    /// in both places a freeable figure drives a decision — it never
+    /// replaces a caveat, and the graded word is plain text so a
+    /// monochrome terminal reads the level just as well.
+    #[test]
+    fn confirm_modal_headlines_the_verdict_above_the_detail_lines() {
+        let mut ui = UiState::new(markable_snapshot());
+        ui.toggle_mark().unwrap();
+        let view = oracle::OracleView {
+            report: camembert_core::fiemap::OracleReport {
+                exclusive: 4096,
+                unknown: 300_000,
+                inodes: 2,
+                mapped: 2,
+                ..Default::default()
+            },
+            compressed: false,
+            old_kernel: false,
+            truncated_files: 0,
+            truncated_disk: 0,
+        };
+        ui.open_confirm(0, None, oracle::OracleSlot::Ready(view));
+
+        let content = render(&ui, &[], None);
+        // Majority of the selection unaccounted for: the bottom rung.
+        assert!(
+            content.contains("confidence: fragmentary"),
+            "verdict headline rendered: {content}"
+        );
+        assert!(
+            content.contains("not estimated (unwritten or unmapped)"),
+            "the detailed caveat line stays exactly where it was: {content}"
+        );
+        let verdict_at = content.find("confidence:").expect("verdict present");
+        let detail_at = content
+            .find("not estimated (unwritten")
+            .expect("detail present");
+        assert!(
+            verdict_at < detail_at,
+            "the verdict is a headline above the details, not a footnote"
+        );
+
+        // Mono: no color at all, and the level must still be readable.
+        let mono = render_at(&ui, ColorLevel::Mono);
+        assert!(
+            mono.contains("confidence: fragmentary"),
+            "the level word carries the grade without color: {mono}"
+        );
+    }
+
+    /// A pending oracle is a confidence signal ("not known yet"), never an
+    /// error and never a graded-but-weak figure — and the spinner line it
+    /// already had stays put underneath.
+    #[test]
+    fn confirm_modal_pending_oracle_reads_as_an_absent_figure() {
+        let mut ui = UiState::new(markable_snapshot());
+        ui.toggle_mark().unwrap();
+        ui.open_confirm(3, None, oracle::OracleSlot::Pending);
+        let content = render(&ui, &[], None);
+        assert!(
+            content.contains("confidence: no figure"),
+            "pending grades as an absence: {content}"
+        );
+        assert!(
+            content.contains("still mapping"),
+            "the reason says why it is absent: {content}"
+        );
+        assert!(
+            content.contains("estimating actual reclaim"),
+            "the existing spinner line is untouched: {content}"
+        );
+    }
+
+    /// `--no-fiemap` shows nothing rather than a fallback figure
+    /// (freeable2 D3) — the verdict names the absence instead of leaving
+    /// the modal silently short of a number.
+    #[test]
+    fn confirm_modal_no_fiemap_names_the_absence() {
+        let mut ui = UiState::new(markable_snapshot());
+        ui.toggle_mark().unwrap();
+        ui.open_confirm(3, None, oracle::OracleSlot::Disabled);
+        let content = render(&ui, &[], None);
+        assert!(
+            content.contains("confidence: no figure"),
+            "disabled grades as an absence: {content}"
+        );
+        assert!(
+            content.contains("--no-fiemap"),
+            "the reason names the flag that turned it off: {content}"
+        );
+        assert!(
+            !content.contains("frees"),
+            "no fabricated fallback figure: {content}"
         );
     }
 }

@@ -37,6 +37,7 @@ use std::thread;
 
 use tracing::{debug, warn};
 
+use camembert_core::confidence::{ReclaimFacts, Verdict};
 use camembert_core::fiemap::{
     FileMap, FsTier, LinkStatus, OracleInput, OracleReport, correlate, map_file,
     shared_bit_reliable, tier_of,
@@ -192,6 +193,39 @@ pub fn ready_wording(view: &OracleView) -> OracleWording {
 /// frame — see `ui::draw_confirm_modal`).
 pub fn pending_line(spinner: char) -> String {
     format!("{spinner} estimating actual reclaim… (y deletes without waiting)")
+}
+
+impl OracleView {
+    /// This view restated as the core's plain [`ReclaimFacts`], the input
+    /// to the confirm modal's headline verdict.
+    pub fn facts(&self) -> ReclaimFacts {
+        ReclaimFacts {
+            report: self.report,
+            compressed: self.compressed,
+            old_kernel: self.old_kernel,
+            truncated_files: self.truncated_files,
+            truncated_disk: self.truncated_disk,
+        }
+    }
+}
+
+/// The confirm modal's headline [`Verdict`] for the current slot — the
+/// single decision-grade judgement above the detailed caveat lines, which
+/// keep their own places below ([`ready_wording`], the phase-1 open-file
+/// advisory).
+///
+/// Both figure-less slots grade as `NoFigure` rather than as a weak
+/// figure, with distinct reasons: [`OracleSlot::Pending`] is a genuine
+/// confidence signal ("we do not know **yet**" — `y` stays live and acts
+/// on what is known, per D4), not an error, and it flips to a graded rung
+/// in place the moment the last job lands; [`OracleSlot::Disabled`] is
+/// `--no-fiemap` showing nothing rather than a fallback (freeable2 D3).
+pub fn verdict(slot: &OracleSlot) -> Verdict {
+    match slot {
+        OracleSlot::Disabled => Verdict::reclaim(None, true),
+        OracleSlot::Pending => Verdict::reclaim(None, false),
+        OracleSlot::Ready(view) => Verdict::reclaim(Some(&view.facts()), false),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1109,6 +1143,38 @@ mod tests {
         assert!(rt.known_maps.is_empty());
         assert!(rt.dev_tier.is_empty());
         assert!(rt.dev_compressed.is_empty());
+    }
+
+    /// The confirm modal's headline verdict for each slot. A pending
+    /// oracle must read as "not known yet", never as an error and never
+    /// as a graded-but-weak figure — and it must become a graded rung the
+    /// moment the report lands, since the modal re-renders in place.
+    #[test]
+    fn slot_verdicts_grade_pending_and_disabled_as_absences() {
+        assert_eq!(
+            verdict(&OracleSlot::Pending).line(),
+            "no figure — still mapping the selection"
+        );
+        assert_eq!(
+            verdict(&OracleSlot::Disabled).line(),
+            "no figure — extent mapping is off (--no-fiemap)"
+        );
+        let ready = OracleSlot::Ready(OracleView {
+            report: OracleReport {
+                exclusive: 4096,
+                inodes: 1,
+                mapped: 1,
+                ..OracleReport::default()
+            },
+            compressed: false,
+            old_kernel: false,
+            truncated_files: 0,
+            truncated_disk: 0,
+        });
+        assert_eq!(
+            verdict(&ready).line(),
+            "measured — every marked file accounted for"
+        );
     }
 
     #[test]
