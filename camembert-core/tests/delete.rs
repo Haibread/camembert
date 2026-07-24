@@ -5,9 +5,20 @@
 use std::fs;
 use std::path::Path;
 
-use camembert_core::delete::{self, EntryOutcome, SkipReason};
+use camembert_core::delete::{self, DeleteTarget, EntryOutcome, InodeId, SkipReason};
 use camembert_core::scan::{ScanOptions, ScanOutcome, Scanner};
 use camembert_core::tree::{NodeFlags, NodeId};
+
+/// The live `(dev, ino)` of a path, without following a final symlink —
+/// what a caller records to anchor a [`DeleteTarget`]'s identity check.
+fn identity_of(path: &Path) -> InodeId {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::symlink_metadata(path).expect("stat the target");
+    InodeId {
+        dev: meta.dev(),
+        ino: meta.ino(),
+    }
+}
 
 fn scan(path: &Path) -> ScanOutcome {
     Scanner::new(ScanOptions {
@@ -216,6 +227,95 @@ fn the_scan_root_itself_is_refused() {
         root.join("f").exists(),
         "nothing under the root was touched"
     );
+}
+
+#[test]
+fn an_impostor_swapped_in_since_the_mark_is_refused_by_identity() {
+    // The defense the descriptor-relative walk adds over the old path-based
+    // guard: a *real* directory of the same name renamed into the target's
+    // place between the mark (identity recorded) and the delete passes the
+    // type and same-device checks, yet must still be refused — its
+    // `(dev, ino)` is not the one the caller recorded.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    fs::create_dir(root.join("victim")).unwrap();
+    write(&root.join("victim/data.txt"), 4096);
+
+    let mut outcome = scan(root);
+    let victim = find_node(&outcome, &["victim"]);
+    // Recorded at mark time (here: right after the scan), before the swap.
+    let recorded = identity_of(&root.join("victim"));
+    let totals_before = outcome.totals;
+
+    // The swap: the original directory is moved aside and a *fresh* one of
+    // the same name takes its place (a new inode, same device, still a
+    // directory — so only the identity check can catch it).
+    fs::rename(root.join("victim"), root.join("moved-away")).unwrap();
+    fs::create_dir(root.join("victim")).unwrap();
+    write(&root.join("victim/impostor.txt"), 4096);
+    assert_ne!(
+        recorded,
+        identity_of(&root.join("victim")),
+        "the fresh directory must be a different inode"
+    );
+
+    let report = delete::delete_nodes_checked(
+        &mut outcome,
+        &[DeleteTarget {
+            node: victim,
+            expected: Some(recorded),
+        }],
+    );
+    assert_eq!((report.deleted, report.failed, report.skipped), (0, 0, 1));
+    assert!(matches!(
+        report.results[0].outcome,
+        EntryOutcome::Skipped(SkipReason::IdentityMismatch)
+    ));
+
+    // The impostor and its contents survive untouched, and the tree was not
+    // tombstoned or debited for the refused entry.
+    assert!(root.join("victim/impostor.txt").exists());
+    assert!(!outcome.tree().is_removed(victim));
+    assert_eq!(outcome.totals, totals_before);
+}
+
+#[test]
+fn a_directory_target_replaced_by_a_symlink_is_refused_and_never_followed() {
+    // The top-level target the scan recorded as a directory is a symlink by
+    // delete time. The no-follow `fstatat` sees the link (not what it points
+    // at), so the kind no longer matches and the entry is refused — and
+    // crucially the link is never traversed, so its target is untouched.
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    fs::create_dir(root.join("target")).unwrap();
+    write(&root.join("target/inside.txt"), 4096);
+    fs::create_dir(root.join("outside")).unwrap();
+    write(&root.join("outside/precious.txt"), 4096);
+
+    let mut outcome = scan(root);
+    let target = find_node(&outcome, &["target"]);
+    let recorded = identity_of(&root.join("target"));
+
+    // Swap the directory for a symlink pointing at the sibling tree.
+    fs::remove_dir_all(root.join("target")).unwrap();
+    std::os::unix::fs::symlink(root.join("outside"), root.join("target")).unwrap();
+
+    let report = delete::delete_nodes_checked(
+        &mut outcome,
+        &[DeleteTarget {
+            node: target,
+            expected: Some(recorded),
+        }],
+    );
+    assert_eq!((report.deleted, report.failed, report.skipped), (0, 0, 1));
+    assert!(matches!(
+        report.results[0].outcome,
+        EntryOutcome::Skipped(SkipReason::KindChanged)
+    ));
+
+    // The symlink was not followed: the sibling tree it pointed at is intact.
+    assert!(root.join("outside/precious.txt").exists());
+    assert!(!outcome.tree().is_removed(target));
 }
 
 #[test]
