@@ -833,8 +833,15 @@ and pattern aggregation, and the filter query language with a Ctrl-K
 command palette are implemented. Freeable phase 2 (both the mark-time
 selection oracle and the ambient exclusive floor above) is implemented;
 next: group/bulk marking under a filter, per-owner views, remote scan
-over ssh, and an HTML report export. The full design trail lives in
-[`docs/design/`](docs/design/).
+over ssh, and an HTML report export. Also tracked: per-directory inode
+counters with an `f_files` near-limit alert, apparent/real slack
+surfacing across small-file masses, quotas (`quotactl`, XFS project
+quotas — its own dossier), composable stdout output of the marked
+selection (fzf-style, for `rm $(camembert --print …)`), display-only
+cleanup recipes for known paths, an age/"big and cold" score view
+(size × age — a dossier is in progress), and a traversal-dedup dossier
+for the bind-mount/snapshot-subvolume double-counting noted above. The
+full design trail lives in [`docs/design/`](docs/design/).
 
 ## Development
 

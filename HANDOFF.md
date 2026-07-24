@@ -274,6 +274,23 @@ pitch.
    are the standing argument against sort authority).
 2. Wave 4 per the archived handoff: ssh remote scan, HTML export, watch
    mode (single-mutator design sketched in scan-tree docs), dated cache.
+3. Per-directory inode counters + an `f_files`-near-limit alert (statvfs)
+   — the archived design's "failure mode nobody surfaces".
+4. Apparent/real slack surfacing across small-file masses (`st_blocks`
+   is already carried per entry — effectively free to expose).
+5. Quotas (`quotactl`, XFS project quotas) — needs its own dossier; on a
+   shared machine the disk isn't always the real limit.
+6. Composable stdout output of the marked selection, fzf-style
+   (`rm $(camembert --print ...)`).
+7. Cleanup recipes: display-only suggestions for known paths (e.g.
+   `journalctl --vacuum-time=`, `pip cache purge`) — never executed,
+   only shown.
+8. Age/"big and cold" score view (size × age) — a dossier is in
+   progress.
+9. Traversal-dedup dossier: collapse the bind-mount and snapshot-
+   subvolume double-counting accepted in the crossing-by-default
+   addendum (see
+   [scan-tree-decisions.md](docs/design/scan-tree-decisions.md)).
 
 ## How to work on this repo
 
@@ -287,4 +304,6 @@ Read the relevant decision doc before touching a subsystem. Update
 README + `--help` with any CLI change. Never bump versions on your own.
 The user prefers co-designing structural decisions and being offered
 concrete options with a recommendation — bring dossiers, not open
-questions.
+questions. Every new dossier must answer, before options are drafted:
+**what does this work displace, and does the thesis agree with that
+trade?**

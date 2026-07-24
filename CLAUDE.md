@@ -20,6 +20,14 @@ output formats) must be documented in the same change:
 No undocumented feature lands, even experimental ones — mark them as
 experimental instead.
 
+## Dossier workflow
+
+Before drafting options for a new dossier, answer one question first:
+**what does this work displace, and does the thesis agree with that
+trade?** (thesis: differentiation through honest answers to real
+questions — see HANDOFF.md). A dossier that skips this ends up
+optimizing something the project doesn't actually need to win at.
+
 ## Benchmarks (regression guard + external comparison)
 
 Any change touching the scan hot path (`camembert-core/src/scan/`,
