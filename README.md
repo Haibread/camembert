@@ -43,6 +43,9 @@ fill in and re-sort live, and the donut wheel's slices grow in real time:
 
 <div align="center">
   <img src="docs/images/tui.png" alt="camembert's interactive TUI: a dashboard with metric cards, a disk gauge, a sortable directory table with proportion bars, and a live donut wheel of the current directory's children" width="820">
+
+  *Illustrative render, not a live capture — the numbers are synthetic
+  (see [tui-design.md](docs/design/tui-design.md#readme-hero-image)).*
 </div>
 
 The wheel is a real pie chart drawn in your terminal with sub-cell
@@ -148,12 +151,15 @@ camembert diff old.cmbt today.cmbt
 camembert /var --no-ui --filter '*.log >100M !older:1y'
 ```
 
-Every option is also an environment variable (`THREADS`,
-`ONE_FILESYSTEM`, `STATX_ENGINE`, `TOP`, `NO_UI`, `OUTPUT`, `FILTER`,
-`THRESHOLD`, `COLOR`, `THEME`, `NO_MOTION`, `NO_PROC_SWEEP`, `NO_FIEMAP`,
-`LOG_FILTER`, `LOG_FILE`, …) — see `camembert --help` and
-`camembert <subcommand> --help` for the full reference, including the
-interactive key map and the diff JSON schema.
+Every option is also an environment variable: `SCAN_PATH` (the directory
+to scan, positional otherwise), `THREADS`, `ONE_FILESYSTEM`,
+`STATX_ENGINE`, `TOP`, `NO_UI`, `OUTPUT`, `FILTER`, `COLOR`, `THEME`,
+`NO_MOTION`, `NO_PROC_SWEEP`, `NO_FIEMAP`, `LOG_FILTER`, `LOG_FILE` for
+the scan mode, plus `JSON_OUTPUT` and `THRESHOLD` for `camembert diff`
+(see [`camembert diff`](#camembert-diff--what-changed-between-two-scans)
+below) — see `camembert --help` and `camembert <subcommand> --help` for
+the full reference, including the interactive key map and the diff JSON
+schema.
 
 | Flag | Env | What it does |
 | --- | --- | --- |
@@ -822,7 +828,7 @@ over ssh, and an HTML report export. The full design trail lives in
 ## Development
 
 ```bash
-cargo test --workspace          # the suite (~480 tests)
+cargo test --workspace          # the suite (~518 tests)
 pre-commit install              # fmt + clippy -D warnings + hygiene hooks
 ```
 
