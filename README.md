@@ -878,7 +878,7 @@ full design trail lives in [`docs/design/`](docs/design/).
 ## Development
 
 ```bash
-cargo test --workspace          # the suite (~518 tests)
+cargo test --workspace          # the suite (~559 tests)
 pre-commit install              # fmt + clippy -D warnings + hygiene hooks
 ```
 

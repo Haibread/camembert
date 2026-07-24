@@ -55,7 +55,7 @@ pitch.
   identity is `Haibread <haibread@users.noreply.github.com>` (set
   repo-locally).
 
-## What is implemented (all merged on main, ~518 tests green)
+## What is implemented (all merged on main, ~559 tests green)
 
 - **Scan engine** (`camembert-core/src/scan/`): work-stealing,
   fd-relative `openat`/`getdents64`/`statx` (fstatat fallback), mount
@@ -319,7 +319,7 @@ pitch.
 ## How to work on this repo
 
 ```bash
-cargo test --workspace                                  # ~518 tests
+cargo test --workspace                                  # ~559 tests
 cargo clippy --workspace --all-targets -- -D warnings   # zero tolerance
 pre-commit run --all-files
 ```
