@@ -1,2 +1,4 @@
 /target
 /.claude/worktrees/
+# `camembert-mangen` writes generated roff here; it is a build product.
+/man/

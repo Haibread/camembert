@@ -959,7 +959,7 @@ trail lives in [`docs/design/`](docs/design/).
 ## Development
 
 ```bash
-cargo test --workspace          # the suite (~582 tests)
+cargo test --workspace          # the suite (~587 tests)
 pre-commit install              # fmt + clippy -D warnings + hygiene hooks
 ```
 

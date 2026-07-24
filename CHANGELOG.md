@@ -9,6 +9,21 @@ one is called out under **Breaking** with the migration to apply.
 
 ## [Unreleased]
 
+### Added
+
+- **Man pages** — `camembert-mangen <OUT_DIR>` renders `camembert.1` (plus
+  one page per subcommand) from the same clap definitions the binary parses
+  with, so the manual cannot drift from `--help`.
+- **`CAMEMBERT_GIT_SHA` is honored at build time** — set it and `--version`
+  reports that commit instead of `unknown`, which is what a distro packager
+  building from a `.git`-less tarball needs.
+- **Declared MSRV: Rust 1.88**, the floor the dependency graph already
+  imposed. A CI job builds against exactly that version, so raising it has
+  to be deliberate.
+- **AUR packaging** — `packaging/aur/` holds the `PKGBUILD` and the runbook
+  for publishing and updating it. Not published yet; it needs a release
+  containing the man-page generator.
+
 ## [0.2.0] - 2026-07-24
 
 ### Breaking
