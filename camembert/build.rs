@@ -5,6 +5,13 @@
 //! changes, or `unknown` when `.git` or the `git` binary is unavailable
 //! (crates.io / plain source-tarball builds).
 //!
+//! A `CAMEMBERT_GIT_SHA` already set in the environment wins over both:
+//! distro packagers build from a `.git`-less tarball but do know which
+//! commit they are packaging, and a build that says `unknown` when the
+//! packager could have said `3d07b34` helps nobody chasing a bug report.
+//! The value is used verbatim — camembert cannot verify a claim about a
+//! repository it cannot see.
+//!
 //! Only `.git/HEAD` and `.git/refs` are watched via `rerun-if-changed`, so a
 //! rebuild refreshes the commit after a commit/checkout/merge without
 //! re-running on every source-file edit. One consequence: the `-dirty`
@@ -25,8 +32,14 @@ fn main() {
 
     println!("cargo:rerun-if-changed={}", git_dir.join("HEAD").display());
     println!("cargo:rerun-if-changed={}", git_dir.join("refs").display());
+    println!("cargo:rerun-if-env-changed=CAMEMBERT_GIT_SHA");
 
-    let sha = git_sha(workspace_root).unwrap_or_else(|| "unknown".to_string());
+    let sha = env::var("CAMEMBERT_GIT_SHA")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| git_sha(workspace_root))
+        .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=CAMEMBERT_GIT_SHA={sha}");
 }
 
