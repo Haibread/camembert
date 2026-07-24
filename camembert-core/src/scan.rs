@@ -632,7 +632,8 @@ pub struct ScanOutcome {
     /// Mount points recorded but not descended into.
     pub excluded_dirs: u64,
     /// Subset of `excluded_dirs` that are kernel pseudo-filesystems
-    /// (`/proc`, `/sys`, …) — excluded even with `--cross-filesystems`.
+    /// (`/proc`, `/sys`, …) — excluded even when `cross_filesystems` is on
+    /// (CLI: crossing is the default; `--one-filesystem` opts out).
     pub excluded_kernfs: u64,
     /// Distinct `(dev, ino)` with `nlink > 1` seen.
     pub hardlink_inodes: u64,
@@ -835,5 +836,116 @@ impl ScanOutcome {
         dirs.sort_by_key(|&(d, te)| (std::cmp::Reverse(te), d.index()));
         dirs.truncate(n);
         dirs
+    }
+
+    /// Number of distinct filesystems (`st_dev`) this scan's live
+    /// (non-tombstoned) directories span. `1` for an ordinary
+    /// same-filesystem scan; more than `1` once crossing filesystem
+    /// boundaries (the CLI default; `--one-filesystem` opts out) actually
+    /// descended into another mounted filesystem or a RAM-backed `tmpfs`.
+    ///
+    /// Computed on demand with one O(dirs) pass over the tree — **not**
+    /// maintained on the scan hot path, so call this post-scan only (the
+    /// disk gauge, once per frame, is fine; a scan worker must not).
+    pub fn device_count(&self) -> usize {
+        self.tree
+            .dir_ids()
+            .filter(|&d| !self.tree.is_removed(self.tree.dir(d).node))
+            .map(|d| self.tree.dir(d).dev)
+            .collect::<rustc_hash::FxHashSet<_>>()
+            .len()
+    }
+}
+
+#[cfg(test)]
+mod device_count_tests {
+    use super::*;
+    use crate::size::Size;
+    use crate::tree::{ChildRun, Kind, NodeFlags};
+
+    /// root (dev 1) with one same-device child dir and one child dir on a
+    /// different device (a crossed mount, or a RAM-backed tmpfs) — built
+    /// directly with the owner-side arena mutators, mirroring
+    /// `view::tests::sample_tree`. Returns the outcome plus the other
+    /// device's dir node, so a caller can exercise removal.
+    fn multi_dev_outcome() -> (ScanOutcome, NodeId) {
+        let mut tree = Tree::new();
+        let root_node = tree.push_root_node(b"/scan", Size::new(4096, 8), 1000);
+        let root = tree.add_dir(root_node, None, 1);
+
+        let same_fs_node = tree.push_node(
+            b"same",
+            Kind::Dir,
+            NodeFlags::default(),
+            root_node,
+            Size::new(4096, 8),
+            111,
+        );
+        let other_fs_node = tree.push_node(
+            b"other",
+            Kind::Dir,
+            NodeFlags::default(),
+            root_node,
+            Size::new(4096, 8),
+            222,
+        );
+        tree.push_run(
+            root,
+            ChildRun {
+                start: same_fs_node.index() as u32,
+                len: 2,
+            },
+        );
+        tree.add_dir(same_fs_node, Some(root), 1);
+        tree.add_dir(other_fs_node, Some(root), 2);
+        tree.apply_delta(root, 4096 + 4096, 4096 + 4096, 2, 0);
+
+        let outcome = ScanOutcome::from_tree(
+            tree,
+            root,
+            PathBuf::from("/scan"),
+            Vec::new(),
+            0,
+            0,
+            0,
+            Duration::default(),
+        );
+        (outcome, other_fs_node)
+    }
+
+    #[test]
+    fn counts_distinct_live_devices() {
+        let (outcome, _) = multi_dev_outcome();
+        assert_eq!(outcome.device_count(), 2);
+    }
+
+    #[test]
+    fn single_device_scan_counts_one() {
+        let mut tree = Tree::new();
+        let root_node = tree.push_root_node(b"/scan", Size::new(4096, 8), 1000);
+        let root = tree.add_dir(root_node, None, 1);
+        let outcome = ScanOutcome::from_tree(
+            tree,
+            root,
+            PathBuf::from("/scan"),
+            Vec::new(),
+            0,
+            0,
+            0,
+            Duration::default(),
+        );
+        assert_eq!(outcome.device_count(), 1);
+    }
+
+    /// Once the other device's directory is deleted (tombstoned), it no
+    /// longer counts — `device_count` reflects the *live* tree, matching
+    /// what the gauge should say after a deletion drops the last directory
+    /// on a crossed filesystem.
+    #[test]
+    fn ignores_removed_directories() {
+        let (mut outcome, other_dir_node) = multi_dev_outcome();
+        assert_eq!(outcome.device_count(), 2);
+        outcome.apply_removal(other_dir_node).unwrap();
+        assert_eq!(outcome.device_count(), 1);
     }
 }
