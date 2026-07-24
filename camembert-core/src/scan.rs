@@ -24,8 +24,8 @@
 
 mod hardlink;
 mod media;
-mod message;
-mod owner;
+pub(crate) mod message;
+pub(crate) mod owner;
 mod uring;
 mod worker;
 
