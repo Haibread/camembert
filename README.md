@@ -134,6 +134,15 @@ tar xzf "camembert-${VERSION}-${TARGET}.tar.gz"
 Each archive contains the `camembert` binary alongside `LICENSE-MIT`,
 `LICENSE-APACHE`, and `README.md`.
 
+Both binaries are fully static (no libc to match, no dynamic loader). The
+x86_64 one is additionally `static-pie`, so it gets ASLR; the aarch64 one
+is **static but not position-independent**, because rustc's
+`aarch64-unknown-linux-musl` target does not enable static-pie and forcing
+it through the `musl-gcc` wrapper produces binaries that segfault at
+startup ([rust-lang/rust#95926](https://github.com/rust-lang/rust/issues/95926)).
+A working binary without ASLR beats a hardened one that does not run;
+build from source if you need PIE on ARM64.
+
 `camembert --version` embeds the exact commit it was built from (e.g.
 `camembert 0.2.0 (abc1234)`), so you can always tell what you're running.
 

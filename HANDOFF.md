@@ -219,7 +219,16 @@ pitch.
   not PIE** (the x86_64 one is `static-pie`), so it runs without ASLR;
   the earlier "static-pie" claim only ever held for x86_64. Not a
   regression — same workflow as v0.1.0, whose verification only covered
-  x86_64 — but worth fixing.
+  x86_64. **Investigated 2026-07-24, decided not to fix**: rustc's
+  `aarch64-unknown-linux-musl` spec does not set
+  `static_position_independent_executables` (x86_64's does), and forcing
+  PIE through the `musl-gcc` wrapper the release job installs is the
+  documented segfault-at-startup path
+  ([rust-lang/rust#95926](https://github.com/rust-lang/rust/issues/95926)).
+  A working binary without ASLR beats a hardened one that does not run;
+  the difference is stated in the README's Install section instead.
+  Reopen if upstream enables static-pie for the target, or if the job
+  moves off `musl-gcc` to self-contained `rust-lld` linking.
 - **Infra**: pre-commit (fmt, clippy -D warnings, actionlint, hygiene),
   GitHub workflows `quality` + `release` (SHA-pinned), Dependabot,
   dual MIT/Apache-2.0, repository metadata. The GitHub repo is live at
