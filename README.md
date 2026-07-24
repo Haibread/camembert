@@ -31,7 +31,8 @@ questions you actually have during an incident:
 And it is **honest about the numbers** other tools get wrong: hardlinks,
 sparse files, unreadable directories (counted *and* located, never
 silently missing), kernel pseudo-filesystems (`/proc` claims 128 TiB —
-camembert never counts it), mount boundaries.
+camembert never counts it), and mount boundaries (crossed by default, with
+the gauge saying so plainly once a scan spans more than one filesystem).
 
 ## The interface
 
@@ -146,7 +147,7 @@ camembert /var --no-ui --filter '*.log >100M !older:1y'
 ```
 
 Every option is also an environment variable (`THREADS`,
-`CROSS_FILESYSTEMS`, `STATX_ENGINE`, `TOP`, `NO_UI`, `OUTPUT`, `FILTER`,
+`ONE_FILESYSTEM`, `STATX_ENGINE`, `TOP`, `NO_UI`, `OUTPUT`, `FILTER`,
 `THRESHOLD`, `COLOR`, `THEME`, `NO_MOTION`, `NO_PROC_SWEEP`, `NO_FIEMAP`,
 `LOG_FILTER`, `LOG_FILE`, …) — see `camembert --help` and
 `camembert <subcommand> --help` for the full reference, including the
@@ -155,7 +156,7 @@ interactive key map and the diff JSON schema.
 | Flag | Env | What it does |
 | --- | --- | --- |
 | `--threads` | `THREADS` | scan worker threads (`0` = auto, media-adaptive: see below) |
-| `--cross-filesystems` | `CROSS_FILESYSTEMS` | descend into other mounted filesystems instead of stopping at them |
+| `--one-filesystem` | `ONE_FILESYSTEM` | stay on the scan root's filesystem, stopping at mount points, instead of the default of crossing them (kernel pseudo-filesystems are always excluded either way; also avoids multiply-counting btrfs snapshot subvolumes) |
 | `--statx-engine` | `STATX_ENGINE` | **experimental** — stat engine: `auto` (io_uring for ≤ 2-worker scans, probed, sync otherwise), `sync`, `io_uring` (see below) |
 | `--top` | `TOP` | entries in the summary's "top directories" **and** "top files" (D5) lists — one flag, two lists; the interactive `t` mode's own cap is the separate `flat_cap` config key |
 | `--no-ui` | `NO_UI` | summary mode: scan to completion, print totals, top directories, top files, no TUI |
@@ -471,9 +472,10 @@ shared extents and hardlink siblings are phase 2):
 - **Scope**: only files on the **scan root's own filesystem** count
   toward the gauge and the toast threshold — the same filesystem the
   disk gauge itself describes, so the number is always a coherent
-  subset of "used". With `--cross-filesystems`, files held open on
-  *other* crossed devices still appear in the panel, labeled by device,
-  but are never added to the gauge.
+  subset of "used". Since crossing filesystem boundaries is the default
+  (`--one-filesystem` opts out), files held open on *other* crossed
+  devices still appear in the panel, labeled by device, but are never
+  added to the gauge.
 - **btrfs multi-subvolume layouts**: several subvolumes mounted as
   separate `st_dev`s can share one underlying block pool. Because scope
   is decided by `st_dev`, a deleted-open file on a sibling subvolume
@@ -675,7 +677,16 @@ not gigabytes.
 - Unreadable directories never abort a scan and never vanish: the
   summary lists exactly where reads failed; in the TUI, sort with `e`.
 - Kernel pseudo-filesystems (`/proc`, `/sys`, cgroups…) are never
-  descended into, even with `--cross-filesystems`.
+  descended into, even though crossing filesystem boundaries is the
+  default (`--one-filesystem` restricts a scan to the root's own
+  filesystem).
+- By default camembert descends into every filesystem mounted under the
+  scan root — RAM-backed `tmpfs` and other disks included, since their
+  bytes are real usage of *those* filesystems, not phantom totals.
+  `--one-filesystem`/`ONE_FILESYSTEM` stops at mount points instead. One
+  caveat on btrfs: descending into subvolumes also walks snapshot
+  subvolumes (e.g. `.snapshots`), which can multiply-count snapshotted
+  data — `--one-filesystem` avoids that too.
 - The disk gauge tells you how much of the *occupied* filesystem your
   scan actually covers — a total without context is half a lie. The
   coverage compares the scan's **logical** footprint (`st_blocks`)
@@ -684,7 +695,12 @@ not gigabytes.
   logical routinely exceeds on-disk. Rather than clamp that to a
   fabricated "covers 100% of used", the gauge says so plainly — *"scan
   logical exceeds on-disk (compressed mount)"* — so a compressed
-  filesystem never makes the bar quietly lie.
+  filesystem never makes the bar quietly lie. Once a scan spans more than
+  one filesystem (the default, once it actually crosses a mount or hits a
+  `tmpfs`), a percentage against the scan root's one statvfs would be just
+  as dishonest, so the caption says so instead — *"spans N filesystems ·
+  gauge shows the scan root's"* — the bar itself still tracks the scan
+  root's own used/capacity, unchanged.
 - Freeable (deleted-but-open files) states its scope and its gaps out
   loud — root-filesystem-only, btrfs multi-subvolume under-counting,
   mmap-only blind spot, RAM-backed split — see
