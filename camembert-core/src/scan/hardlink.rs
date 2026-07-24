@@ -20,12 +20,53 @@ use crate::tree::{DirId, NodeFlags, NodeId, Tree};
 /// [`crate::tree::Node`] has no room for `ino`/`dev`/`nlink`, so the owner
 /// keeps them here (also consumed by the dump writer for the `i`/`l`
 /// entry fields).
+///
+/// The registry records **only `nlink > 1` inodes**: a file with a single
+/// link never appears here. Callers applying the freeable-2 D4 hardlink
+/// rule ("all links inside the selection, and the scan saw every link")
+/// therefore treat absence from the registry as `nlink == 1`.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct HardlinkLink {
+pub struct HardlinkLink {
+    /// The tree node of this link (one entry per *link*, so an inode with
+    /// three scanned links yields three records).
     pub node: NodeId,
+    /// `st_dev` of the inode (hardlinks never cross devices).
     pub dev: u64,
+    /// `st_ino` of the inode.
     pub ino: u64,
+    /// `st_nlink` as stat reported it: the number of links that *exist*
+    /// on the filesystem, scanned or not.
     pub nlink: u32,
+}
+
+/// All scanned links of one `nlink > 1` inode, grouped by `(dev, ino)` —
+/// the freeable-2 D4 rule inputs: an inode's bytes are freeable only when
+/// the selection contains every scanned link (`nodes`) **and** the scan
+/// saw every link that exists (`nodes.len() as u32 == nlink`).
+#[derive(Debug, Clone)]
+pub struct HardlinkGroup {
+    /// Every scanned link of the inode (at least one).
+    pub nodes: Vec<NodeId>,
+    /// `st_nlink` — total links existing on the filesystem.
+    pub nlink: u32,
+}
+
+/// Group the flat link registry by inode identity `(dev, ino)`. Each
+/// group's `nlink` is the stat-reported link count (they agree across
+/// links of one inode; the max is kept defensively).
+pub(crate) fn group_links(links: &[HardlinkLink]) -> FxHashMap<(u64, u64), HardlinkGroup> {
+    let mut groups: FxHashMap<(u64, u64), HardlinkGroup> = FxHashMap::default();
+    for link in links {
+        let group = groups
+            .entry((link.dev, link.ino))
+            .or_insert_with(|| HardlinkGroup {
+                nodes: Vec::new(),
+                nlink: link.nlink,
+            });
+        group.nodes.push(link.node);
+        group.nlink = group.nlink.max(link.nlink);
+    }
+    groups
 }
 
 /// Re-attribute every multi-link inode to its canonical owner. Returns the

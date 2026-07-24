@@ -44,7 +44,8 @@ use crate::size::Size;
 use crate::tree::{DirId, DirMeta, Node, NodeId, Tree};
 use crate::view::{ViewBus, ViewPublisher};
 
-pub(crate) use hardlink::HardlinkLink;
+pub use hardlink::{HardlinkGroup, HardlinkLink};
+pub use media::path_on_compressed_mount;
 use owner::{Owner, ROOT_TOKEN};
 use worker::{Job, JobFd, WorkerShared};
 
@@ -730,9 +731,21 @@ impl ScanOutcome {
         self.hardlinks_finalized
     }
 
-    /// Side records of every `nlink > 1` link (dump writer input).
-    pub(crate) fn hardlink_links(&self) -> &[HardlinkLink] {
+    /// Side records of every `nlink > 1` link seen by the scan (dump
+    /// writer input; freeable-2 D4 rule input). Single-link inodes never
+    /// appear here.
+    pub fn hardlink_links(&self) -> &[HardlinkLink] {
         &self.hardlink_links
+    }
+
+    /// The link registry grouped by inode identity: `(dev, ino)` → every
+    /// scanned link plus the stat-reported `nlink`. Built on demand (one
+    /// pass over the registry); the freeable-2 selection oracle uses it
+    /// to decide [`crate::fiemap::LinkStatus`] per D4 — an inode is only
+    /// fully contained when the selection holds all of `nodes` **and**
+    /// `nodes.len() as u32 == nlink` (the scan saw every existing link).
+    pub fn hardlink_groups(&self) -> rustc_hash::FxHashMap<(u64, u64), HardlinkGroup> {
+        hardlink::group_links(&self.hardlink_links)
     }
 
     /// The scan root directory.

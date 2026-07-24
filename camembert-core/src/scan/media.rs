@@ -323,11 +323,19 @@ fn read_rotational(device_dir: &Path) -> Media {
 // the line itself is space-delimited; nothing else in the format needs
 // escaping.
 
-/// One parsed mountinfo line's fields relevant to media detection.
+/// One parsed mountinfo line's fields relevant to media detection and
+/// compress-mount detection.
 struct MountEntry {
     mount_point: PathBuf,
     fstype: String,
     source: String,
+    /// Per-mount options (field 6, before the `-` separator), e.g.
+    /// `rw,relatime`.
+    options: String,
+    /// Per-superblock options (the field after `<fstype> <source>`), e.g.
+    /// `rw,compress=zstd:3,subvol=/@` — this is where btrfs reports
+    /// `compress`.
+    super_options: String,
 }
 
 /// Undo mountinfo's octal escaping of whitespace/backslash in path
@@ -359,8 +367,11 @@ fn unescape_octal(field: &str) -> String {
 }
 
 /// Parse one mountinfo line, if it is well-formed. Ignores the numeric
-/// ids, the `root` field, mount options, and any optional fields before
-/// the `-` separator — none of those affect media detection.
+/// ids, the `root` field, and any optional fields before the `-`
+/// separator — none of those affect media or compress detection. Both
+/// option fields (per-mount and per-superblock) are retained: btrfs
+/// reports `compress` in the super options, other filesystems could put
+/// relevant options in either.
 fn parse_line(line: &str) -> Option<MountEntry> {
     let mut fields = line.split(' ').filter(|s| !s.is_empty());
     let _id = fields.next()?;
@@ -368,7 +379,7 @@ fn parse_line(line: &str) -> Option<MountEntry> {
     let _majmin = fields.next()?;
     let _root = fields.next()?;
     let mount_point_raw = fields.next()?;
-    let _options = fields.next()?;
+    let options = fields.next()?;
     // Zero or more optional fields, terminated by a literal "-".
     for field in fields.by_ref() {
         if field == "-" {
@@ -377,10 +388,15 @@ fn parse_line(line: &str) -> Option<MountEntry> {
     }
     let fstype = fields.next()?;
     let source = fields.next()?;
+    // Super options are mandatory per proc(5), but a truncated line
+    // should not invalidate the fields already parsed.
+    let super_options = fields.next().unwrap_or_default();
     Some(MountEntry {
         mount_point: PathBuf::from(unescape_octal(mount_point_raw)),
         fstype: fstype.to_string(),
         source: source.to_string(),
+        options: options.to_string(),
+        super_options: super_options.to_string(),
     })
 }
 
@@ -420,6 +436,51 @@ pub(crate) fn parse_mountinfo(contents: &str, root_path: &Path) -> Option<PathBu
 /// `(contents, root_path) -> Option<PathBuf>`).
 fn mount_fstype(contents: &str, root_path: &Path) -> Option<String> {
     best_mount_entry(contents, root_path).map(|entry| entry.fstype)
+}
+
+// --- compress-mount detection (freeable phase 2, D2) -------------------
+
+/// Whether the mount covering `path` has transparent compression enabled
+/// (a `compress` / `compress-force` option in either mountinfo options
+/// field — btrfs reports it in the super options).
+///
+/// Freeable phase-2 figures are allocated-**logical** bytes; on a
+/// compressed mount the physical reclaim can be smaller, so every
+/// phase-2 surface adds a caveat line when this returns `true` (decision
+/// D2). Unknown / unreadable mountinfo → `false` (no caveat rather than
+/// a spurious one).
+pub fn path_on_compressed_mount(path: &Path) -> bool {
+    let Ok(contents) = fs::read_to_string(DEFAULT_MOUNTINFO_PATH) else {
+        return false;
+    };
+    // Canonicalize so relative paths and symlinked prefixes match the
+    // mount table; a path that no longer resolves (already deleted) is
+    // matched as given.
+    let canon = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    path_on_compressed_mount_in(&contents, &canon)
+}
+
+/// [`path_on_compressed_mount`] against injected mountinfo contents
+/// (pure parsing — the fixture-tested surface).
+fn path_on_compressed_mount_in(contents: &str, path: &Path) -> bool {
+    best_mount_entry(contents, path).is_some_and(|entry| {
+        has_compress_option(&entry.options) || has_compress_option(&entry.super_options)
+    })
+}
+
+/// Whether one comma-separated option string enables compression: a
+/// `compress` or `compress-force` key, with or without a value
+/// (`compress=zstd:3`). An explicit `compress=no` / `compress=none`
+/// (compression turned off) does not count.
+fn has_compress_option(options: &str) -> bool {
+    options.split(',').any(|opt| {
+        let (key, value) = match opt.split_once('=') {
+            Some((key, value)) => (key, Some(value)),
+            None => (opt, None),
+        };
+        (key == "compress" || key == "compress-force")
+            && !matches!(value, Some("no") | Some("none"))
+    })
 }
 
 #[cfg(test)]
@@ -1006,6 +1067,82 @@ mod tests {
     fn no_covering_mount_is_none() {
         let fixture = "1 0 8:1 / /mnt/data rw - ext4 /dev/sdb1 rw\n";
         assert_eq!(parse_mountinfo(fixture, Path::new("/unrelated/path")), None);
+    }
+
+    // --- path_on_compressed_mount: pure fixture parsing -----------------
+
+    #[test]
+    fn compress_zstd_in_super_options_is_detected() {
+        // "/" and "/home" both carry compress=zstd in the super options.
+        assert!(path_on_compressed_mount_in(
+            MOUNTINFO_FIXTURE,
+            Path::new("/home/user/docs")
+        ));
+        assert!(path_on_compressed_mount_in(
+            MOUNTINFO_FIXTURE,
+            Path::new("/etc/passwd")
+        ));
+    }
+
+    #[test]
+    fn mount_without_compress_option_is_not_compressed() {
+        // "/var" is btrfs but mounted without compress; "/mnt/data" is
+        // ext4. Neither must trigger the caveat.
+        assert!(!path_on_compressed_mount_in(
+            MOUNTINFO_FIXTURE,
+            Path::new("/var/cache")
+        ));
+        assert!(!path_on_compressed_mount_in(
+            MOUNTINFO_FIXTURE,
+            Path::new("/mnt/data/foo")
+        ));
+    }
+
+    #[test]
+    fn compress_force_is_detected() {
+        let fixture = "1 0 0:30 / /mnt/forced rw,relatime - btrfs /dev/sda2 rw,compress-force=zstd:9,subvol=/\n";
+        assert!(path_on_compressed_mount_in(
+            fixture,
+            Path::new("/mnt/forced/file")
+        ));
+    }
+
+    #[test]
+    fn compress_in_the_per_mount_options_field_is_detected() {
+        // Some filesystems report compression in the per-mount options
+        // (field 6) rather than the super options.
+        let fixture = "1 0 0:30 / /mnt/c rw,relatime,compress=lzo - btrfs /dev/sda2 rw,subvol=/\n";
+        assert!(path_on_compressed_mount_in(fixture, Path::new("/mnt/c/x")));
+    }
+
+    #[test]
+    fn compress_no_and_none_do_not_count() {
+        let fixture = "1 0 0:30 / /mnt/off rw,relatime - btrfs /dev/sda2 rw,compress=no,subvol=/\n\
+                       2 0 0:31 / /mnt/off2 rw,relatime - btrfs /dev/sda3 rw,compress=none,subvol=/\n";
+        assert!(!path_on_compressed_mount_in(
+            fixture,
+            Path::new("/mnt/off/x")
+        ));
+        assert!(!path_on_compressed_mount_in(
+            fixture,
+            Path::new("/mnt/off2/x")
+        ));
+    }
+
+    #[test]
+    fn compress_substring_of_another_option_does_not_count() {
+        // Option *keys* must match exactly: neither a `compressed`
+        // pseudo-option nor a value containing "compress" qualifies.
+        let fixture = "1 0 0:30 / /mnt/x rw,compressed - ext4 /dev/sda2 rw,data=compress\n";
+        assert!(!path_on_compressed_mount_in(fixture, Path::new("/mnt/x/f")));
+    }
+
+    #[test]
+    fn no_covering_mount_is_not_compressed() {
+        assert!(!path_on_compressed_mount_in(
+            "1 0 8:1 / /mnt/data rw - ext4 /dev/sdb1 rw\n",
+            Path::new("/unrelated")
+        ));
     }
 
     #[test]
