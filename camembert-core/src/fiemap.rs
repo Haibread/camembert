@@ -201,8 +201,10 @@ pub struct FileMap {
 /// Opens `O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK`, verifies a
 /// regular file via `fstat`, then runs the mandatory pagination loop
 /// ([`EXTENT_BATCH`] extents per call, `fm_start` advanced past the last
-/// returned extent, stop on `FIEMAP_EXTENT_LAST` or an empty batch).
-/// `FIEMAP_FLAG_SYNC` is **never** set (module docs).
+/// returned extent, stop on `FIEMAP_EXTENT_LAST`, an empty batch, or a
+/// round that fails to advance `fm_start` — the forward-progress guard
+/// that keeps a buggy/hostile filesystem from spinning the loop forever
+/// on the open fd). `FIEMAP_FLAG_SYNC` is **never** set (module docs).
 ///
 /// Errors surface as-is — notably `EOPNOTSUPP`/`ENOTTY` from filesystems
 /// without FIEMAP; the caller downgrades the file (to `unknown` on an
@@ -257,20 +259,52 @@ pub fn map_file(path: &Path) -> io::Result<FileMap> {
         unsafe { rustix::ioctl::ioctl(&fd, FiemapIoctl { buf: &mut buf })? };
 
         let returned = (buf.header.fm_mapped_extents as usize).min(EXTENT_BATCH);
-        if returned == 0 {
-            break;
-        }
-        let mut saw_last = false;
-        for extent in &buf.extents[..returned] {
-            bucket_extent(extent, &mut map);
-            saw_last |= extent.fe_flags & FIEMAP_EXTENT_LAST != 0;
-            start = extent.fe_logical.saturating_add(extent.fe_length);
-        }
-        if saw_last {
-            break;
+        match advance_pagination(start, &buf.extents[..returned], &mut map) {
+            Some(next) => start = next,
+            None => break,
         }
     }
     Ok(map)
+}
+
+/// Fold one FIEMAP batch into `map` and decide where the next round starts.
+///
+/// `round_start` is the `fm_start` this batch was fetched with; `extents`
+/// are the `fm_mapped_extents` the kernel returned. Returns `Some(next)` —
+/// the `fm_start` for the following ioctl — or `None` when pagination must
+/// stop: an empty batch, the `FIEMAP_EXTENT_LAST` extent seen, or the
+/// **forward-progress guard** tripping.
+///
+/// Forward-progress guard: `next` (the last returned extent's logical end)
+/// must be strictly greater than `round_start`. A conforming filesystem
+/// guarantees it — extents come back in ascending logical order and the
+/// last one is non-empty. A buggy or hostile one that returns a non-LAST
+/// extent with `fe_length == 0`, or a batch whose last `fe_logical` does
+/// not advance, would otherwise spin [`map_file`]'s loop forever holding
+/// the open fd on a (possibly UI-adjacent) thread. When it trips we stop
+/// and keep only what was mapped so far: the unmapped tail is left
+/// uncounted, so `exclusive` understates — the module's
+/// understate-don't-fabricate contract (we have no trustworthy size for the
+/// remainder, so it is never invented into `unknown` either).
+fn advance_pagination(
+    round_start: u64,
+    extents: &[FiemapExtent],
+    map: &mut FileMap,
+) -> Option<u64> {
+    if extents.is_empty() {
+        return None;
+    }
+    let mut next = round_start;
+    let mut saw_last = false;
+    for extent in extents {
+        bucket_extent(extent, map);
+        saw_last |= extent.fe_flags & FIEMAP_EXTENT_LAST != 0;
+        next = extent.fe_logical.saturating_add(extent.fe_length);
+    }
+    if saw_last || next <= round_start {
+        return None;
+    }
+    Some(next)
 }
 
 /// Bucket one extent per the D4 rules (module docs): delalloc/unknown →
@@ -611,6 +645,71 @@ mod tests {
     #[test]
     fn sweep_zero_length_ranges_are_ignored() {
         assert_eq!(sweep(&[range(10, 0), range(10, 0)]), (0, 0));
+    }
+
+    // --- pagination forward-progress guard -------------------------------
+
+    fn extent(logical: u64, length: u64, flags: u32) -> FiemapExtent {
+        FiemapExtent {
+            fe_logical: logical,
+            fe_length: length,
+            fe_flags: flags,
+            ..FiemapExtent::ZERO
+        }
+    }
+
+    fn empty_map() -> FileMap {
+        FileMap {
+            dev: 0,
+            ino: 0,
+            exclusive: 0,
+            shared: Vec::new(),
+            shared_logical: 0,
+            unknown: 0,
+        }
+    }
+
+    #[test]
+    fn advance_pagination_empty_batch_stops() {
+        let mut map = empty_map();
+        assert_eq!(advance_pagination(0, &[], &mut map), None);
+        assert_eq!(map.exclusive, 0);
+    }
+
+    #[test]
+    fn advance_pagination_normal_batch_advances_past_last_extent() {
+        let mut map = empty_map();
+        // Two non-LAST extents, ascending: next round starts past the tail.
+        let batch = [extent(0, 4096, 0), extent(4096, 8192, 0)];
+        assert_eq!(advance_pagination(0, &batch, &mut map), Some(4096 + 8192));
+        assert_eq!(map.exclusive, 4096 + 8192, "both extents bucketed");
+    }
+
+    #[test]
+    fn advance_pagination_last_flag_stops_after_bucketing() {
+        let mut map = empty_map();
+        let batch = [extent(0, 4096, 0), extent(4096, 4096, FIEMAP_EXTENT_LAST)];
+        assert_eq!(advance_pagination(0, &batch, &mut map), None);
+        assert_eq!(map.exclusive, 8192, "the LAST extent still counts");
+    }
+
+    #[test]
+    fn advance_pagination_guard_trips_on_non_advancing_zero_length_extent() {
+        // The pathological case: a non-LAST extent with fe_length == 0 at
+        // the round's own start offset. Re-issuing the ioctl would spin
+        // forever; the guard returns None instead of Some(round_start).
+        let mut map = empty_map();
+        let batch = [extent(8192, 0, 0)];
+        assert_eq!(advance_pagination(8192, &batch, &mut map), None);
+    }
+
+    #[test]
+    fn advance_pagination_guard_trips_when_last_logical_goes_backwards() {
+        // Even if an earlier extent advanced, the loop tracks the *last*
+        // extent's end; a hostile batch ending below round_start stops.
+        let mut map = empty_map();
+        let batch = [extent(4096, 4096, 0), extent(0, 0, 0)];
+        assert_eq!(advance_pagination(4096, &batch, &mut map), None);
     }
 
     // --- correlate bucketing ---------------------------------------------
