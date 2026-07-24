@@ -1909,9 +1909,40 @@ fn open_delete_confirm(
     } else {
         pre_deletion_open_warning(ui)
     };
+    // Anchor each mark's identity at confirm time — the last moment before
+    // the user commits — so the executor refuses a target swapped for a
+    // different inode after this point (see `camembert_core::delete`). A
+    // no-follow stat per mark (dirs included, and regardless of
+    // `--no-proc-sweep`), the same kind the open-file advisory above takes
+    // for its own file lookups; captured once here over the full mark set
+    // the executor will later receive from `take_confirmed_marks` (marks
+    // with a still-pending oracle job included — a pending job never drops a
+    // mark). `None` (a vanished/failed stat) simply skips the identity check
+    // for that entry, leaving every other guard in force.
+    let identities: Vec<(NodeId, Option<delete::InodeId>)> = ui
+        .marks()
+        .iter()
+        .map(|mark| (mark.node, mark_identity(&mark.path)))
+        .collect();
+    ui.set_mark_identities(&identities);
     let hardlink_groups = outcome.hardlink_groups();
     let oracle_slot = oracle::build_slot(oracle_rt, &nodes, &hardlink_groups);
     ui.open_confirm(hardlinks, open_warning, oracle_slot);
+}
+
+/// The live `(dev, ino)` of a marked path, without following a final
+/// symlink — the identity the deletion executor re-checks before touching
+/// disk. `None` when the entry cannot be stat'd (it vanished, permission
+/// denied, …); the executor then falls back to no identity check for it,
+/// still fully descriptor-relative and still every other guard.
+fn mark_identity(path: &Path) -> Option<delete::InodeId> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|meta| delete::InodeId {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        })
 }
 
 /// D6: refresh the open-file index (unfiltered sweep, same ~25ms cost as
@@ -2048,8 +2079,14 @@ fn execute_deletion(
     let Some(marks) = ui.take_confirmed_marks() else {
         return;
     };
-    let nodes: Vec<NodeId> = marks.iter().map(|mark| mark.node).collect();
-    info!(count = nodes.len(), "deletion confirmed");
+    let targets: Vec<delete::DeleteTarget> = marks
+        .iter()
+        .map(|mark| delete::DeleteTarget {
+            node: mark.node,
+            expected: mark.expected,
+        })
+        .collect();
+    info!(count = targets.len(), "deletion confirmed");
     // The viewed directory may sit inside a deleted subtree: climb to the
     // nearest surviving ancestor before rebuilding the view.
     let mut dir = ui.snapshot().dir;
@@ -2069,7 +2106,7 @@ fn execute_deletion(
         // same lock, never raced it.
         let mut guard = write_outcome(lock);
         let outcome = &mut *guard;
-        let report = delete::delete_nodes(outcome, &nodes);
+        let report = delete::delete_nodes_checked(outcome, &targets);
         if report.deleted > 0 {
             // D2/D3, attack finding 1: advance the epoch so the very next
             // render-time check (`ensure_flat_summary_fresh`) recomputes

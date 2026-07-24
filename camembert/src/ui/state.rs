@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use camembert_core::delete::InodeId;
 use camembert_core::fiemap::FloorMap;
 use camembert_core::flat::FlatSummary;
 use camembert_core::freeable::Ledger;
@@ -102,6 +103,12 @@ pub struct MarkedEntry {
     pub is_dir: bool,
     /// Disk bytes (subtree total for a dir) at mark time.
     pub disk: u64,
+    /// The entry's live `(dev, ino)`, recorded at confirm time by
+    /// [`UiState::set_mark_identities`] to anchor the deletion executor's
+    /// identity check ([`camembert_core::delete::DeleteTarget`]). `None`
+    /// until stamped (or if the stat failed) — the executor then deletes
+    /// without the identity check, still fully descriptor-relative.
+    pub expected: Option<InodeId>,
 }
 
 /// Why a mark keypress was refused (shown as a footer flash).
@@ -759,6 +766,7 @@ impl UiState {
                 .join(std::ffi::OsStr::from_bytes(&row.name)),
             is_dir: row.is_dir,
             disk: row.disk,
+            expected: None,
         };
         if self.marked_set.remove(&entry.node) {
             self.marks.retain(|mark| mark.node != entry.node);
@@ -784,6 +792,21 @@ impl UiState {
     /// Marked rows in mark order.
     pub fn marks(&self) -> &[MarkedEntry] {
         &self.marks
+    }
+
+    /// Stamp each marked entry with the live `(dev, ino)` the caller just
+    /// observed for it, keyed by node. Anchors the deletion executor's
+    /// identity check ([`camembert_core::delete::DeleteTarget`]): a target
+    /// swapped for a different inode after this point is refused rather than
+    /// deleted. The caller supplies the identities (a no-follow stat per
+    /// mark) so this module stays free of filesystem I/O; nodes not in
+    /// `identities`, or paired with `None`, keep whatever they had.
+    pub fn set_mark_identities(&mut self, identities: &[(NodeId, Option<InodeId>)]) {
+        for &(node, id) in identities {
+            if let Some(mark) = self.marks.iter_mut().find(|mark| mark.node == node) {
+                mark.expected = id;
+            }
+        }
     }
 
     /// Footer summary: `(entry count, total disk bytes)`, `None` when
@@ -1250,6 +1273,7 @@ impl UiState {
             path,
             is_dir: false,
             disk,
+            expected: None,
         };
         if self.marked_set.remove(&entry.node) {
             self.marks.retain(|mark| mark.node != entry.node);
