@@ -290,6 +290,26 @@ mod tests {
     }
 
     #[test]
+    fn group_links_groups_by_inode_identity() {
+        let (tree, _, _, _, links) = scan_with_wrong_first_seen();
+        let groups = group_links(&links);
+        assert_eq!(groups.len(), 1, "one nlink>1 inode");
+        let group = &groups[&(1, 42)];
+        assert_eq!(group.nlink, 2);
+        assert_eq!(group.nodes.len(), 2);
+        let mut names: Vec<_> = group.nodes.iter().map(|&n| tree.name(n)).collect();
+        names.sort_unstable();
+        assert_eq!(names, [b"link0", b"link1"]);
+        // The D4 subset check's other half: the scan saw every link.
+        assert_eq!(group.nodes.len() as u32, group.nlink);
+    }
+
+    #[test]
+    fn group_links_on_an_empty_registry_is_empty() {
+        assert!(group_links(&[]).is_empty());
+    }
+
+    #[test]
     fn reattribution_is_idempotent() {
         let (mut tree, root, aaa, zzz, links) = scan_with_wrong_first_seen();
         assert_eq!(reattribute(&mut tree, &links), 1);
