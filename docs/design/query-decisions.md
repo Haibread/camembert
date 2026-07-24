@@ -1,9 +1,9 @@
 # Query language + palette — decisions (co-design session, 2026-07-23)
 
 Outcome of the co-design session over the
-[options dossier](query-options.md) and the three attack reports
-([a](query-attack-a.md), [b](query-attack-b.md),
-[c](query-attack-c.md)). Settled; reopening one requires a new
+options dossier and the three attack reports (condensed below in this
+file's own "Condensed reasoning trail" section; originals in git
+history). Settled; reopening one requires a new
 element. Covers HANDOFF next-step "Filter query language + Ctrl-K
 palette".
 

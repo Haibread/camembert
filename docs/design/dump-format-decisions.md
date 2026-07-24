@@ -1,7 +1,7 @@
 # Dump format — decisions (co-design session, 2026-07-22)
 
 Outcome of the co-design session over the
-[options dossier](dump-format-options.md). These decisions are settled;
+[options dossier](#condensed-reasoning-trail). These decisions are settled;
 reopening one requires a new element, not re-litigation.
 
 ## D1 — Format family: Option A now, Option C later as cache

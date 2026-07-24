@@ -1,5 +1,5 @@
 //! Query history file (D6, `docs/design/query-decisions.md`; write-safety
-//! amendments `docs/design/query-attack-a.md` finding 13):
+//! amendments per its condensed trail, attack-a finding 13):
 //! `$XDG_STATE_HOME/camembert/history`, falling back to
 //! `~/.local/state/camembert/history` when `XDG_STATE_HOME` is unset or
 //! empty (the XDG base-directory spec's own fallback, same shape

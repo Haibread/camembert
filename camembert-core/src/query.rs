@@ -1,6 +1,6 @@
 //! Filter query language: tokenizer, parser and the filtered fold
-//! (decisions `docs/design/query-decisions.md`, amendments
-//! `docs/design/query-attack-a.md`).
+//! (decisions `docs/design/query-decisions.md`; amendments in its
+//! condensed trail, attack-a findings).
 //!
 //! # Grammar (phase 1, D1 — as implemented)
 //!

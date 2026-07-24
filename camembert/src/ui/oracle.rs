@@ -1,6 +1,6 @@
 //! Freeable phase 2 slice 1 — the mark-time incremental selection oracle
 //! (D4, `docs/design/freeable2-decisions.md`; the confirm-modal contract
-//! redesigned by `docs/design/freeable2-attack-a.md` finding [1]).
+//! redesigned per its condensed trail, attack-a finding [1]).
 //!
 //! The core `camembert_core::fiemap` module maps one file's extents and
 //! [`correlate`]s a whole selection into an honest byte-bucket

@@ -1,5 +1,5 @@
 //! ncdu JSON export importer (spec §11, quirks per
-//! `docs/design/dump-format-research.md` §1).
+//! `docs/design/dump-format-decisions.md` (condensed trail, research §1)).
 //!
 //! [`import`] stream-parses an ncdu `-o` export — the nested
 //! `[1, minor, metadata, tree]` array — directly into a [`Tree`] arena and

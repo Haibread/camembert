@@ -1,6 +1,6 @@
 //! Pure composition helpers for what an active filter's [`FilterResult`]
 //! makes the pill say (D4/D6, `docs/design/query-decisions.md`;
-//! amendments `docs/design/query-attack-a.md` findings 7 (the residual
+//! amendments per its condensed trail, attack-a findings 7 (the residual
 //! must be shown, not just documented) and 12 (the "Esc clears" scope)).
 //!
 //! The other half of D4 composition — which tree rows survive an active

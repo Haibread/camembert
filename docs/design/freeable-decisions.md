@@ -1,9 +1,9 @@
 # Freeable phase 1 — decisions (co-design session, 2026-07-23)
 
-Outcome of the co-design session over the
-[options dossier](freeable-options.md) and the three
-[attack](freeable-attack-a.md) [reports](freeable-attack-b.md)
-[(c)](freeable-attack-c.md). Settled; reopening one requires a new
+Outcome of the co-design session over the options dossier and the
+three attack reports (condensed below in this file's own "Condensed
+reasoning trail" section; originals in git history). Settled;
+reopening one requires a new
 element. Covers HANDOFF next-step "Freeable column, phase 1"
 (deleted-but-open files); btrfs shared extents and hardlink siblings
 remain phase 2.
@@ -22,8 +22,8 @@ B because its per-directory channel is the wrong substrate for phase
 2's non-additive sources and its `+N` column promotes best-effort
 attribution to ranking authority.
 
-The **full amendment list of freeable-attack-a.md is binding**; the
-load-bearing ones are D2 and D6.
+The **full amendment list in this file's condensed reasoning trail
+(Attack A) is binding**; the load-bearing ones are D2 and D6.
 
 ## D2 — Scope: root-filesystem only, honest about the rest
 

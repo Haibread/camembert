@@ -1,7 +1,7 @@
 # Scan tree — decisions (co-design session, 2026-07-22)
 
 Outcome of the co-design session over the
-[options dossier](scan-tree-options.md). Settled; reopening one requires a
+[options dossier](#condensed-reasoning-trail). Settled; reopening one requires a
 new element. Closes HANDOFF open question §7.2 — nothing blocks the engine
 implementation anymore.
 

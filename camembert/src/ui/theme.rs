@@ -283,7 +283,8 @@ impl Theme {
     /// The "emphasis" variant of an identity color: freeable phase 2's
     /// in-bar bright segment (tui-design.md reservation 2) must stay
     /// within the row's own identity hue — never a second color
-    /// (`docs/design/freeable2-attack-b.md` finding 10). Truecolor/256
+    /// (`docs/design/freeable2-decisions.md`, condensed trail, attack-b
+    /// finding 10). Truecolor/256
     /// blend the palette entry 40% toward white: still unmistakably the
     /// same hue, visibly brighter. ANSI-16/mono have no reliable brighter
     /// shade of a named terminal color, so those rungs carry the

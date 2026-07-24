@@ -2,7 +2,8 @@
 //!
 //! The two dumps are consumed as a **merge-join over their directory
 //! blocks**, never loaded whole (the format's raison d'être — see
-//! `docs/design/dump-format-research.md` §3): tier-2 ordering makes each
+//! `docs/design/dump-format-decisions.md` (condensed trail, research §3)):
+//! tier-2 ordering makes each
 //! dump a totally ordered stream of blocks under the component-wise
 //! raw-byte path comparator, so one cursor per side and a bounded window
 //! suffice. Within a matched block pair, entries are merge-joined by raw

@@ -44,8 +44,10 @@ pitch.
 - The dump format spec is [docs/format/dump-v1.md](docs/format/dump-v1.md);
   writer AND reader implement it. Major-version changes are near-taboo
   (they invalidate every stored dump).
-- The options dossiers + adversarial attack reports next to the decision
-  docs are the reasoning trail — read them before proposing to revisit.
+- The reasoning trail (research digest, options pushed to their limit,
+  adversarial attack findings) lives condensed inside each decisions doc's
+  own "Condensed reasoning trail" section — read it before proposing to
+  revisit; full originals are recoverable from git history.
 - Workflow: co-design structural decisions with the user; implement
   autonomously once settled; direct commits on `main`, small and atomic;
   agents work in worktrees, the orchestrator reviews and merges.

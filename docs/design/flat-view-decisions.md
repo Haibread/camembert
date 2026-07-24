@@ -1,8 +1,9 @@
 # Flat view + pattern aggregation — decisions (co-design session, 2026-07-23)
 
 Outcome of the co-design session over the
-[options dossier](flat-view-options.md) and its
-[attack report](flat-view-attack.md). Settled; reopening one requires a
+options dossier and its attack report (condensed below in this file's
+own "Condensed reasoning trail" section; originals in git history).
+Settled; reopening one requires a
 new element. Covers HANDOFF next-step "Flat view + pattern
 aggregation". The wave-3 filter/query language and Ctrl-K palette are
 explicitly out of scope (the dossier draws the boundary).

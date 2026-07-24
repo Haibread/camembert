@@ -1,8 +1,8 @@
 # Freeable phase 2 — decisions (2026-07-23, delegated session)
 
-Outcome over the [options dossier](freeable2-options.md) and the three
-attack reports ([a](freeable2-attack-a.md), [b](freeable2-attack-b.md),
-[c](freeable2-attack-c.md)). **The user delegated this session's
+Outcome over the options dossier and the three
+attack reports (condensed below in this file's own "Condensed
+reasoning trail" section; originals in git history). **The user delegated this session's
 choices ("prend les choix recommandés") — the post-attack recommended
 option was adopted with the attacks' amendments folded in.** Settled;
 reopening one requires a new element.

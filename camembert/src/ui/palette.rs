@@ -1,11 +1,11 @@
 //! The Ctrl-K / `/` command-and-filter palette (D6,
-//! `docs/design/query-decisions.md`; amendments
-//! `docs/design/query-attack-a.md` finding 2 (q-typability), finding 3
+//! `docs/design/query-decisions.md`; amendments per its condensed trail,
+//! attack-a finding 2 (q-typability), finding 3
 //! (`<`/`>` collision — bare size sugar stays, so command mode uses `>` as
 //! the *first character* of the buffer, never conflicting with a `>100M`
 //! size term which can only ever appear after at least one other
 //! character or as the sole content of a *query*-mode buffer — see
-//! [`PaletteState::mode`]'s doc), `docs/design/query-attack-c.md`
+//! [`PaletteState::mode`]'s doc), attack-c
 //! (the `/` graft: identical widget, no second surface, no split
 //! histories).
 //!
