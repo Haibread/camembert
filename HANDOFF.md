@@ -9,7 +9,8 @@ file describes what actually exists.
 
 A disk usage analyzer (ncdu successor) in Rust whose thesis is
 **differentiation through honest answers to real questions**: what grew
-(diff), what is actually freeable, what is big *and* cold — with numbers
+(diff), what is actually freeable, what is big *and* stale (the filter
+query language, not a score — see next-steps item 8) — with numbers
 that are correct where other tools lie (hardlinks, sparse files,
 unreadable dirs, kernfs). See [README.md](README.md) for the product
 pitch.
@@ -321,18 +322,21 @@ pitch.
 7. Cleanup recipes: display-only suggestions for known paths (e.g.
    `journalctl --vacuum-time=`, `pip cache purge`) — never executed,
    only shown.
-8. Age/"big and cold" score view (size × age) — **dossier delivered,
-   awaiting a decision**:
+8. Age/"big and stale" — **decided 2026-07-24: no score view.**
    [age-score-prototype.md](docs/design/age-score-prototype.md) measured
-   seven formulas on five real trees and recommends building *no* score
-   (every continuous formula collapses onto either the size or the age
-   axis; the threshold quadrant wins and already ships as
-   `--filter '>10M older:1y'`; mtime is widely fabricated — 22.6k files
-   share cargo's fixed 2006 timestamp, some directories carry negative
-   mtimes), while [age-view-mockups.md](docs/design/age-view-mockups.md)
-   designs four surfaces should the score be built anyway. The actionable
-   item either way: README's "size × age, visible at a glance" describes
-   a feature that does not exist.
+   seven formulas on five real trees: every continuous formula collapses
+   onto either the size or the age axis, the threshold quadrant wins and
+   already ships as `--filter '>10M older:1y'`, and mtime is widely
+   fabricated (22.6k files share cargo's fixed 2006 timestamp; some
+   directories carry negative mtimes). The README/`--help` claim was
+   corrected to describe the filter — "big and *stale*", mtime not atime.
+   [age-view-mockups.md](docs/design/age-view-mockups.md) keeps four
+   surface designs should new evidence reopen it (a fileserver or NAS
+   with genuinely cold data is the untested case; the prototype's §10
+   lists what a rescan there would have to show). Optional follow-ups,
+   not scheduled: a named filter preset expanding to a visible editable
+   query, and a display guard badging absurd mtimes (1881, cargo-2006)
+   rather than ranking them.
 9. Traversal-dedup — **dossier delivered, awaiting a decision**:
    [traversal-dedup-dossier.md](docs/design/traversal-dedup-dossier.md)
    (recommends Option D: `statx` `MNT_ID_UNIQUE`/`SUBVOL` +

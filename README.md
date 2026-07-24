@@ -4,7 +4,7 @@
 
 **A disk usage analyzer that answers the real questions.**
 
-*What grew? What can I actually free? What is big **and** cold?*
+*What grew? What can I actually free? What is big **and** stale?*
 
 [![CI](https://github.com/Haibread/camembert/actions/workflows/quality.yaml/badge.svg)](https://github.com/Haibread/camembert/actions/workflows/quality.yaml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
@@ -28,7 +28,18 @@ questions you actually have during an incident:
   disk space are found and shown (see [Freeable](#freeable-deleted-but-open-files)
   below) — btrfs shared extents and hardlink siblings are phase 2, on the
   roadmap.
-- **What is big *and* cold?** — size × age, visible at a glance.
+- **What is big *and* stale?** — `--filter '>10M older:1y'` re-aggregates
+  the whole tree on that subset, so directory totals, the donut and the
+  top-files list all answer the narrowed question (see
+  [Filtering](#filtering) below). Deliberately a
+  filter and not a size × age score: measured on real trees, every
+  continuous score collapses onto either the size axis or the age axis,
+  and unlike a threshold a score can never answer "nothing here is
+  stale" — which is usually the truth. Note that *stale* means **not
+  modified**, not "not read": camembert never reads atime, because
+  `relatime` makes it unreliable and `noatime` removes it entirely. The
+  evidence is in
+  [age-score-prototype.md](docs/design/age-score-prototype.md).
 
 And it is **honest about the numbers** other tools get wrong: hardlinks,
 sparse files, unreadable directories (counted *and* located, never
@@ -927,10 +938,14 @@ counters with an `f_files` near-limit alert, apparent/real slack
 surfacing across small-file masses, quotas (`quotactl`, XFS project
 quotas — its own dossier), composable stdout output of the marked
 selection (fzf-style, for `rm $(camembert --print …)`), display-only
-cleanup recipes for known paths, an age/"big and cold" score view
-(size × age — a dossier is in progress), and a traversal-dedup dossier
-for the bind-mount/snapshot-subvolume double-counting noted above. The
-full design trail lives in [`docs/design/`](docs/design/).
+cleanup recipes for known paths, and a traversal-dedup dossier for the
+bind-mount/snapshot-subvolume double-counting noted above. A dedicated
+size × age score view was prototyped on real trees and **not** adopted —
+the threshold filter above beat every scoring formula tried
+([age-score-prototype.md](docs/design/age-score-prototype.md); surface
+designs, should new evidence reopen it, are in
+[age-view-mockups.md](docs/design/age-view-mockups.md)). The full design
+trail lives in [`docs/design/`](docs/design/).
 
 ## Development
 

@@ -32,7 +32,7 @@ const VERSION: &str = concat!(
     ")"
 );
 
-/// Disk usage analyzer: what grew, what is freeable, what is cold.
+/// Disk usage analyzer: what grew, what is freeable, what is stale.
 ///
 /// Without a subcommand, scans PATH (interactive browser on a terminal,
 /// summary otherwise). `diff` compares two dumps; `import` converts an
