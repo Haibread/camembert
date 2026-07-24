@@ -229,8 +229,8 @@ fn stress_scan_is_deterministic_across_runs() {
     }
 }
 
-/// Kernel pseudo-filesystems are never descended into, even with
-/// `--cross-filesystems` (their numbers are not disk usage). Gated on a
+/// Kernel pseudo-filesystems are never descended into, even when crossing
+/// filesystem boundaries (their numbers are not disk usage). Gated on a
 /// mounted kernfs being visible under /sys; skipped elsewhere.
 #[test]
 fn kernfs_mounts_are_excluded_even_when_crossing() {

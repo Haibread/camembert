@@ -16,7 +16,7 @@ fn bin() -> Command {
     for var in [
         "SCAN_PATH",
         "THREADS",
-        "CROSS_FILESYSTEMS",
+        "ONE_FILESYSTEM",
         "TOP",
         "NO_UI",
         "OUTPUT",

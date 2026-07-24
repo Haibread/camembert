@@ -96,9 +96,20 @@ struct ScanArgs {
     #[arg(long, env = "THREADS", default_value_t = 0)]
     threads: usize,
 
-    /// Cross filesystem boundaries instead of stopping at mount points (env: CROSS_FILESYSTEMS)
-    #[arg(long, env = "CROSS_FILESYSTEMS")]
-    cross_filesystems: bool,
+    /// Stay on the scan root's filesystem: stop at mount points instead of
+    /// descending into them (env: ONE_FILESYSTEM)
+    ///
+    /// By default (this flag unset) camembert crosses filesystem boundaries
+    /// and descends into every filesystem mounted under the scan root,
+    /// including RAM-backed `tmpfs` and other disks — their bytes are real
+    /// usage of *those* filesystems, not phantom totals. Kernel
+    /// pseudo-filesystems (`/proc`, `/sys`, cgroups, …) are always excluded,
+    /// regardless of this flag — their sizes are not disk usage. On btrfs,
+    /// descending into subvolumes also walks snapshot subvolumes (e.g.
+    /// `.snapshots`), which can multiply-count snapshotted data;
+    /// `--one-filesystem` avoids that too.
+    #[arg(long, env = "ONE_FILESYSTEM")]
+    one_filesystem: bool,
 
     /// Stat engine for the scan: auto, sync, io_uring — experimental (env: STATX_ENGINE)
     ///
@@ -608,8 +619,9 @@ Freeable (deleted-but-open files):
   filesystem only (the same one the disk gauge describes) — a btrfs
   layout split across several subvolume-mounted `st_dev`s shares one
   pool underneath, so the count under-reports there; files held open on
-  a *different* crossed filesystem (--cross-filesystems) still show up
-  in the panel, labeled by device, but are never added to the gauge.
+  a *different* filesystem the scan crossed into (the default; restrict
+  with --one-filesystem) still show up in the panel, labeled by device,
+  but are never added to the gauge.
   Holders visible only via mmap (no open file descriptor) are invisible
   without CAP_SYS_ADMIN and are not counted. memfd/tmpfs/shm-backed
   inodes are RAM, not disk, and are reported as one separate line rather
@@ -773,7 +785,7 @@ fn run_scan(cli: &Cli) -> ExitCode {
 
     let scanner = Scanner::new(ScanOptions {
         threads: args.threads,
-        cross_filesystems: args.cross_filesystems,
+        cross_filesystems: !args.one_filesystem,
         statx_engine: args.statx_engine.into(),
     });
 

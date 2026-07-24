@@ -72,10 +72,11 @@ pub(crate) struct Job {
 }
 
 /// Kernel pseudo-filesystem magics (`linux/magic.h`): mounts whose numbers
-/// are not disk usage. Never descended into, even with
-/// `--cross-filesystems` (HANDOFF §3: "exclure /proc, /sys"). `/proc` alone
-/// otherwise poisons totals (`/proc/kcore` reports a ~128 TiB apparent
-/// size) and floods the error count with permission noise.
+/// are not disk usage. Never descended into, even when crossing filesystem
+/// boundaries (the CLI default; `--one-filesystem` opts out — HANDOFF §3:
+/// "exclure /proc, /sys"). `/proc` alone otherwise poisons totals
+/// (`/proc/kcore` reports a ~128 TiB apparent size) and floods the error
+/// count with permission noise.
 const KERNFS_MAGICS: &[(u64, &str)] = &[
     (0x9fa0, "proc"),
     (0x6265_6572, "sysfs"),
@@ -111,7 +112,8 @@ enum MountKind {
     /// Kernel pseudo-filesystem: record, never descend.
     KernFs,
     /// Real filesystem; the opened fd is reused for descent when
-    /// `--cross-filesystems` is on.
+    /// `cross_filesystems` is on (the CLI default; `--one-filesystem` opts
+    /// out).
     Real(OwnedFd),
     /// Could not open it to classify.
     Unreadable(rustix::io::Errno),

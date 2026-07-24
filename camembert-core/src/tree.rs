@@ -339,12 +339,12 @@ pub struct Tree {
 /// Why a directory entry was recorded but not descended into.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExcludedReason {
-    /// Mount point to another (real) filesystem; `--cross-filesystems`
-    /// descends into these.
+    /// Mount point to another (real) filesystem; descended into by default
+    /// (CLI: `cross_filesystems`, opted out of with `--one-filesystem`).
     OtherFs,
     /// Kernel pseudo-filesystem (`/proc`, `/sys`, cgroups, …): never
-    /// descended into, regardless of `--cross-filesystems` — its numbers
-    /// are not disk usage (HANDOFF §3: "exclure /proc, /sys").
+    /// descended into, regardless of `cross_filesystems`/`--one-filesystem`
+    /// — its numbers are not disk usage (HANDOFF §3: "exclure /proc, /sys").
     KernFs,
 }
 
