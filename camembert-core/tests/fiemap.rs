@@ -10,9 +10,13 @@ use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+use std::sync::atomic::{AtomicBool, AtomicU64};
+
 use camembert_core::fiemap::{
-    self, FileMap, FsTier, LinkStatus, OracleInput, OracleReport, correlate, map_file,
+    self, FileMap, FsTier, LinkStatus, OracleInput, OracleReport, compute_floor, correlate,
+    map_file,
 };
+use camembert_core::scan::{ScanOptions, Scanner};
 
 /// Fixture root: inside `target/`, on the real filesystem under test.
 /// Wiped on entry — `CARGO_TARGET_TMPDIR` persists across runs, and stale
@@ -208,4 +212,102 @@ fn oracle_report_is_plain_data() {
     // The oracle is pure: an empty selection is an all-zero report even
     // with no filesystem underneath (D6 isolation sanity check).
     assert_eq!(correlate(&[]), OracleReport::default());
+}
+
+// --- ambient exclusive floor (slice 2) ---------------------------------
+
+/// The child node of `root` whose name matches, in a finalized outcome.
+fn child(outcome: &camembert_core::scan::ScanOutcome, name: &[u8]) -> camembert_core::tree::NodeId {
+    outcome
+        .children_of(outcome.root())
+        .find(|&n| outcome.name_of(n) == name)
+        .unwrap_or_else(|| panic!("no child named {}", String::from_utf8_lossy(name)))
+}
+
+#[test]
+fn floor_of_a_real_scan_buckets_plain_reflinked_and_hardlinked() {
+    let dir = fixture_dir("floor-scan");
+    if skip_unless_extent_fs(&dir) {
+        return;
+    }
+    // A plain unshared file: its whole size is exclusive floor.
+    let plain = dir.join("plain.bin");
+    write_random(&plain, FILE_LEN);
+    // A reflinked pair: both files share every extent, so each floors to
+    // ~0 ("fully shared", never None), and neither pins the other's bytes.
+    let ref_a = dir.join("ref_a.bin");
+    let ref_b = dir.join("ref_b.bin");
+    write_random(&ref_a, FILE_LEN);
+    if let Err(err) = reflink(&ref_a, &ref_b) {
+        eprintln!("skipping: FICLONE unsupported here ({err})");
+        return;
+    }
+    // A hardlinked pair fully inside the scan: one inode, wholly seen, so
+    // it lands one contribution at the links' LCA (the scan root) and each
+    // link row is None.
+    let hard1 = dir.join("hard1.bin");
+    let hard2 = dir.join("hard2.bin");
+    write_random(&hard1, FILE_LEN);
+    fs::hard_link(&hard1, &hard2).unwrap();
+
+    let mut outcome = Scanner::new(ScanOptions::default()).scan(&dir).unwrap();
+    outcome.finalize_hardlinks();
+
+    let cancel = AtomicBool::new(false);
+    let progress = AtomicU64::new(0);
+    let floor = compute_floor(&outcome, &cancel, &progress).expect("floor produced on extent fs");
+
+    // Plain file: floor ≈ its allocated size.
+    let plain_floor = floor
+        .node_floor(child(&outcome, b"plain.bin"))
+        .expect("plain has a floor");
+    assert_approx(plain_floor, FILE_LEN as u64, "plain node_floor");
+
+    // Reflinked pair: fully shared → Some(small), never None, never the
+    // whole size.
+    for name in [b"ref_a.bin".as_slice(), b"ref_b.bin".as_slice()] {
+        let f = floor
+            .node_floor(child(&outcome, name))
+            .expect("a fully-shared file still has a figure (Some(0)), never None");
+        assert!(
+            f <= 256 * 1024,
+            "{}: fully-shared file claims {f} exclusive bytes",
+            String::from_utf8_lossy(name)
+        );
+    }
+
+    // Hardlinked pair: bytes belong to the whole group, so each link row is
+    // None (only freeing the last link releases them).
+    assert_eq!(floor.node_floor(child(&outcome, b"hard1.bin")), None);
+    assert_eq!(floor.node_floor(child(&outcome, b"hard2.bin")), None);
+
+    // Root aggregate: plain (~4 MiB) + the hardlink group's one inode
+    // (~4 MiB); the reflinked pair contributes ~0.
+    let root_floor = floor.dir_floor(outcome.root()).expect("root floor");
+    assert_approx(root_floor, 2 * FILE_LEN as u64, "root dir_floor");
+
+    // Coverage: five regular files, all mapped, none unmapped (extent fs,
+    // no ZFS, no FIEMAP failures). The hardlink pair counts once.
+    let (mapped, unmapped) = floor.coverage();
+    assert_eq!(unmapped, 0, "no FIEMAP failures on a healthy extent fs");
+    assert!(
+        mapped >= 3,
+        "plain + reflink pair + one hardlink inode mapped"
+    );
+}
+
+#[test]
+fn compute_floor_honours_a_preset_cancel() {
+    let dir = fixture_dir("floor-cancel");
+    // No extent-fs guard: cancellation fires before any FIEMAP work.
+    write_random(&dir.join("a.bin"), 4096);
+    write_random(&dir.join("b.bin"), 4096);
+    let outcome = Scanner::new(ScanOptions::default()).scan(&dir).unwrap();
+
+    let cancel = AtomicBool::new(true);
+    let progress = AtomicU64::new(0);
+    assert!(
+        compute_floor(&outcome, &cancel, &progress).is_none(),
+        "a pre-set cancel flag aborts the pass and returns None"
+    );
 }
