@@ -212,9 +212,26 @@ pitch.
   possible refinement). Genuinely undetectable cases (network
   filesystems, unreadable sysfs/mountinfo) still fall back to the
   pre-adaptive `min(2x cores, 8)` default.
-- Deletion: intermediate-symlink TOCTOU window (needs a descriptor-
-  relative unlink walk); freed-space estimate for surviving hardlinks is
-  optimistic (warned in dialog).
+- Deletion: the executor walks descriptor-relative (`openat`/`fstatat`/
+  `unlinkat` from the scan-root fd, `O_NOFOLLOW` below the root) and
+  re-checks each target's `(dev, ino)` against the identity the UI
+  recorded at confirm time — the intermediate-symlink TOCTOU and a
+  real-directory swap of the top-level target are both closed. Residual
+  (documented in `delete.rs`): the root's path above the anchor is
+  trusted (as the scan trusts it); a rename strictly within the marked
+  subtree mid-walk stays bounded to that subtree (per-entry `unlinkat`,
+  no symlink ever followed); the identity anchor is captured at confirm
+  time, not scan time. Freed-space estimate for surviving hardlinks is
+  still optimistic (warned in dialog).
+- Hardlinks: if a concurrent rewrite changes an inode between the
+  scan's two `statx` snapshots of it, canonical re-attribution shifts
+  the root total by the size delta (the canonical link's size wins for
+  the group); per-directory subtree-aggregate consistency is preserved
+  and the divergence is logged at debug.
+- FIEMAP pagination has a forward-progress guard: a filesystem
+  returning non-advancing extent batches leaves the unmapped tail
+  uncounted (`exclusive` understates) instead of looping forever on the
+  open fd — pathological/hostile filesystems only.
 - Dump: ordered-only writer (D5 unordered/degrade tier unimplemented);
   `ext:false` (no uid/gid/mode yet); TUI writes the dump on the UI
   thread at scan end (brief stall).
