@@ -53,12 +53,17 @@ pitch.
   identity is `Haibread <haibread@users.noreply.github.com>` (set
   repo-locally).
 
-## What is implemented (all merged on main, ~513 tests green)
+## What is implemented (all merged on main, ~518 tests green)
 
 - **Scan engine** (`camembert-core/src/scan/`): work-stealing,
   fd-relative `openat`/`getdents64`/`statx` (fstatat fallback), mount
-  boundaries by `st_dev`, **kernfs excluded by filesystem magic even
-  with `--cross-filesystems`**, single-owner arena integration with
+  boundaries by `st_dev` — **crossed by default since 2026-07-24**
+  (user decision: `--one-filesystem`/`ONE_FILESYSTEM` is the opt-out,
+  `--cross-filesystems` removed; the disk gauge captions multi-fs scans
+  as "spans N filesystems" via `ScanOutcome::device_count()`; known
+  accepted caveat: btrfs snapshot subvolumes are descended and can
+  multiply-count — documented in README/--help), **kernfs excluded by
+  filesystem magic regardless**, single-owner arena integration with
   bounded out-of-order holding, per-directory batched aggregation,
   completion cascade, first-seen hardlink registry + post-scan canonical
   re-attribution. **Media-adaptive auto threading** (sysfs rotational +
@@ -273,7 +278,7 @@ pitch.
 ## How to work on this repo
 
 ```bash
-cargo test --workspace                                  # ~513 tests
+cargo test --workspace                                  # ~518 tests
 cargo clippy --workspace --all-targets -- -D warnings   # zero tolerance
 pre-commit run --all-files
 ```
