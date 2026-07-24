@@ -619,3 +619,144 @@ fn kind_of(file_type: FileType) -> Kind {
         FileType::Unknown => Kind::Other,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit coverage for the pure/mockable seams of the syscall-level scan
+    //! path: entry classification, the kernfs magic table, the terminal
+    //! error-batch contract, and — through the `statx_supported` atomic
+    //! seam — the `statx` → `fstatat` fallback that is otherwise only
+    //! reachable on an `ENOSYS` kernel.
+
+    use std::ffi::CString;
+    use std::sync::atomic::AtomicBool;
+
+    use rustix::fd::OwnedFd;
+    use rustix::fs::{Mode, OFlags};
+    use rustix::io::Errno;
+
+    use super::*;
+
+    /// `d_type` → [`Kind`] mapping, including the `DT_UNKNOWN` case: a
+    /// filesystem that does not fill `d_type` (or a stat failure whose kind
+    /// falls back to the dirent type) must land on [`Kind::Other`], never a
+    /// wrong concrete kind.
+    #[test]
+    fn kind_of_maps_every_file_type() {
+        assert_eq!(kind_of(FileType::Directory), Kind::Dir);
+        assert_eq!(kind_of(FileType::RegularFile), Kind::File);
+        assert_eq!(kind_of(FileType::Symlink), Kind::Symlink);
+        assert_eq!(kind_of(FileType::BlockDevice), Kind::Block);
+        assert_eq!(kind_of(FileType::CharacterDevice), Kind::Char);
+        assert_eq!(kind_of(FileType::Fifo), Kind::Fifo);
+        assert_eq!(kind_of(FileType::Socket), Kind::Socket);
+        // DT_UNKNOWN — the getdents `d_type` a filesystem may leave unset.
+        assert_eq!(kind_of(FileType::Unknown), Kind::Other);
+    }
+
+    /// The kernfs magic table classifies pseudo-filesystems by number and
+    /// returns `None` for anything else, so a real filesystem sharing no
+    /// magic is never mistaken for one to skip.
+    #[test]
+    fn kernfs_name_matches_known_magics_only() {
+        assert_eq!(kernfs_name(0x9fa0), Some("proc"));
+        assert_eq!(kernfs_name(0x6367_7270), Some("cgroup2"));
+        assert_eq!(kernfs_name(0x0187), Some("autofs"));
+        // ext4 (0xEF53) and btrfs (0x9123683E) are real filesystems.
+        assert_eq!(kernfs_name(0xEF53), None);
+        assert_eq!(kernfs_name(0x9123_683E), None);
+        assert_eq!(kernfs_name(0), None);
+    }
+
+    /// A directory that could not be opened produces a terminal batch: the
+    /// errno is carried in `dir_error`, it is flagged as the last section,
+    /// and it carries no entries or child dirs (the owner counts it as one
+    /// unreadable directory and completes it).
+    #[test]
+    fn error_batch_is_terminal_and_carries_errno() {
+        let batch = error_batch(42, Errno::ACCESS);
+        assert_eq!(batch.dir_token, 42);
+        assert_eq!(batch.dir_error, Some(Errno::ACCESS));
+        assert!(batch.is_last_section);
+        assert!(batch.entries.is_empty());
+        assert_eq!(batch.child_dirs, 0);
+        assert_eq!(batch.sums.count, 0);
+    }
+
+    fn open_dir(path: &std::path::Path) -> OwnedFd {
+        rustix::fs::open(
+            path,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .expect("open temp dir")
+    }
+
+    /// The `statx` → `fstatat` fallback (taken on an `ENOSYS` kernel, or a
+    /// seccomp/gVisor sandbox) must be byte-for-byte equivalent to the
+    /// `statx` path. Driving `stat_at` with `statx_supported` forced to
+    /// `false` exercises the fallback directly without needing a kernel that
+    /// actually rejects `statx`; both answers must agree on every recorded
+    /// field.
+    #[test]
+    fn stat_at_fstatat_fallback_matches_statx() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("f"), vec![b'x'; 3000]).unwrap();
+        let dir = open_dir(tmp.path());
+        let name = CString::new("f").unwrap();
+
+        let via_statx = stat_at(dir.as_fd(), &name, &AtomicBool::new(true)).expect("statx");
+        let via_fstatat = stat_at(dir.as_fd(), &name, &AtomicBool::new(false)).expect("fstatat");
+
+        assert_eq!(kind_of(via_statx.file_type), Kind::File);
+        assert_eq!(kind_of(via_fstatat.file_type), Kind::File);
+        assert_eq!(via_statx.size.apparent, via_fstatat.size.apparent);
+        assert_eq!(via_statx.size.apparent, 3000);
+        assert_eq!(via_statx.size.real, via_fstatat.size.real);
+        assert_eq!(via_statx.ino, via_fstatat.ino);
+        assert_eq!(via_statx.nlink, via_fstatat.nlink);
+        assert_eq!(via_statx.mtime, via_fstatat.mtime);
+        assert_eq!(via_statx.dev, via_fstatat.dev);
+    }
+
+    /// Symlinks are never followed (lstat semantics, `AT_SYMLINK_NOFOLLOW`):
+    /// the entry is recorded as a symlink with its own target-string length,
+    /// on both stat paths.
+    #[test]
+    fn stat_at_does_not_follow_symlinks() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("target"), vec![b'z'; 9999]).unwrap();
+        std::os::unix::fs::symlink("target", tmp.path().join("link")).unwrap();
+        let dir = open_dir(tmp.path());
+        let name = CString::new("link").unwrap();
+
+        for supported in [true, false] {
+            let stat = stat_at(dir.as_fd(), &name, &AtomicBool::new(supported)).expect("stat link");
+            assert_eq!(
+                kind_of(stat.file_type),
+                Kind::Symlink,
+                "supported={supported}"
+            );
+            // The symlink's own size is the length of its target path,
+            // never the 9999-byte target file's size.
+            assert_eq!(stat.size.apparent, "target".len() as u64);
+        }
+    }
+
+    /// A name that raced away (or never existed) yields `ENOENT` on both the
+    /// `statx` and the `fstatat` path — the error is propagated, not masked.
+    #[test]
+    fn stat_at_reports_enoent_for_missing_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = open_dir(tmp.path());
+        let name = CString::new("does-not-exist").unwrap();
+
+        for supported in [true, false] {
+            // `EntryStat` has no `Debug`, so match rather than `unwrap_err`.
+            match stat_at(dir.as_fd(), &name, &AtomicBool::new(supported)) {
+                Ok(_) => panic!("missing name unexpectedly stat'd (supported={supported})"),
+                Err(errno) => assert_eq!(errno, Errno::NOENT, "supported={supported}"),
+            }
+        }
+    }
+}
