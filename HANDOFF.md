@@ -1,6 +1,6 @@
 # camembert — project handoff
 
-State of the project as of 2026-07-23, written for the next agent (or
+State of the project as of 2026-07-24, written for the next agent (or
 human) picking it up. The original ideation document is archived at
 [docs/design/handoff-original.md](docs/design/handoff-original.md); this
 file describes what actually exists.
@@ -37,6 +37,10 @@ pitch.
     sweep-ledger shape, root-fs scoping, nlink==0 ground truth, scan-end
     + pre-deletion lifecycle, gauge/panel/toast UI, advisory warning,
     `--no-proc-sweep`, no dump keys, module isolation).
+  - [freeable2-decisions.md](docs/design/freeable2-decisions.md) (D1–D6:
+    oracle-first Option B, allocated-logical units + "exclusive" wording,
+    floor lifecycle + kernel ≥ 6.1 gate + `--no-fiemap`, mark-time oracle
+    with async confirm modal, filesystem tiers, fiemap.rs isolation).
 - The dump format spec is [docs/format/dump-v1.md](docs/format/dump-v1.md);
   writer AND reader implement it. Major-version changes are near-taboo
   (they invalidate every stored dump).
@@ -49,7 +53,7 @@ pitch.
   identity is `Haibread <haibread@users.noreply.github.com>` (set
   repo-locally).
 
-## What is implemented (all merged on main, ~416 tests green)
+## What is implemented (all merged on main, ~480 tests green)
 
 - **Scan engine** (`camembert-core/src/scan/`): work-stealing,
   fd-relative `openat`/`getdents64`/`statx` (fstatat fallback), mount
@@ -103,6 +107,24 @@ pitch.
   (marked files by `(dev,ino)` + files *inside* marked dirs by path
   containment, coverage-honest), `--no-proc-sweep`/`NO_PROC_SWEEP`.
   Nothing in tree/dump/diff (D8 isolation).
+- **Freeable phase 2 slice 1** (`camembert-core/src/fiemap.rs`,
+  `camembert/src/ui/oracle.rs`): the mark-time selection oracle per
+  [freeable2-decisions.md](docs/design/freeable2-decisions.md) D2/D4/D5
+  — FIEMAP wrapper (pagination loop, never `FLAG_SYNC`, delalloc →
+  unknown), per-device physical-interval sweep bucketing bytes into
+  exclusive / shared-within-selection (ceiling) / shared-outside /
+  unknown, D4 hardlink rule fed by the now-public hardlink registry
+  (`ScanOutcome::hardlink_groups`), filesystem tiers by statfs magic
+  (btrfs/XFS extent, ext-family hardlink-exact, ZFS no figures), kernel
+  ≥ 6.1 gate + compress-mount caveat (mountinfo super-options now
+  parsed). UI: jobs spawn per mark off-thread (50k-file cap, per-inode
+  map cache, serial-guarded against unmark/remark races, invalidated on
+  deletion epochs), confirm modal gains an async oracle slot that
+  updates in place (spinner while pending, `y` always live), quantified
+  D2 wording replaces the phase-1 qualitative hardlink note when ready.
+  `--no-fiemap`/`NO_FIEMAP` disables it outright. Real reflink
+  integration tests (FICLONE fixtures under `CARGO_TARGET_TMPDIR`,
+  guard-skipped off btrfs/XFS).
 - **Flat view + pattern breakdown** (`camembert-core/src/flat.rs`,
   `camembert/src/ui/flatview.rs`): per
   [flat-view-decisions.md](docs/design/flat-view-decisions.md) D1–D6 —
@@ -180,6 +202,16 @@ pitch.
   (clap subcommand precedence).
 - Scanning-a-kernfs-root is allowed (explicit user intent); only mounts
   *inside* a scan are excluded.
+- Freeable phase 2 slice 1: buckets 3/4 are merged — "shared outside"
+  cannot distinguish a scanned-but-unselected sharer from an invisible
+  snapshot without root (`LOGICAL_INO` is EPERM; attack-b finding 4),
+  so the shared-elsewhere figure is exact as "not freed now" but names
+  no culprit. A mark whose oracle thread fails to spawn (rare) reads
+  Ready with that mark's bytes silently absent. The 50k-files-per-mark
+  cap sends the overflow to "not estimated" with a caveat line. Extent
+  maps are cached per (dev,ino) within a deletion epoch — external
+  filesystem writes between mark and confirm are not watched (D3:
+  acknowledged, not tracked).
 - Freeable: mmap-only holders invisible without CAP_SYS_ADMIN
   (`map_files`); btrfs multi-subvolume layouts under-count (root-subvol
   `st_dev` scoping, stated in the panel); directory-containment
@@ -201,18 +233,22 @@ pitch.
 
 ## Suggested next steps, in value order
 
-1. **Freeable phase 2**: btrfs `FIEMAP_EXTENT_SHARED` + hardlink
-   siblings — needs its own per-entry channel design (non-additive
-   inclusion-exclusion; see freeable-attack-b.md for why the phase-1
-   ledger deliberately did not pre-build it) and the reserved in-bar
-   bright segment. (ZFS: show nothing rather than invent.)
+1. **Freeable phase 2 slice 2**: the eager exclusive floor + the
+   reserved in-bar bright segment, per
+   [freeable2-decisions.md](docs/design/freeable2-decisions.md) D1/D3 —
+   off-thread post-scan pass (sequenced after the phase-1 sweep),
+   whole-value epoch-stamped side maps (~48-64 MB @ 10 M), kernel
+   ≥ 6.1 gate, "as of <computed-at>" staleness wording, `--no-fiemap`
+   shows nothing (never the disk-size fallback). Then slice 3:
+   composition (flat/breakdown/filter floor sums; `SortKey::Exclusive`
+   only if it survives the attack-report reservations).
 2. Wave 4 per the archived handoff: ssh remote scan, HTML export, watch
    mode (single-mutator design sketched in scan-tree docs), dated cache.
 
 ## How to work on this repo
 
 ```bash
-cargo test --workspace                                  # ~416 tests
+cargo test --workspace                                  # ~480 tests
 cargo clippy --workspace --all-targets -- -D warnings   # zero tolerance
 pre-commit run --all-files
 ```
