@@ -1,0 +1,92 @@
+# Changelog
+
+All notable user-facing changes to camembert are documented here.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+While the major version is `0`, a minor bump may carry a breaking change; each
+one is called out under **Breaking** with the migration to apply.
+
+## [Unreleased]
+
+## [0.2.0] - 2026-07-24
+
+### Breaking
+
+- Scans **cross filesystem boundaries by default**.
+  `--cross-filesystems`/`CROSS_FILESYSTEMS` is gone; pass
+  `--one-filesystem`/`ONE_FILESYSTEM` to restore the old
+  stop-at-the-mount-point behavior. Scripts carrying the removed flag now
+  fail to parse instead of silently changing meaning. Kernfs
+  (`/proc`, `/sys`, …) stays excluded by filesystem magic either way.
+  Known caveat, documented in the README and `--help`: btrfs snapshot
+  subvolumes and bind mounts are descended and can multiply-count.
+
+### Added
+
+- **Reclaim oracle** — marking an entry now maps its extents off the UI
+  thread (`FS_IOC_FIEMAP`, no root), so the `D` confirmation dialog answers
+  what deleting actually frees, bucketed rather than optimistic: `frees ≥ X
+  exclusive`, `+ up to Y shared only within the marked set`, `Z shared
+  elsewhere will not be freed`, `W not estimated`. Figures are
+  allocated-logical bytes. btrfs and XFS get the full extent-aware tier,
+  reflink-less filesystems an exact hardlink-only figure, ZFS nothing at all
+  (block cloning has no per-file API — no figure beats a guess).
+- **Ambient exclusive floor** — a background pass after each scan and each
+  in-app deletion proves how much of every directory nobody else references:
+  a brighter segment inside each row's bar, plus an `excl ≥ X · mapped Y ago`
+  line (or `fully shared`) on the selection card. Additive and counted once
+  filesystem-wide, so directory totals never double-count their children.
+  Requires kernel ≥ 6.1; below that it never runs rather than showing a
+  figure it can't stand behind.
+- **`--no-fiemap`/`NO_FIEMAP`** — disables the oracle and the floor
+  outright: no job spawns, no `FS_IOC_FIEMAP` call is ever made. Flag and
+  env only, no `camembert.toml` key, same shape as `--no-proc-sweep`.
+- **Confidence verdict** — both places a freeable number drives a decision
+  (top of the `f` panel, top of the `D` dialog) now open with one graded
+  line: `measured`, `partial`, `fragmentary`, or `no figure`, plus what
+  drove the grade. It headlines the caveats rather than replacing them, and
+  carries its level in plain text so a monochrome terminal reads it as well
+  as a truecolor one.
+- **Per-error `errno`** — every failing directory read and stat keeps its
+  reason end to end (scan → tree → dump → TUI), because `EACCES` ("rerun as
+  root") and `EIO` ("your disk is dying") are not the same event.
+- Multi-filesystem scans report a device count, and the disk gauge captions
+  them as spanning N filesystems instead of a percentage of a single device.
+
+### Changed
+
+- `Esc` ascends to the parent directory from the tree view instead of
+  quitting outright.
+- The README and `--help` describe the age axis as the **filter** it is
+  (`--filter '>10M older:1y'`, on mtime), not a score. A measured prototype
+  of seven scoring formulas on five real trees found every continuous
+  formula collapses onto the size or the age axis, and that mtime is widely
+  fabricated — so no score view ships.
+
+### Fixed
+
+- The disk gauge no longer overstates coverage on compressed mounts.
+- FIEMAP pagination guards against non-advancing batches instead of looping
+  forever on a filesystem that returns an empty batch mid-file.
+- The floor pass stays cancellable through hardlink-heavy work, so quitting
+  mid-pass no longer waits on it.
+
+### Security
+
+- Deletion walks descriptor-relative (`openat`/`unlinkat`) with the mark
+  identity threaded through to the executor, closing a TOCTOU window where a
+  path swapped between marking and deleting could redirect the unlink.
+
+## [0.1.0] - 2026-07-23
+
+Initial release: the scan engine, tree view, flat view and pattern
+breakdown, filter query language, `.cmbt` dump format, `camembert diff`,
+`camembert import` for ncdu exports, the freeable (deleted-but-open) panel,
+and musl builds for x86_64 and aarch64. See the
+[commit history](https://github.com/Haibread/camembert/commits/v0.1.0) for
+the full detail.
+
+[Unreleased]: https://github.com/Haibread/camembert/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/Haibread/camembert/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/Haibread/camembert/releases/tag/v0.1.0
