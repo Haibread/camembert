@@ -53,7 +53,7 @@ pitch.
   identity is `Haibread <haibread@users.noreply.github.com>` (set
   repo-locally).
 
-## What is implemented (all merged on main, ~480 tests green)
+## What is implemented (all merged on main, ~513 tests green)
 
 - **Scan engine** (`camembert-core/src/scan/`): work-stealing,
   fd-relative `openat`/`getdents64`/`statx` (fstatat fallback), mount
@@ -125,6 +125,24 @@ pitch.
   `--no-fiemap`/`NO_FIEMAP` disables it outright. Real reflink
   integration tests (FICLONE fixtures under `CARGO_TARGET_TMPDIR`,
   guard-skipped off btrfs/XFS).
+- **Freeable phase 2 slice 2** (`camembert-core/src/fiemap/floor.rs`,
+  `camembert/src/ui/floor_rt.rs`): the ambient exclusive floor per
+  freeable2 D1/D3 — whole-tree off-thread pass sequenced after the
+  phase-1 sweep (or at scan end under `--no-proc-sweep`), gated on
+  kernel ≥ 6.1 + `--no-fiemap`; SHARED-unset extents on single-link
+  files + wholly-seen fully-live hardlink groups landed at their LCA
+  (additive by construction, understates only); whole-value snapshot
+  (never mutated), post-deletion `reaggregate_floor` (no FIEMAP, per
+  attack-b finding 9), deletion interlock (cancel-before-write-lock,
+  unconditional respawn, generation-guarded results). UI: the reserved
+  in-bar bright segment (emphasized same-hue identity color; bold on
+  ANSI-16/mono, nothing wrong ever), selection-card `excl ≥ X · mapped
+  Xm ago` / `fully shared` lines with one caveat (compress wins over
+  unmapped-count), dim `mapping extents… N files` footer progress.
+  Also on main: the disk-gauge coverage fix on compressed mounts
+  (`Coverage::Exceeds` wording instead of a fabricated 100%), and Esc
+  now ascends from tree view instead of quitting (user request,
+  recorded in query-decisions D6).
 - **Flat view + pattern breakdown** (`camembert-core/src/flat.rs`,
   `camembert/src/ui/flatview.rs`): per
   [flat-view-decisions.md](docs/design/flat-view-decisions.md) D1–D6 —
@@ -212,6 +230,16 @@ pitch.
   maps are cached per (dev,ino) within a deletion epoch — external
   filesystem writes between mark and confirm are not watched (D3:
   acknowledged, not tracked).
+- Freeable phase 2 slice 2: between a deletion and its respawned pass
+  landing, every ambient floor surface is empty (the stale snapshot is
+  dropped rather than shown overstating — D3); a post-deletion
+  `reaggregate_floor` carries the previous unmapped count and
+  compressed flag forward, and never re-FIEMAPs (surviving reflink
+  siblings that became more exclusive keep their old, understating
+  figure until the next full pass — i.e. the next scan). The footer
+  progress count has no denominator (hardlink groups tick it once per
+  group). Flat-view rows and filtered totals show no floor yet
+  (slice 3 composition).
 - Freeable: mmap-only holders invisible without CAP_SYS_ADMIN
   (`map_files`); btrfs multi-subvolume layouts under-count (root-subvol
   `st_dev` scoping, stated in the panel); directory-containment
@@ -233,22 +261,19 @@ pitch.
 
 ## Suggested next steps, in value order
 
-1. **Freeable phase 2 slice 2**: the eager exclusive floor + the
-   reserved in-bar bright segment, per
-   [freeable2-decisions.md](docs/design/freeable2-decisions.md) D1/D3 —
-   off-thread post-scan pass (sequenced after the phase-1 sweep),
-   whole-value epoch-stamped side maps (~48-64 MB @ 10 M), kernel
-   ≥ 6.1 gate, "as of <computed-at>" staleness wording, `--no-fiemap`
-   shows nothing (never the disk-size fallback). Then slice 3:
-   composition (flat/breakdown/filter floor sums; `SortKey::Exclusive`
-   only if it survives the attack-report reservations).
+1. **Freeable phase 2 slice 3** — composition: floor figures on
+   flat-view rows, filtered-total floor sums, breakdown groups;
+   `SortKey::Exclusive` + `excl` column only if it survives the
+   attack-report reservations (freeable2 D2 says no sort key in
+   phase 2 — reopening needs a new element, and attack-b findings 1-3
+   are the standing argument against sort authority).
 2. Wave 4 per the archived handoff: ssh remote scan, HTML export, watch
    mode (single-mutator design sketched in scan-tree docs), dated cache.
 
 ## How to work on this repo
 
 ```bash
-cargo test --workspace                                  # ~480 tests
+cargo test --workspace                                  # ~513 tests
 cargo clippy --workspace --all-targets -- -D warnings   # zero tolerance
 pre-commit run --all-files
 ```
