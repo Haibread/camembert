@@ -1,0 +1,71 @@
+# Maintainer: Haibread <haibread@users.noreply.github.com>
+
+# Requires camembert >= 0.3.0: the man-page generator (the `camembert-mangen`
+# helper binary) landed after v0.2.0, and package() installs its output.
+#
+# Per release, in this order:
+#   1. bump pkgver
+#   2. set _commit to the commit the tag points at — it is what
+#      `camembert --version` reports, and a stale value here means the
+#      binary lies about which source built it
+#   3. updpkgsums
+#   4. makepkg --printsrcinfo > .SRCINFO
+# See README.md in this directory.
+
+pkgname=camembert
+pkgver=0.3.0
+pkgrel=1
+_commit=0000000
+pkgdesc='Disk usage analyzer that answers the real questions: what grew, what is freeable, what is cold'
+arch=('x86_64' 'aarch64')
+url='https://github.com/Haibread/camembert'
+license=('MIT OR Apache-2.0')
+depends=('gcc-libs')
+makedepends=('cargo')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+	cd "$pkgname-$pkgver"
+	export RUSTUP_TOOLCHAIN=stable
+	cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+}
+
+build() {
+	cd "$pkgname-$pkgver"
+	export RUSTUP_TOOLCHAIN=stable
+	export CARGO_TARGET_DIR=target
+	# The tarball has no .git, so build.rs would stamp `unknown` into
+	# --version; hand it the commit the tag points at instead.
+	export CAMEMBERT_GIT_SHA="$_commit"
+	cargo build --frozen --release --package camembert
+	cargo run --frozen --release --package camembert --bin camembert-mangen -- man
+}
+
+check() {
+	cd "$pkgname-$pkgver"
+	export RUSTUP_TOOLCHAIN=stable
+	export CARGO_TARGET_DIR=target
+	# Extent-dependent tests guard-skip when the build filesystem has no
+	# extents, and the statx engine probes io_uring at runtime with a
+	# synchronous fallback, so this is chroot-safe. A failure here is a
+	# real one — do not paper over it with `|| true`.
+	cargo test --frozen --workspace
+}
+
+package() {
+	cd "$pkgname-$pkgver"
+	install -Dm0755 target/release/"$pkgname" "$pkgdir/usr/bin/$pkgname"
+
+	for page in man/*.1; do
+		install -Dm0644 "$page" "$pkgdir/usr/share/man/man1/${page##*/}"
+	done
+
+	install -Dm0644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+	install -Dm0644 CHANGELOG.md "$pkgdir/usr/share/doc/$pkgname/CHANGELOG.md"
+
+	# MIT requires the copyright notice to ship with the binary; Apache-2.0
+	# requires its own text. Dual-licensed means both travel.
+	install -Dm0644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+	install -Dm0644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+}
