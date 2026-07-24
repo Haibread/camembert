@@ -790,10 +790,21 @@ truncated dump is refused with exit code 2.
 - By default camembert descends into every filesystem mounted under the
   scan root — RAM-backed `tmpfs` and other disks included, since their
   bytes are real usage of *those* filesystems, not phantom totals.
-  `--one-filesystem`/`ONE_FILESYSTEM` stops at mount points instead. One
-  caveat on btrfs: descending into subvolumes also walks snapshot
-  subvolumes (e.g. `.snapshots`), which can multiply-count snapshotted
-  data — `--one-filesystem` avoids that too.
+  `--one-filesystem`/`ONE_FILESYSTEM` stops at mount points instead. Three
+  known, accepted caveats share one root cause: the mount-boundary check
+  only compares a child's `st_dev` against its parent's, which cannot see
+  *why* two paths share a device. (1) On btrfs, descending into
+  subvolumes also walks snapshot subvolumes (e.g. `.snapshots`), which can
+  multiply-count snapshotted data — `--one-filesystem` avoids that too.
+  (2) A bind mount whose source is on the same filesystem is descended as
+  an ordinary directory, double-counting its subtree — `st_dev` never
+  differs across a same-filesystem bind mount, so even
+  `--one-filesystem` does not catch it. (3) The same block device mounted
+  at two different paths inside the scan is descended twice under the
+  default crossing behavior. Hardlink deduplication only catches
+  `nlink > 1` files, so `nlink == 1` files and directories still
+  double-count in cases (2) and (3). A traversal-dedup pass is planned —
+  see the [Roadmap](#roadmap).
 - The disk gauge tells you how much of the *occupied* filesystem your
   scan actually covers — a total without context is half a lie. The
   coverage compares the scan's **logical** footprint (`st_blocks`)

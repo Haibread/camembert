@@ -107,7 +107,15 @@ struct ScanArgs {
     /// regardless of this flag — their sizes are not disk usage. On btrfs,
     /// descending into subvolumes also walks snapshot subvolumes (e.g.
     /// `.snapshots`), which can multiply-count snapshotted data;
-    /// `--one-filesystem` avoids that too.
+    /// `--one-filesystem` avoids that too. Two related caveats this flag
+    /// does NOT fully cover: a bind mount whose source is on the same
+    /// filesystem is descended as an ordinary directory and its subtree is
+    /// double-counted, because its `st_dev` never differs from its
+    /// parent's, even with `--one-filesystem`; and the same block device
+    /// mounted at two different paths inside the scan is descended twice
+    /// under the default crossing behavior. Hardlink deduplication only
+    /// catches `nlink > 1` files, so `nlink == 1` files and directories
+    /// still double-count in both cases.
     #[arg(long, env = "ONE_FILESYSTEM")]
     one_filesystem: bool,
 
