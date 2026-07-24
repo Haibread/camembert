@@ -970,6 +970,16 @@ The workspace splits a pure core library
 [HANDOFF.md](HANDOFF.md) for the current project state, and
 [CHANGELOG.md](CHANGELOG.md) for what changed between releases.
 
+Man page generation (for packagers):
+
+```bash
+cargo run --release --package camembert --bin camembert-mangen -- <OUT_DIR>
+```
+
+writes `<OUT_DIR>/camembert.1` (plus `camembert-diff.1` and
+`camembert-import.1` for the subcommands), creating `OUT_DIR` if it
+doesn't exist. Install the result to `/usr/share/man/man1/`.
+
 ## License
 
 Dual-licensed under [MIT](LICENSE-MIT) or
