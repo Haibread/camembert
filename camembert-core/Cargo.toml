@@ -20,4 +20,8 @@ tracing = { workspace = true }
 zstd = { workspace = true }
 
 [dev-dependencies]
+# `process` (setrlimit/getrlimit) is test-only: the fd-exhaustion
+# integration test (tests/scan_errors.rs) lowers RLIMIT_NOFILE in a
+# self-spawned child. The production build keeps only `fs` + `system`.
+rustix = { version = "1.1.4", features = ["fs", "process"] }
 tempfile = "3.27.0"
