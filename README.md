@@ -122,7 +122,7 @@ Static musl binaries for `x86_64` and `aarch64` Linux are attached to every
 TARGET=x86_64-unknown-linux-musl
 TARGET=aarch64-unknown-linux-musl
 
-VERSION=0.1.0 # match the release tag, without the leading "v"
+VERSION=0.2.0 # match the release tag, without the leading "v"
 curl -LO "https://github.com/Haibread/camembert/releases/download/v${VERSION}/camembert-${VERSION}-${TARGET}.tar.gz"
 curl -LO "https://github.com/Haibread/camembert/releases/download/v${VERSION}/camembert-${VERSION}-${TARGET}.tar.gz.sha256"
 
@@ -135,7 +135,7 @@ Each archive contains the `camembert` binary alongside `LICENSE-MIT`,
 `LICENSE-APACHE`, and `README.md`.
 
 `camembert --version` embeds the exact commit it was built from (e.g.
-`camembert 0.1.0 (abc1234)`), so you can always tell what you're running.
+`camembert 0.2.0 (abc1234)`), so you can always tell what you're running.
 
 ## Quick start
 
