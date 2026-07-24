@@ -38,6 +38,7 @@ mod anim;
 pub mod caps;
 mod filterview;
 mod flatview;
+mod floor_rt;
 mod fmt;
 mod freeable_panel;
 mod history;
@@ -72,6 +73,7 @@ use tracing::{debug, error, info, warn};
 
 use camembert_core::delete;
 use camembert_core::dump::{self, DumpMeta};
+use camembert_core::fiemap::shared_bit_reliable;
 use camembert_core::flat::{self, FlatConfig};
 use camembert_core::freeable::{self, Ledger};
 use camembert_core::query::{self, ApplyOptions, FilterResult, HardlinkIndex, Query};
@@ -511,6 +513,13 @@ fn event_loop(
     // runtime (job channel, per-inode/per-device caches, per-mark landed
     // results) — `ctx.no_fiemap` disables it outright (no job ever spawns).
     let mut oracle_rt = oracle::OracleRuntime::new(ctx.no_fiemap);
+    // Freeable phase 2 slice 2 (D3): the ambient exclusive floor pass's
+    // session-long runtime (spawn state, job channel) — gated on both
+    // `--no-fiemap`/`NO_FIEMAP` and the kernel version (unlike the oracle
+    // above, which is NOT kernel-gated). Computed once here so the gate
+    // is never re-probed mid-session; see `floor_rt`'s module doc for the
+    // full spawn-sequencing and deletion-interlock design.
+    let mut floor_rt = floor_rt::FloorRuntime::new(!ctx.no_fiemap && shared_bit_reliable());
     // D6: the palette's clock/IO-owning runtime (history file, the
     // debounce timer, the off-thread filter fold's channel) — kept out of
     // `PaletteState`/`UiState` the same way `Flash`/`sweep_rx` are kept out
@@ -534,6 +543,7 @@ fn event_loop(
             &palette_rt,
             &ui,
             &oracle_rt,
+            &floor_rt,
         ) {
             FRAME
         } else {
@@ -555,6 +565,7 @@ fn event_loop(
                         &mut palette_rt,
                         &ctx.flat_config,
                         &mut oracle_rt,
+                        &mut floor_rt,
                     ) {
                         Action::Quit => {
                             if let Phase::Scanning(live) = phase {
@@ -623,6 +634,16 @@ fn event_loop(
             }
             local_generation = ui.snapshot().generation;
             phase = Phase::Done(Arc::new(RwLock::new(outcome)));
+            // Freeable phase 2 slice 2 (D3): the floor pass is sequenced
+            // strictly after the phase-1 sweep — spawn it right here only
+            // when no sweep will ever run at all (`--no-proc-sweep`);
+            // otherwise step 2.5 below kicks it off the instant `sweep_rx`
+            // resolves to `None` (see `floor_rt`'s module doc).
+            if ctx.no_proc_sweep
+                && let Phase::Done(lock) = &phase
+            {
+                floor_rt.spawn_full(Arc::clone(lock));
+            }
             // Re-view the current dir so states/totals show final values,
             // resolving any nav request the owner no longer serves.
             let dir = ui.pending_nav().unwrap_or(ui.snapshot().dir);
@@ -671,11 +692,19 @@ fn event_loop(
                     }
                     ui.set_freeable_ledger(ledger);
                     sweep_rx = None;
+                    // D3 sequencing: the phase-1 sweep just landed — this
+                    // is the earliest the floor pass may spawn.
+                    if let Phase::Done(lock) = &phase {
+                        floor_rt.spawn_full(Arc::clone(lock));
+                    }
                 }
                 Err(mpsc::TryRecvError::Empty) => {}
                 Err(mpsc::TryRecvError::Disconnected) => {
                     debug!("freeable sweep thread ended without a result");
                     sweep_rx = None;
+                    if let Phase::Done(lock) = &phase {
+                        floor_rt.spawn_full(Arc::clone(lock));
+                    }
                 }
             }
         }
@@ -694,6 +723,15 @@ fn event_loop(
             let hardlink_groups = read_outcome(lock).hardlink_groups();
             let slot = oracle::build_slot(&oracle_rt, &marks, &hardlink_groups);
             ui.set_confirm_oracle(slot);
+        }
+
+        // 2.56. Ambient exclusive floor pass landed? (freeable phase 2
+        // slice 2, D3 — polled non-blockingly, same `try_recv` idiom as
+        // the freeable sweep/oracle above.) A stale/superseded result was
+        // already discarded inside `poll` itself (`floor_rt`'s generation
+        // guard), so anything that comes back here is current.
+        if let Some(map) = floor_rt.poll() {
+            ui.set_floor(Arc::new(map), Instant::now());
         }
 
         // 2.6. Filter fold (D5): debounced trigger, then a non-blocking
@@ -743,6 +781,7 @@ fn event_loop(
                 .collect()
         };
         let mut geometry = FrameGeometry::default();
+        let floor_progress = floor_rt.progress();
         terminal.draw(|frame| {
             geometry = draw(
                 frame,
@@ -756,6 +795,7 @@ fn event_loop(
                 ctx,
                 palette_rt.fold_rx.is_some(),
                 &palette_rt.saved_queries,
+                floor_progress,
             );
         })?;
         // Recomputed every frame (design slice 3): mouse events hit-test
@@ -808,8 +848,10 @@ fn spawn_freeable_sweep(root_dev: u64) -> Option<Receiver<Ledger>> {
 /// window / a fold already in flight (D5), or the freeable-2 selection
 /// oracle: any job still in flight, or the confirm modal open with its
 /// slot still [`oracle::OracleSlot::Pending`] (the spinner needs a timely
-/// redraw even between job landings). `false` means nothing on screen
-/// changes until the user does something, so the loop idles at
+/// redraw even between job landings), or the freeable-2 ambient floor
+/// pass ([`floor_rt::FloorRuntime::has_pending`]) — its "mapping extents…
+/// N files" status line needs to tick too. `false` means nothing on
+/// screen changes until the user does something, so the loop idles at
 /// [`IDLE_POLL`] instead (design slice 5).
 #[allow(clippy::too_many_arguments)]
 fn needs_frequent_polling(
@@ -821,6 +863,7 @@ fn needs_frequent_polling(
     palette_rt: &PaletteRuntime,
     ui: &UiState,
     oracle_rt: &oracle::OracleRuntime,
+    floor_rt: &floor_rt::FloorRuntime,
 ) -> bool {
     matches!(phase, Phase::Scanning(_))
         || motion.is_active()
@@ -837,6 +880,7 @@ fn needs_frequent_polling(
                 ..
             })
         )
+        || floor_rt.has_pending()
 }
 
 // ---------------------------------------------------------------------------
@@ -1137,6 +1181,7 @@ fn handle_key(
     palette_rt: &mut PaletteRuntime,
     flat_config: &FlatConfig,
     oracle_rt: &mut oracle::OracleRuntime,
+    floor_rt: &mut floor_rt::FloorRuntime,
 ) -> Action {
     // The palette (D6) is the topmost rung: while open, it owns the
     // keyboard except Esc/Enter/arrows/Home/End/Backspace/Delete/Ctrl-C —
@@ -1161,7 +1206,7 @@ fn handle_key(
             return Action::Quit;
         }
         if code == KeyCode::Char('y') {
-            execute_deletion(ui, phase, generation, toasts, oracle_rt);
+            execute_deletion(ui, phase, generation, toasts, oracle_rt, floor_rt);
         } else {
             ui.cancel_confirm();
         }
@@ -1992,6 +2037,7 @@ fn execute_deletion(
     generation: &mut u64,
     toasts: &mut ToastQueue,
     oracle_rt: &mut oracle::OracleRuntime,
+    floor_rt: &mut floor_rt::FloorRuntime,
 ) {
     let Phase::Done(lock) = phase else {
         // The modal only opens post-scan, but never delete on a stale
@@ -2007,6 +2053,14 @@ fn execute_deletion(
     // The viewed directory may sit inside a deleted subtree: climb to the
     // nearest surviving ancestor before rebuilding the view.
     let mut dir = ui.snapshot().dir;
+    // Freeable phase 2 slice 2 (D3), the deletion interlock's first half:
+    // cancel the in-flight floor pass *before* the write lock below — see
+    // `floor_rt`'s module doc for why (a minutes-long pass must never
+    // block a deletion the user expects to be near-instant). Capture
+    // whatever map is currently displayed now, before it can be cleared,
+    // so a completed one can still seed a cheap reaggregate afterward.
+    floor_rt.cancel_for_deletion();
+    let prev_floor = ui.floor().map(|(map, _)| Arc::clone(map));
     {
         // The write lock (D5: the sole writer against `Phase::Done`'s
         // shared arena — see its doc) is scoped to this block and dropped
@@ -2028,6 +2082,12 @@ fn execute_deletion(
             // every cached oracle fact (inode maps, per-mark results,
             // in-flight job identities) -- invalidate them all.
             oracle_rt.on_deletion();
+            // Freeable phase 2 slice 2 (D3 "invalidated ... on in-app
+            // deletion epochs"): drop the now-stale floor snapshot rather
+            // than showing it against a tree it no longer describes (see
+            // `UiState::clear_floor`'s doc on why a stale map would
+            // transiently overstate).
+            ui.clear_floor();
         }
         if report.failed > 0 || report.skipped > 0 {
             toasts.push(format!(
@@ -2051,6 +2111,15 @@ fn execute_deletion(
                 .parent
                 .expect("the scan root is never removable");
         }
+    }
+    // The deletion interlock's second half (`floor_rt`'s module doc):
+    // respawn *unconditionally*, even if nothing actually got deleted —
+    // the cancel above already fired before that outcome was known, so an
+    // all-failed deletion attempt must still resurrect a pass that was
+    // cancelled for nothing rather than leaving the floor pass stalled
+    // for the rest of the session.
+    if let Phase::Done(lock) = phase {
+        floor_rt.respawn_after_deletion(Arc::clone(lock), prev_floor);
     }
     serve_local(phase, dir, generation, ui);
 }
@@ -2144,6 +2213,7 @@ fn draw(
     ctx: &RenderCtx,
     filter_fold_in_flight: bool,
     saved_queries: &[(String, String)],
+    floor_progress: Option<u64>,
 ) -> FrameGeometry {
     // Once per frame: a navigation/sort since the last frame starts a
     // fresh animation window (design slice 5) — see the `anim` module.
@@ -2219,9 +2289,19 @@ fn draw(
         (main_area, None)
     };
     let show_selection_card = !ui.zen() && ui.mode() == ViewMode::Tree && left_area.height >= 9;
+    // Freeable phase 2 slice 2 (D2): the card's floor figure/caveat lines,
+    // computed once here so the card's own height (below) and its content
+    // (`draw_selection_card`) never disagree about how many there are.
+    let floor_lines: Vec<String> = match (ui.floor(), ui.card_row()) {
+        (Some((floor, computed_at)), Some(row)) => {
+            floor_rt::card_lines(floor, row, Instant::now(), computed_at)
+        }
+        _ => Vec::new(),
+    };
     let (table_area, card_area) = if show_selection_card {
-        let [table, card] =
-            Layout::vertical([Constraint::Min(1), Constraint::Length(4)]).areas(left_area);
+        let card_height = 4 + floor_lines.len() as u16;
+        let [table, card] = Layout::vertical([Constraint::Min(1), Constraint::Length(card_height)])
+            .areas(left_area);
         (table, Some(card))
     } else {
         (left_area, None)
@@ -2292,7 +2372,7 @@ fn draw(
         }
     };
     if let Some(card_area) = card_area {
-        draw_selection_card(frame, card_area, ui, ctx);
+        draw_selection_card(frame, card_area, ui, &floor_lines, ctx);
     }
     if layout == WheelLayout::Mini {
         draw_mini_donut(frame, header_area, &wheel_source, motion, ctx);
@@ -2302,7 +2382,7 @@ fn draw(
 
     draw_filter_pill(frame, pill_area, ui, filter_fold_in_flight, ctx);
     draw_basket_strip(frame, basket_area, ui, ctx);
-    draw_footer(frame, footer_area, ui, flash, ctx);
+    draw_footer(frame, footer_area, ui, flash, floor_progress, ctx);
 
     // Toasts must not obstruct the confirm modal (design slice 4) or the
     // palette (D6): they sit top-right of the main content, well clear of
@@ -2705,21 +2785,40 @@ fn draw_table(
             format!("{:>5}", "-")
         };
         // Identity color: bar color == name color == wheel slice color.
-        let identity = ranks
-            .get(index)
-            .copied()
-            .flatten()
-            .map(|rank| theme.identity(rank));
+        let rank = ranks.get(index).copied().flatten();
+        let identity = rank.map(|rank| theme.identity(rank));
         // Eased bar fill (design slice 5): the percentage text above
         // shows the real value immediately, only the bar itself grows in
         // — `bar_progress` is a uniform 0->1 reveal shared by every row
         // in the view, restarted on the next navigation/sort.
-        let bar = Span::from(wheel::proportion_bar(
-            frac * bar_progress,
-            BAR_WIDTH,
-            ctx.ascii(),
-        ))
-        .fg(identity.unwrap_or(muted));
+        let bar_text = wheel::proportion_bar(frac * bar_progress, BAR_WIDTH, ctx.ascii());
+        let bar_color = identity.unwrap_or(muted);
+        // Freeable phase 2 slice 2 (reservation 2, tui-design.md): split
+        // the *current* eased fill into a bright "floor-exclusive" prefix
+        // and the rest, using whatever `bar_text` actually rendered —
+        // reusing its own filled-cell count via `bright_split` keeps this
+        // in lockstep with the eased reveal instead of fighting it.
+        let floor_bytes = ui
+            .floor()
+            .and_then(|(floor, _)| floor_rt::row_floor(floor, row));
+        let bright_len = floor_rt::bright_split(&bar_text, floor_bytes, disk);
+        let bar = if bright_len > 0 {
+            let emphasis = match rank {
+                Some(rank) => theme.identity_emphasis(rank),
+                None => theme.muted_emphasis(),
+            };
+            let split = bar_text
+                .char_indices()
+                .nth(bright_len)
+                .map_or(bar_text.len(), |(i, _)| i);
+            let (bright, rest) = bar_text.split_at(split);
+            Cell::from(Line::from(vec![
+                Span::from(bright.to_owned()).style(emphasis),
+                Span::from(rest.to_owned()).fg(bar_color),
+            ]))
+        } else {
+            Cell::from(Span::from(bar_text).fg(bar_color))
+        };
         let mut name_text = String::from_utf8_lossy(&row.name).into_owned();
         if row.is_dir {
             name_text.push('/');
@@ -2766,7 +2865,7 @@ fn draw_table(
         }
         cells.extend([
             Cell::from(pct),
-            Cell::from(bar),
+            bar,
             Cell::from(format!("{:>8}", items)),
             Cell::from(name),
         ]);
@@ -3126,7 +3225,13 @@ fn draw_breakdown_table(
 /// Selection card under the table: humanized mtime, item count, share of
 /// the parent, error count for the row under the cursor — or the
 /// mouse-hovered row while the pointer sits over the table.
-fn draw_selection_card(frame: &mut Frame<'_>, area: Rect, ui: &UiState, ctx: &RenderCtx) {
+fn draw_selection_card(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    ui: &UiState,
+    floor_lines: &[String],
+    ctx: &RenderCtx,
+) {
     let theme = &ctx.theme;
     // Accent border while the mouse is driving the card (a transient
     // preview), muted for the keyboard cursor's steady-state selection.
@@ -3173,7 +3278,7 @@ fn draw_selection_card(frame: &mut Frame<'_>, area: Rect, ui: &UiState, ctx: &Re
         line2.push(sep.clone());
         line2.push(Span::from(format!("{} errors", row.errors)).fg(theme.color(theme::ERROR)));
     }
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![
             Span::from(format!("{:>9}", HumanSize(row.disk).to_string())).bold(),
             sep.clone(),
@@ -3181,6 +3286,18 @@ fn draw_selection_card(frame: &mut Frame<'_>, area: Rect, ui: &UiState, ctx: &Re
         ]),
         Line::from(line2),
     ];
+    // Freeable phase 2 slice 2 (D2): the ambient floor figure, when there
+    // is one — `excl ≥ …`/"fully shared" in accent, at most one caveat
+    // beneath it dimmed, same styling split the confirm modal's oracle
+    // wording already uses.
+    if let Some((figure, caveat)) = floor_lines.split_first() {
+        lines.push(Line::from(
+            Span::from(figure.clone()).fg(theme.color(theme::ACCENT)),
+        ));
+        if let Some(caveat) = caveat.first() {
+            lines.push(Line::from(Span::from(caveat.clone()).dim()));
+        }
+    }
     let block = block.title(Span::from(format!(" {name}{suffix} ")).bold());
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -3382,6 +3499,7 @@ fn draw_footer(
     area: Rect,
     ui: &UiState,
     flash: Option<&str>,
+    floor_progress: Option<u64>,
     ctx: &RenderCtx,
 ) {
     let theme = &ctx.theme;
@@ -3399,6 +3517,16 @@ fn draw_footer(
             Span::from(format!(" {text}"))
                 .fg(theme.color(theme::ACCENT))
                 .bold(),
+        );
+    }
+    // Freeable phase 2 slice 2 (D3): the ambient floor pass's progress,
+    // while in flight — a dim one-liner, same unobtrusive footer spot as
+    // the "updating…"/hardlink notes just below. Nothing at all once the
+    // pass lands (or on `--no-fiemap`/old kernel, where it never spawns).
+    if let Some(n) = floor_progress {
+        push_note(
+            &mut notes,
+            Span::from(format!("mapping extents… {n} files")).dim(),
         );
     }
     // Marked-entry count/size lives in the basket strip now (design
@@ -4294,6 +4422,7 @@ mod tests {
                             &ctx,
                             true, // fold in flight: exercises the spinner path too
                             saved,
+                            None,
                         );
                     })
                     .unwrap();
@@ -4341,6 +4470,7 @@ mod tests {
                             &ctx,
                             false,
                             &[],
+                            None,
                         );
                     })
                     .unwrap();
@@ -4395,6 +4525,7 @@ mod tests {
                                     &ctx,
                                     false,
                                     &[],
+                                    None,
                                 );
                             })
                             .unwrap();
@@ -4465,6 +4596,7 @@ mod tests {
                         &ctx,
                         false,
                         &[],
+                        None,
                     );
                 })
                 .unwrap();
@@ -4572,6 +4704,7 @@ mod tests {
                     &ctx,
                     false,
                     &[],
+                    None,
                 );
             })
             .unwrap();
@@ -4601,6 +4734,7 @@ mod tests {
                     &ctx,
                     false,
                     &[],
+                    None,
                 );
             })
             .unwrap();
@@ -4643,6 +4777,7 @@ mod tests {
                     &ctx,
                     false,
                     &[],
+                    None,
                 );
             })
             .unwrap();
@@ -4677,6 +4812,7 @@ mod tests {
                     &ctx,
                     false,
                     &[],
+                    None,
                 );
             })
             .unwrap();
@@ -4818,6 +4954,7 @@ mod tests {
                         &ctx,
                         false,
                         &[],
+                        None,
                     );
                 })
                 .unwrap();
@@ -4857,6 +4994,7 @@ mod tests {
                         &ctx,
                         false,
                         &[],
+                        None,
                     );
                 })
                 .unwrap();
@@ -4918,13 +5056,15 @@ mod tests {
         // A fresh runtime per call is fine here: none of the pre-existing
         // routing tests exercise the palette (their own dedicated tests
         // below construct/thread a `PaletteRuntime` explicitly instead).
-        // The oracle runtime is `disabled: true` for the same reason —
-        // these are routing tests, not oracle behavior tests (see
-        // `ui::oracle::tests` for those), and a disabled runtime never
-        // spawns a thread, keeping this helper synchronous.
+        // The oracle and floor runtimes are both disabled for the same
+        // reason — these are routing tests, not oracle/floor behavior
+        // tests (see `ui::oracle::tests`/`ui::floor_rt::tests` for those),
+        // and a disabled runtime never spawns a thread, keeping this
+        // helper synchronous.
         let mut palette_rt = PaletteRuntime::new(Vec::new());
         let flat_config = FlatConfig::default();
         let mut oracle_rt = oracle::OracleRuntime::new(true);
+        let mut floor_rt = floor_rt::FloorRuntime::new(false);
         handle_key(
             code,
             KeyModifiers::NONE,
@@ -4937,6 +5077,7 @@ mod tests {
             &mut palette_rt,
             &flat_config,
             &mut oracle_rt,
+            &mut floor_rt,
         )
     }
 
@@ -5051,6 +5192,7 @@ mod tests {
                     &ctx,
                     false,
                     &[],
+                    None,
                 );
             })
             .unwrap();
@@ -5553,6 +5695,7 @@ mod tests {
                         &ctx,
                         false,
                         &[],
+                        None,
                     );
                 })
                 .unwrap();

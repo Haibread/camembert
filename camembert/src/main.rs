@@ -200,10 +200,11 @@ struct ScanArgs {
     /// Disable the freeable-2 selection oracle in the interactive UI (env:
     /// NO_FIEMAP)
     ///
-    /// Skips every `FS_IOC_FIEMAP` call: no mark-time reclaim estimate, and
-    /// the delete confirmation dialog falls back to the phase-1
-    /// hardlink-only advisory (a later slice's ambient in-bar "shared"
-    /// segment is disabled the same way). For filesystems or containers
+    /// Skips every `FS_IOC_FIEMAP` call: no mark-time reclaim estimate, the
+    /// delete confirmation dialog falls back to the phase-1 hardlink-only
+    /// advisory, and the ambient exclusive floor is disabled outright — no
+    /// background pass, no in-bar bright segment, no `excl ≥ …`/"fully
+    /// shared" line on the selection card. For filesystems or containers
     /// where the ioctl is unavailable, undesired, or where the per-mark
     /// `open`+FIEMAP cost on a large selection isn't wanted. Like
     /// NO_PROC_SWEEP, any value at all counts as set, even the empty

@@ -6,7 +6,9 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
+use camembert_core::fiemap::FloorMap;
 use camembert_core::flat::FlatSummary;
 use camembert_core::freeable::Ledger;
 use camembert_core::query::FilterResult;
@@ -420,6 +422,14 @@ pub struct UiState {
     /// is active. Composition (tree/t/b totals, dir-mark refusal, the
     /// pill) all key off this.
     filter: Option<ActiveFilter>,
+    /// Freeable phase 2 slice 2 (D3): the ambient exclusive floor's latest
+    /// whole-value snapshot plus when it was computed — `None` until the
+    /// first pass lands, forever on `--no-fiemap`/`NO_FIEMAP` or a kernel
+    /// < 6.1 (the pass never spawns at all, see `ui::floor_rt`), or
+    /// transiently while a deletion's respawned pass is still in flight
+    /// (the stale map is dropped rather than shown against a tree it no
+    /// longer describes — [`Self::clear_floor`]).
+    floor: Option<(Arc<FloorMap>, Instant)>,
 }
 
 impl UiState {
@@ -454,6 +464,7 @@ impl UiState {
             flat_epoch: 0,
             palette: None,
             filter: None,
+            floor: None,
         };
         state.ensure_sorted();
         state
@@ -1006,6 +1017,36 @@ impl UiState {
     /// for mouse hit-testing.
     pub fn clamp_freeable_cursor(&mut self, total_rows: usize) {
         self.freeable_cursor = self.freeable_cursor.min(total_rows.saturating_sub(1));
+    }
+
+    // ---- freeable phase 2 slice 2: ambient exclusive floor (D3) ----
+
+    /// Adopt a freshly-landed floor snapshot (`ui::floor_rt::FloorRuntime`
+    /// poll, both the scan-end full pass and a post-deletion respawn).
+    /// `computed_at` is the wall-clock instant the caller stamped the
+    /// result with — every ambient surface reads "as of/mapped X ago" off
+    /// it (D3).
+    pub fn set_floor(&mut self, floor: Arc<FloorMap>, computed_at: Instant) {
+        self.floor = Some((floor, computed_at));
+    }
+
+    /// The current floor snapshot plus when it was computed, if any
+    /// (`None` before the first pass lands, forever when the pass never
+    /// spawns at all, or transiently between a deletion and its respawned
+    /// pass landing — see [`Self::clear_floor`]).
+    pub fn floor(&self) -> Option<(&Arc<FloorMap>, Instant)> {
+        self.floor.as_ref().map(|(map, at)| (map, *at))
+    }
+
+    /// Drop the current snapshot (a confirmed deletion just changed the
+    /// tree under it, D3 "invalidated ... on in-app deletion epochs"): a
+    /// stale map's `dir_floor` would still count bytes from the
+    /// now-removed subtree until the respawned pass lands, which would
+    /// transiently *overstate* the floor — the one honesty direction this
+    /// feature must never take. Every ambient surface reads `None` as "no
+    /// figure" in the meantime, same as before the first pass ever landed.
+    pub fn clear_floor(&mut self) {
+        self.floor = None;
     }
 
     fn ensure_sorted(&mut self) {

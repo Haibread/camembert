@@ -230,6 +230,17 @@ fn dist2(a: (u8, u8, u8), b: (i32, i32, i32)) -> i64 {
     d(a.0, b.0) + d(a.1, b.1) + d(a.2, b.2)
 }
 
+/// Blend `rgb` toward white by `amount` (`0.0` = unchanged, `1.0` =
+/// white) — the freeable-2 bright-segment "emphasis" variant.
+fn lighten((r, g, b): (u8, u8, u8), amount: f64) -> (u8, u8, u8) {
+    let blend = |c: u8| -> u8 {
+        (f64::from(c) + (255.0 - f64::from(c)) * amount)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    (blend(r), blend(g), blend(b))
+}
+
 /// The active theme: a palette projected onto the detected color level.
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
@@ -267,6 +278,47 @@ impl Theme {
     /// Identity color for a size rank (0 = largest child).
     pub fn identity(&self, rank: usize) -> Color {
         self.project(self.palette.identity[rank % IDENTITY_LEN])
+    }
+
+    /// The "emphasis" variant of an identity color: freeable phase 2's
+    /// in-bar bright segment (tui-design.md reservation 2) must stay
+    /// within the row's own identity hue — never a second color
+    /// (`docs/design/freeable2-attack-b.md` finding 10). Truecolor/256
+    /// blend the palette entry 40% toward white: still unmistakably the
+    /// same hue, visibly brighter. ANSI-16/mono have no reliable brighter
+    /// shade of a named terminal color, so those rungs carry the
+    /// distinction as **bold** on the same (unlightened) color instead —
+    /// silent degrade, never a wrong color.
+    pub fn identity_emphasis(&self, rank: usize) -> Style {
+        self.emphasize(
+            self.palette.identity[rank % IDENTITY_LEN],
+            self.identity(rank),
+        )
+    }
+
+    /// [`Self::identity_emphasis`] for muted (non-ranked) rows: the bar
+    /// still needs an emphasized variant of *its* actual color, which for
+    /// an unranked row is the muted role, not an identity color.
+    pub fn muted_emphasis(&self) -> Style {
+        self.emphasize(self.palette.muted, self.color(MUTED))
+    }
+
+    /// Shared emphasis projection: lighten on truecolor/256, bold-only on
+    /// ANSI-16/mono (see [`Self::identity_emphasis`]'s doc for why).
+    fn emphasize(&self, entry: PaletteEntry, base: Color) -> Style {
+        match self.level {
+            ColorLevel::Truecolor => {
+                let (r, g, b) = lighten(entry.rgb, 0.4);
+                Style::new().fg(Color::Rgb(r, g, b))
+            }
+            ColorLevel::Ansi256 => {
+                let (r, g, b) = lighten(entry.rgb, 0.4);
+                Style::new().fg(Color::Indexed(rgb_to_256(r, g, b)))
+            }
+            ColorLevel::Ansi16 | ColorLevel::Mono => {
+                Style::new().fg(base).add_modifier(Modifier::BOLD)
+            }
+        }
     }
 
     /// Cursor-row highlight: the palette's selection background where the
@@ -420,6 +472,57 @@ mod tests {
             theme.selection_style(),
             Style::new().add_modifier(Modifier::REVERSED)
         );
+    }
+
+    /// Freeable-2 bright segment (attack-b finding 10): the emphasis
+    /// variant stays the same hue at truecolor/256 — never a second color
+    /// family — while ANSI-16/mono keep the exact base color and add bold
+    /// instead of trying (and failing) to fabricate a brighter shade.
+    #[test]
+    fn identity_emphasis_stays_within_hue_and_degrades_to_bold() {
+        let truecolor = Theme::new(ThemeName::TokyoNight, ColorLevel::Truecolor);
+        let base = truecolor.identity(1);
+        let emph = truecolor.identity_emphasis(1);
+        assert_ne!(emph.fg, Some(base), "truecolor must actually brighten");
+        let Some(Color::Rgb(r, g, b)) = emph.fg else {
+            panic!("expected an RGB emphasis color");
+        };
+        let Color::Rgb(br, bg, bb) = base else {
+            panic!("expected an RGB base color");
+        };
+        // Every channel moved toward white (or was already saturated).
+        assert!(r >= br && g >= bg && b >= bb);
+        assert!(!emph.add_modifier.contains(Modifier::BOLD));
+
+        for level in [ColorLevel::Ansi16, ColorLevel::Mono] {
+            let theme = Theme::new(ThemeName::TokyoNight, level);
+            let emph = theme.identity_emphasis(1);
+            assert_eq!(
+                emph.fg,
+                Some(theme.identity(1)),
+                "{level:?}: color must stay exactly the base identity color"
+            );
+            assert!(
+                emph.add_modifier.contains(Modifier::BOLD),
+                "{level:?}: distinction carried by bold"
+            );
+        }
+    }
+
+    #[test]
+    fn muted_emphasis_mirrors_identity_emphasis_for_the_muted_role() {
+        let theme = Theme::new(ThemeName::TokyoNight, ColorLevel::Truecolor);
+        let base = theme.color(MUTED);
+        let emph = theme.muted_emphasis();
+        assert_ne!(emph.fg, Some(base));
+    }
+
+    #[test]
+    fn lighten_moves_toward_white_and_clamps() {
+        assert_eq!(lighten((0, 0, 0), 0.5), (128, 128, 128));
+        assert_eq!(lighten((255, 255, 255), 0.5), (255, 255, 255));
+        assert_eq!(lighten((100, 100, 100), 0.0), (100, 100, 100));
+        assert_eq!(lighten((0, 0, 0), 1.0), (255, 255, 255));
     }
 
     #[test]

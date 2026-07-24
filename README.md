@@ -165,7 +165,7 @@ interactive key map and the diff JSON schema.
 | `--theme` | `THEME` | `tokyo-night`/`light`/`high-contrast` |
 | `--no-motion` | `NO_MOTION` | disable bar/donut easing animations |
 | `--no-proc-sweep` | `NO_PROC_SWEEP` | disable the freeable `/proc` sweep (gauge suffix, `f` panel, toast, pre-deletion open-file check) |
-| `--no-fiemap` | `NO_FIEMAP` | disable the freeable-2 selection oracle (mark-time reclaim estimate in the delete confirmation) — see [Reclaim oracle](#reclaim-oracle-freeable-phase-2) |
+| `--no-fiemap` | `NO_FIEMAP` | disable the freeable-2 selection oracle (mark-time reclaim estimate) and the ambient exclusive floor (in-bar bright segment, card figure) — see [Reclaim oracle](#reclaim-oracle-freeable-phase-2) |
 | `--log-filter` | `LOG_FILTER` | `tracing` filter directive |
 | `--log-file` | `LOG_FILE` | write diagnostics to a file instead of discarding them |
 
@@ -540,7 +540,44 @@ bucketed rather than as one optimistic number:
 - **`--no-fiemap`/`NO_FIEMAP`** disables the oracle outright — no job ever
   spawns, no `FS_IOC_FIEMAP` call is ever made, and the confirmation
   dialog falls back to the phase-1 hardlink-only wording. Same shape as
-  `--no-proc-sweep`: flag/env only, no `camembert.toml` key.
+  `--no-proc-sweep`: flag/env only, no `camembert.toml` key. Also
+  disables the ambient exclusive floor below.
+
+### Ambient exclusive floor
+
+Where the oracle above answers "what does *this marked set* free, exactly,
+right now", the floor answers the ambient question — visible before you
+mark anything at all — of how much of every directory is provably
+non-shared:
+
+- **The bright segment inside each row's bar** is the row's guaranteed-at
+  -least-this-much-exclusive share: a brighter shade of the row's own
+  identity color (never a second color), sized to the fraction of the
+  row's bytes the floor can prove nobody else references. It is
+  *additive* — unlike the oracle's per-selection figures, floor bytes are
+  counted once, filesystem-wide, so directory totals never double-count
+  what their children already claimed.
+- **The selection card** adds a matching line once a directory or file is
+  selected: `excl ≥ X · mapped Y ago` for a nonzero floor, or `fully
+  shared · mapped Y ago` when the floor is exactly zero on a nonzero-size
+  entry — zero is a real, informative answer here, never hidden as if
+  there were nothing to say. A trailing caveat line appears when it
+  applies: a `compress`-mounted device (physical reclaim may be smaller
+  than the logical figure) or unmapped files (the floor understates by at
+  least their bytes).
+- **"mapped … ago"** is honest about staleness: the pass runs once, off
+  thread, right after the scan (and the phase-1 `/proc` sweep, if one
+  runs) completes, and again after every in-app deletion — but external
+  filesystem writes, snapshots, or dedup runs between passes are not
+  watched. The timestamp says exactly how old the figure is so you can
+  judge that yourself.
+- **Same honesty contract as the oracle**: allocated-logical bytes, `≥`
+  and "fully shared" wording only, never "you will free exactly X".
+  Kernel ≥ 6.1 gated the same way (unlike the oracle, which still runs
+  with a caveat on older kernels, the floor simply never runs at all
+  below 6.1 — no partial/unreliable figure is worth showing ambiently).
+- **`--no-fiemap`/`NO_FIEMAP`** disables the floor together with the
+  oracle: no background pass, no bright segment, no card line.
 
 ## Configuration
 
@@ -659,12 +696,11 @@ Scan engine (including media-adaptive threading and io_uring-batched
 statx with a sync fallback), live TUI, dump v1, diff, ncdu import,
 guarded deletion, freeable phase 1 (deleted-but-open files), flat view
 and pattern aggregation, and the filter query language with a Ctrl-K
-command palette are implemented. Freeable phase 2 slice 1 (the mark-time
-selection oracle above) is implemented; next: freeable phase 2 slice 2
-(the ambient exclusive-byte floor computed after scan end and the
-reserved in-bar "shared" segment), group/bulk marking under a filter,
-per-owner views, remote scan over ssh, and an HTML report export. The
-full design trail lives in [`docs/design/`](docs/design/).
+command palette are implemented. Freeable phase 2 (both the mark-time
+selection oracle and the ambient exclusive floor above) is implemented;
+next: group/bulk marking under a filter, per-owner views, remote scan
+over ssh, and an HTML report export. The full design trail lives in
+[`docs/design/`](docs/design/).
 
 ## Development
 
