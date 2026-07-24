@@ -275,6 +275,11 @@ pub fn compute_floor(
         if group.nodes.iter().any(|&n| tree.is_removed(n)) {
             continue;
         }
+        // The counter keeps moving here (one tick per group measured) so
+        // the stride check stays live through a hardlink-heavy phase 2 —
+        // phase 1's final count is otherwise frozen for this whole loop.
+        processed += 1;
+        progress.fetch_add(1, Ordering::Relaxed);
         if processed.is_multiple_of(CANCEL_STRIDE) && cancel.load(Ordering::Relaxed) {
             return None;
         }
