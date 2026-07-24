@@ -309,12 +309,34 @@ pitch.
 7. Cleanup recipes: display-only suggestions for known paths (e.g.
    `journalctl --vacuum-time=`, `pip cache purge`) — never executed,
    only shown.
-8. Age/"big and cold" score view (size × age) — a dossier is in
-   progress.
-9. Traversal-dedup dossier: collapse the bind-mount and snapshot-
-   subvolume double-counting accepted in the crossing-by-default
-   addendum (see
-   [scan-tree-decisions.md](docs/design/scan-tree-decisions.md)).
+8. Age/"big and cold" score view (size × age) — **dossier delivered,
+   awaiting a decision**:
+   [age-score-prototype.md](docs/design/age-score-prototype.md) measured
+   seven formulas on five real trees and recommends building *no* score
+   (every continuous formula collapses onto either the size or the age
+   axis; the threshold quadrant wins and already ships as
+   `--filter '>10M older:1y'`; mtime is widely fabricated — 22.6k files
+   share cargo's fixed 2006 timestamp, some directories carry negative
+   mtimes), while [age-view-mockups.md](docs/design/age-view-mockups.md)
+   designs four surfaces should the score be built anyway. The actionable
+   item either way: README's "size × age, visible at a glance" describes
+   a feature that does not exist.
+9. Traversal-dedup — **dossier delivered, awaiting a decision**:
+   [traversal-dedup-dossier.md](docs/design/traversal-dedup-dossier.md)
+   (recommends Option D: `statx` `MNT_ID_UNIQUE`/`SUBVOL` +
+   `STATX_ATTR_MOUNT_ROOT` classification, mountinfo plan consulted only
+   at boundaries, aliases skipped *visibly*, subvolumes labelled rather
+   than deduped). Covers the bind-mount and snapshot-subvolume
+   double-counting accepted in the crossing-by-default addendum (see
+   [scan-tree-decisions.md](docs/design/scan-tree-decisions.md)) and adds
+   three newly found alias cases (overlayfs lower/upper, ZFS
+   `.zfs/snapshot` automounts, bind-mounted regular files).
+10. `AT_NO_AUTOMOUNT` on the scan's `statx`/`statat` calls: camembert
+    currently passes only `AT_SYMLINK_NOFOLLOW`, so on ZFS with
+    `snapdir=visible` it *triggers* the automounts it then descends —
+    the tool mutates the system it measures. One flag; the original
+    design already called for excluding unmounted autofs. Hot path, so
+    it needs the usual before/after benchmark.
 
 ## How to work on this repo
 
