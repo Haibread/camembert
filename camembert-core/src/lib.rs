@@ -2,13 +2,24 @@
 //! semantics. Frontends (TUI, GUI) depend on this crate and never the other
 //! way around.
 
+// Depends on `fiemap::OracleReport` and `freeable::Coverage`, so it can
+// only exist where those do: Linux (see the gates below).
+#[cfg(target_os = "linux")]
 pub mod confidence;
+// openat/unlinkat/AT_REMOVEDIR (via `rustix::fs`) are POSIX, not
+// Linux-specific — portable to any Unix.
+#[cfg(unix)]
 pub mod delete;
 pub mod diff;
 pub mod dump;
 pub mod errno;
+// `FS_IOC_FIEMAP` is a Linux-only ioctl (linux/fs.h); no BSD/Darwin
+// equivalent.
+#[cfg(target_os = "linux")]
 pub mod fiemap;
 pub mod flat;
+// Enumerates open files via `/proc/[pid]/fd`, a Linux-only procfs layout.
+#[cfg(target_os = "linux")]
 pub mod freeable;
 pub mod ncdu;
 pub mod query;

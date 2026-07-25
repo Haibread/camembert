@@ -11,17 +11,29 @@ arc-swap = "1.9.2"
 crossbeam-channel = "0.5.16"
 crossbeam-deque = "0.8.7"
 hashbrown = "0.17.1"
-io-uring = "0.7.13"
 rustc-hash = "2.1.3"
-rustix = { version = "1.1.4", features = ["fs", "system"] }
 serde_json = { workspace = true }
 thiserror = "2.0.19"
 tracing = { workspace = true }
 zstd = { workspace = true }
 
+# io_uring is a Linux kernel interface (io_uring(7)); not even portable
+# across other Unixes, so it gets its own narrower `cfg` than `rustix`.
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7.13"
+
+# openat/unlinkat/statx and friends (via `fs`) plus getrlimit/uname (via
+# `system`) are POSIX/Unix-wide, not Linux-specific — keep this at
+# `cfg(unix)` so `delete.rs`, which is POSIX-portable, is not stranded
+# alongside the genuinely Linux-only modules.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", features = ["fs", "system"] }
+
 [dev-dependencies]
+tempfile = "3.27.0"
+
+[target.'cfg(unix)'.dev-dependencies]
 # `process` (setrlimit/getrlimit) is test-only: the fd-exhaustion
 # integration test (tests/scan_errors.rs) lowers RLIMIT_NOFILE in a
 # self-spawned child. The production build keeps only `fs` + `system`.
 rustix = { version = "1.1.4", features = ["fs", "process"] }
-tempfile = "3.27.0"
