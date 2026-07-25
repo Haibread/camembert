@@ -4,8 +4,9 @@
 
 use std::fmt::Write as _;
 use std::fs;
+use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt};
 use std::path::Path;
 
 use camembert_core::scan::{ScanOptions, ScanOutcome, Scanner, StatxBackend, StatxEngine};
@@ -92,6 +93,39 @@ fn fingerprint(outcome: &ScanOutcome) -> String {
     out
 }
 
+/// Guard: skip (returning `true`) when the fixture filesystem accounts
+/// `st_blocks` lazily.
+///
+/// Both engine-parity tests scan the same tree twice and compare the
+/// results byte for byte. That only means anything if the tree holds
+/// still between the two scans — and on ZFS it does not: allocation is
+/// accounted when the transaction group commits, so the second scan sees
+/// allocated bytes the first one could not, with nothing written in
+/// between (measured on OpenZFS 2.2 / kernel 6.8: a synced 512 KiB file
+/// stats as 512 bytes, then as 532 KiB about six seconds later; `sync(2)`
+/// does not reliably settle it). The divergence would be blamed on the
+/// stat engine, which is exactly the thing these tests are meant to rule
+/// out. See the README's "Honest numbers" for the user-facing caveat.
+fn skip_unless_blocks_are_accounted(dir: &Path) -> bool {
+    let probe = dir.join(".block-accounting-probe");
+    {
+        let mut file = fs::File::create(&probe).expect("probe file");
+        file.write_all(&vec![0u8; 512 * 1024]).expect("probe write");
+        file.sync_all().expect("probe fsync");
+    }
+    let blocks = fs::metadata(&probe).map(|m| m.blocks() * 512).unwrap_or(0);
+    let _ = fs::remove_file(&probe);
+    if blocks < 256 * 1024 {
+        eprintln!(
+            "skipping: {} defers block accounting ({blocks} bytes allocated for a \
+             synced 512 KiB file, e.g. ZFS)",
+            dir.display()
+        );
+        return true;
+    }
+    false
+}
+
 fn counters(outcome: &ScanOutcome) -> (u64, u64, u64, u64, u64, u64, u64, u64) {
     (
         outcome.totals.apparent,
@@ -115,6 +149,9 @@ fn io_uring_and_sync_engines_produce_identical_trees() {
     let root = tmp.path();
     build_fixture(root);
 
+    if skip_unless_blocks_are_accounted(root) {
+        return;
+    }
     let sync = scan_with(StatxEngine::Sync, 1, root);
     let uring = scan_with(StatxEngine::IoUring, 1, root);
     unlock_fixture(root);
@@ -146,6 +183,9 @@ fn engines_agree_on_aggregates_under_parallel_scan() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     build_fixture(root);
+    if skip_unless_blocks_are_accounted(root) {
+        return;
+    }
 
     let sync = scan_with(StatxEngine::Sync, 8, root);
     let uring = scan_with(StatxEngine::IoUring, 8, root);
@@ -172,13 +212,14 @@ fn engine_selection_is_reported_and_never_fails() {
     assert_eq!(forced_sync.statx_backend, Some(StatxBackend::Sync));
     assert_eq!(forced_sync.entries, 2);
 
+    // Auto resolves to sync at every worker count: io_uring won on one
+    // machine at ≤ 2 workers and lost by 1.2-1.7× on another at every
+    // count (see the selection comment in `Scanner::scan`), so auto takes
+    // the engine that is never the slow one.
     let auto = scan_with(StatxEngine::Auto, 2, root);
-    assert!(auto.statx_backend.is_some());
+    assert_eq!(auto.statx_backend, Some(StatxBackend::Sync));
     assert_eq!(auto.entries, 2);
 
-    // The auto heuristic: many workers → sync (io_uring batching is
-    // slower once workers saturate the cores); ≤ 2 workers → io_uring
-    // when the probe succeeds.
     let auto_wide = scan_with(StatxEngine::Auto, 8, root);
     assert_eq!(auto_wide.statx_backend, Some(StatxBackend::Sync));
 

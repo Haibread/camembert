@@ -5681,7 +5681,14 @@ mod tests {
 
         press_code(KeyCode::Char('t'), &mut ui, &mut phase);
         ensure_flat_summary_fresh(&phase, &flat_config, &mut ui);
-        // Disk-desc default: "sub/big" is the cursor's row.
+        // Sort by apparent size, not the disk-desc default: `st_blocks`
+        // cannot order these two files everywhere. exfat rounds both to
+        // one 32 KiB cluster, and ZFS reports one block for each until
+        // its own accounting catches up — either way the rows tie and the
+        // cursor lands on whichever won the tiebreak, not on "sub/big"
+        // (found running this suite across eight filesystems, 2026-07-25).
+        // Apparent size is 8192 vs 4 on every filesystem there is.
+        press_code(KeyCode::Char('a'), &mut ui, &mut phase);
         press_code(KeyCode::Enter, &mut ui, &mut phase);
         assert_eq!(ui.mode(), ViewMode::Tree, "jumping leaves the mode");
 

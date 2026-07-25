@@ -66,12 +66,11 @@ const RECV_TIMEOUT: Duration = Duration::from_millis(33);
 /// — only speed can differ.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum StatxEngine {
-    /// Pick per scan (the default): io_uring for low-parallelism scans
-    /// (≤ 2 workers — the rotational-media policy — where the kernel's
-    /// io-wq punting adds useful parallelism, measured −12…−21 % warm),
-    /// sync otherwise (io_uring batching measured slower once the scan
-    /// workers already saturate the cores). Probes io_uring before using
-    /// it and falls back to sync on any denial.
+    /// Pick per scan (the default): always the sync path today. io_uring
+    /// won on this project's dev box at ≤ 2 workers (−12…−21 % warm) and
+    /// lost by 1.2–1.7× at every worker count on cloud block storage
+    /// (2026-07-25, see the selection comment in `Scanner::scan`), so auto
+    /// takes the engine that is never the slow one.
     #[default]
     Auto,
     /// Always use the sync path (`statx` syscalls, `fstatat` fallback).
@@ -340,49 +339,51 @@ impl Scanner {
         // denial (seccomp, gVisor, `io_uring_disabled`, kernel < 5.6)
         // falls back to the sync path — never a scan failure.
         //
-        // `Auto` only picks io_uring for low-parallelism scans. Measured
-        // on the 200k-entry warm-cache bench tree (2026-07): the kernel
-        // punts most statx SQEs to io-wq worker threads, which is extra
-        // parallelism when scan workers are scarce (threads=1: −21 %,
-        // threads=2 — the rotational-media policy: −12 %) but pure
-        // contention once the workers already saturate the cores
-        // (threads=16: +25 %, context switches ×18). The threshold is
-        // warm-cache-derived and provisional: cold-cache and real-HDD
-        // runs may move it — hence the forced `IoUring` escape hatch.
-        const URING_AUTO_MAX_THREADS: usize = 2;
+        // `Auto` always picks sync. It used to engage io_uring for
+        // low-parallelism scans (≤ 2 workers, i.e. the rotational tier),
+        // on a warm-cache measurement of the 200k-entry bench tree on this
+        // project's NVMe dev box (threads=1: −21 %, threads=2: −12 %,
+        // threads=16: +25 % with ×18 the context switches — the kernel
+        // punts statx SQEs to io-wq, which only helps while scan workers
+        // are scarce). A cross-filesystem run on a 2-vCPU cloud instance
+        // (2026-07-25, Scaleway DEV1-S, virtio-SCSI block storage, kernel
+        // 6.8, 100k-entry tree) measured the reverse at *every* worker
+        // count from 1 to 8, warm and cold, on ext4 / XFS / btrfs / f2fs:
+        // io_uring 1.2–1.7× slower than sync (ext4 warm 377 vs 247 ms,
+        // cold 1903 vs 1628 ms). With two measurements pointing opposite
+        // ways, auto takes the engine that is never the slow one; forcing
+        // `--statx-engine io_uring` remains the escape hatch for anyone
+        // whose hardware looks like the first measurement.
         let statx_backend = match self.options.statx_engine {
             StatxEngine::Sync => {
                 info!(statx = "sync", reason = "forced", "stat engine selected");
                 StatxBackend::Sync
             }
-            StatxEngine::Auto if threads > URING_AUTO_MAX_THREADS => {
+            StatxEngine::Auto => {
                 info!(
                     statx = "sync",
-                    reason = "auto: workers saturate cores, io_uring batching measured slower",
+                    reason = "auto: io_uring measured slower on cloud block storage at every \
+                              worker count; sync is the engine that never loses",
                     threads,
                     "stat engine selected"
                 );
                 StatxBackend::Sync
             }
-            preference @ (StatxEngine::Auto | StatxEngine::IoUring) => match uring::probe() {
+            StatxEngine::IoUring => match uring::probe() {
                 Ok(()) => {
-                    info!(statx = "io_uring", "stat engine selected");
+                    info!(
+                        statx = "io_uring",
+                        reason = "forced",
+                        "stat engine selected"
+                    );
                     StatxBackend::IoUring
                 }
                 Err(reason) => {
-                    if preference == StatxEngine::IoUring {
-                        warn!(
-                            statx = "sync",
-                            %reason,
-                            "io_uring requested but unavailable; falling back to sync statx"
-                        );
-                    } else {
-                        info!(
-                            statx = "sync",
-                            %reason,
-                            "stat engine selected (io_uring unavailable)"
-                        );
-                    }
+                    warn!(
+                        statx = "sync",
+                        %reason,
+                        "io_uring requested but unavailable; falling back to sync statx"
+                    );
                     StatxBackend::Sync
                 }
             },

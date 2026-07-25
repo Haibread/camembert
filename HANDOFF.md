@@ -71,10 +71,15 @@ pitch.
   completion cascade, first-seen hardlink registry + post-scan canonical
   re-attribution. **Media-adaptive auto threading** (sysfs rotational +
   mountinfo fallback for btrfs: SSD → min(cores, 16), HDD → 2, unknown
-  → min(2×cores, 8); measured 95 → 76 ms on the bench tree) and
-  **io_uring-batched statx** (per-worker rings, runtime probe, sync
-  fallback, auto-engaged at ≤ 2 workers where it wins 12-21 %;
-  `--statx-engine`/STATX_ENGINE experimental override).
+  → min(2×cores, 8); measured 95 → 76 ms on the bench tree) — since
+  2026-07-25 a `rotational=1` is only believed when the device's active
+  I/O scheduler is not `none`, because cloud block volumes (Scaleway SBS,
+  virtio-SCSI) claim to spin while being network flash; the contradiction
+  resolves to `unknown`. **io_uring-batched statx** (per-worker rings,
+  runtime probe, sync fallback) is still available via
+  `--statx-engine io_uring`, but `auto` no longer engages it: it wins
+  12-21 % at ≤ 2 workers on the dev box and loses 1.2-1.7× at every
+  worker count on cloud block storage.
 - **Tree** (`tree.rs`): 32-byte nodes, run-list children (D2), subtree
   aggregates, tombstoned removal with negative-delta propagation,
   excluded-reason side map, **error-reason side map** (`errno` of every
@@ -237,12 +242,30 @@ pitch.
 
 ## Known limitations (documented in code where they live)
 
-- io_uring statx ships behind an auto heuristic: engages at ≤ 2
-  resolved workers (the HDD tier), where it measures 12-21 % faster;
-  at high warm thread counts it loses to io-wq context-switch storms,
-  so auto stays sync there. Threshold is warm-cache-derived — retune
-  after cold-cache/real-HDD runs (`--statx-engine` forces either
-  engine). Worker fd usage can approach RLIMIT_NOFILE on
+- **Cross-filesystem validation (2026-07-25, Scaleway DEV1-S, kernel
+  6.8, ext4 / XFS / btrfs / btrfs+zstd / f2fs / exfat / tmpfs / ZFS on
+  one host).** Totals are byte-exact against an independent `lstat` walk
+  on all eight (both `apparent` and `real`); `du -sb` disagrees only
+  because it does not count directory inodes in apparent mode. Two
+  filesystem properties bite: **ZFS accounts `st_blocks` on
+  transaction-group commit**, so freshly written data reads as ~0 real
+  bytes for seconds (README "Honest numbers"; three tests now probe for
+  it and skip their absolute-size assertions), and **exfat has no
+  symlinks**, so running the suite with `TMPDIR` on exfat fails 17 tests
+  that build fake sysfs trees out of symlinks — not worth guarding, but
+  worth knowing. exfat is also the one filesystem where camembert loses
+  to `du` (cold, 100k entries: 78 s vs 58 s; parallel readers fight the
+  FAT chain) — accepted, it is a transfer format, not a scan target.
+
+- io_uring statx is opt-in only (`--statx-engine io_uring`): the auto
+  heuristic that engaged it at ≤ 2 workers was retired on 2026-07-25
+  after a cross-filesystem run on a 2-vCPU Scaleway instance measured it
+  1.2-1.7× *slower* than sync at every worker count from 1 to 8, warm and
+  cold, on ext4/XFS/btrfs/f2fs — the opposite of the dev box's 12-21 %
+  win at the same counts. Nobody has yet measured either engine on a
+  **real spinning disk**, which is the one medium the old heuristic
+  claimed to serve; that measurement would be the new element needed to
+  bring an auto rule back. Worker fd usage can approach RLIMIT_NOFILE on
   pathologically wide trees; a worker panic hangs the scan (owner panics
   are handled). The media-adaptive thread policy resolves anon-bdev
   filesystems (major 0 — btrfs, notably) via a `/proc/self/mountinfo`

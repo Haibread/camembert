@@ -15,6 +15,7 @@ camembert-core = { workspace = true }
 clap = { workspace = true }
 clap_mangen = "0.3"
 crossterm = { workspace = true }
+libc = "0.2"
 ratatui = { workspace = true }
 rustix = { version = "1.1.4", features = ["fs", "termios"] }
 serde = { workspace = true }

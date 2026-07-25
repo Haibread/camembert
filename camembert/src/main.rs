@@ -50,7 +50,27 @@ impl From<cli::ThemeNameArg> for ui::theme::ThemeName {
     }
 }
 
+/// Restore the default disposition of `SIGPIPE`, which the Rust runtime
+/// sets to `SIG_IGN` before `main` runs.
+///
+/// With `SIG_IGN`, a closed stdout turns every `println!` into a write
+/// error, and the macro's answer to a write error is a panic: `camembert
+/// /srv --no-ui | head -3` printed a stack trace and exited 101 where
+/// `du`, `find` and every other filter in the pipeline exit silently.
+/// Restoring `SIG_DFL` makes the process die from the signal instead —
+/// exit status 141, no trace, the shell's normal end for a pipeline whose
+/// reader went away.
+fn restore_default_sigpipe() {
+    // SAFETY: sets one signal to its default disposition, before any
+    // thread is spawned and before any handler is installed — nothing to
+    // race with, and `SIG_DFL` needs no async-signal-safe handler code.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 fn main() -> ExitCode {
+    restore_default_sigpipe();
     let cli = Cli::parse();
     match &cli.command {
         None => run_scan(&cli),
@@ -311,6 +331,34 @@ fn summary(args: &ScanArgs, scanner: &Scanner, flat_config: &flat::FlatConfig) -
     });
 
     let dump_to_stdout = args.output.as_deref() == Some(Path::new("-"));
+
+    // The dump goes out before any summary text: it is the deliverable,
+    // the summary is chatter. A `camembert … -o dump.cmbt | head` closes
+    // stdout mid-summary and kills the process (SIGPIPE, restored to its
+    // default disposition in `main`) — writing the dump first means that
+    // costs the user nothing but the text they already stopped reading.
+    if let Some(path) = &args.output {
+        let meta = DumpMeta {
+            timestamp: SystemTime::now(),
+        };
+        let written = if dump_to_stdout {
+            dump::write_dump(
+                &outcome,
+                std::io::BufWriter::new(std::io::stdout().lock()),
+                &meta,
+            )
+        } else {
+            dump::write_dump_to_path(&outcome, path, &meta)
+        };
+        match written {
+            Ok(()) => info!(path = %path.display(), "dump written"),
+            Err(err) => {
+                error!(%err, path = %path.display(), "dump write failed");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
     if dump_to_stdout {
         info!("dump streams to stdout: summary text suppressed");
     } else {
@@ -434,28 +482,6 @@ fn summary(args: &ScanArgs, scanner: &Scanner, flat_config: &flat::FlatConfig) -
                         flat_config.cap
                     );
                 }
-            }
-        }
-    }
-
-    if let Some(path) = &args.output {
-        let meta = DumpMeta {
-            timestamp: SystemTime::now(),
-        };
-        let written = if dump_to_stdout {
-            dump::write_dump(
-                &outcome,
-                std::io::BufWriter::new(std::io::stdout().lock()),
-                &meta,
-            )
-        } else {
-            dump::write_dump_to_path(&outcome, path, &meta)
-        };
-        match written {
-            Ok(()) => info!(path = %path.display(), "dump written"),
-            Err(err) => {
-                error!(%err, path = %path.display(), "dump write failed");
-                return ExitCode::FAILURE;
             }
         }
     }

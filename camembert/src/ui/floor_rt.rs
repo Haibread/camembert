@@ -409,6 +409,24 @@ mod tests {
         (scan_dir(tmp.path()), tmp)
     }
 
+    /// Guard: skip (returning `true`) when the fixture filesystem is the
+    /// one tier that produces no floor figure at all. The extent tiers
+    /// map through FIEMAP and the hardlink-exact tier takes `st_blocks`,
+    /// so both land a figure; ZFS has no per-file sharing API and lands
+    /// none — a test asserting on the figure has nothing to assert
+    /// against. Same runtime-probe style as `camembert-core/tests/fiemap.rs`
+    /// (found running this suite on a real ZFS pool, 2026-07-25).
+    fn skip_unless_floor_produces_figures(dir: &Path) -> bool {
+        if matches!(
+            camembert_core::fiemap::tier_of(dir),
+            camembert_core::fiemap::FsTier::Zfs
+        ) {
+            eprintln!("skipping: {} is on ZFS (no per-file figure)", dir.display());
+            return true;
+        }
+        false
+    }
+
     fn compute(outcome: &ScanOutcome) -> FloorMap {
         let cancel = AtomicBool::new(false);
         let progress = AtomicU64::new(0);
@@ -455,6 +473,9 @@ mod tests {
     #[test]
     fn spawn_full_lands_a_real_floor_map() {
         let (outcome, _tmp) = one_file_outcome();
+        if skip_unless_floor_produces_figures(_tmp.path()) {
+            return;
+        }
         let mut rt = FloorRuntime::new(true);
         rt.spawn_full(Arc::new(RwLock::new(outcome)));
         assert!(rt.has_pending());
@@ -690,6 +711,9 @@ mod tests {
     #[test]
     fn card_lines_fully_shared_wording_for_a_zero_floor_on_a_nonzero_row() {
         let (outcome, _tmp) = one_file_outcome();
+        if skip_unless_floor_produces_figures(_tmp.path()) {
+            return;
+        }
         let map = compute(&outcome); // produced_figure is true: the fixture file got mapped
         // A directory id absent from the map's aggregate reads as
         // `Some(0)` by `FloorMap::dir_floor`'s documented "a miss reads

@@ -28,6 +28,14 @@
 //! stat that device node for its real `major:minor`, and run the normal
 //! sysfs resolution on *that*.
 //!
+//! ## Devices that lie about `rotational`
+//!
+//! Cloud block storage reports `queue/rotational = 1` while being
+//! network-attached flash (measured on Scaleway SBS, virtio-SCSI). Taking
+//! that at face value drops the scan into the 2-worker rotational tier and
+//! costs up to 1.7× wall time there, so a `1` is only believed when the
+//! device's active I/O scheduler agrees — see [`rotational_is_credible`].
+//!
 //! This is still an approximation for **multi-device btrfs** (RAID0/1/10
 //! across several block devices): mountinfo's source is only ever *one*
 //! member device, so a btrfs volume spanning one SSD and one HDD is
@@ -62,10 +70,12 @@ pub(crate) enum Media {
     /// came from the `major == 0` mountinfo fallback rather than a direct
     /// `st_dev` lookup, e.g. `Some("btrfs via /dev/nvme0n1p2")`.
     Ssd { via: Option<String> },
-    /// `queue/rotational` reads `1` on the resolved device, or on ANY
-    /// slave of a device-mapper/RAID stack — conservative: one spinning
-    /// disk in the stack is enough to thrash on over-parallel reads.
-    /// `via` as in [`Media::Ssd`].
+    /// `queue/rotational` reads `1` on the resolved device — and the
+    /// device's active I/O scheduler does not contradict it (see
+    /// [`rotational_is_credible`]) — or the same holds for ANY slave of a
+    /// device-mapper/RAID stack: conservative, one spinning disk in the
+    /// stack is enough to thrash on over-parallel reads. `via` as in
+    /// [`Media::Ssd`].
     Hdd { device: String, via: Option<String> },
     /// Undetectable: anonymous `major:minor` (0) with no usable
     /// mountinfo fallback, a missing/unreadable sysfs node, or a
@@ -289,7 +299,8 @@ fn resolve_device(device_dir: &Path, depth: u32) -> Media {
     Media::Ssd { via: None }
 }
 
-/// Leaf case: read `queue/rotational` off a whole-device directory.
+/// Leaf case: read `queue/rotational` off a whole-device directory, and
+/// corroborate a `1` against the I/O scheduler (see [`rotational_is_credible`]).
 fn read_rotational(device_dir: &Path) -> Media {
     let name = device_dir
         .file_name()
@@ -298,9 +309,12 @@ fn read_rotational(device_dir: &Path) -> Media {
         .to_string();
     match fs::read_to_string(device_dir.join("queue").join("rotational")) {
         Ok(contents) => match contents.trim() {
-            "1" => Media::Hdd {
+            "1" if rotational_is_credible(device_dir) => Media::Hdd {
                 device: name,
                 via: None,
+            },
+            "1" => Media::Unknown {
+                reason: "rotational=1 contradicted by scheduler=none (virtualized device)",
             },
             "0" => Media::Ssd { via: None },
             _ => Media::Unknown {
@@ -311,6 +325,46 @@ fn read_rotational(device_dir: &Path) -> Media {
             reason: "queue/rotational missing",
         },
     }
+}
+
+/// Whether a `queue/rotational` of `1` should be believed, by cross-checking
+/// the device's active I/O scheduler.
+///
+/// Virtualized block devices lie: Scaleway's SBS volumes (network-attached
+/// flash, virtio-SCSI) report `rotational=1`, and so do several other cloud
+/// providers' disks. Believing them costs real time — the rotational tier
+/// caps the scan at 2 workers, measured 1.7× slower than 8 on such a volume
+/// (2026-07-25, ext4, 100k entries, cold: 1476 ms at 2 workers vs 874 ms at
+/// 8) — so `rotational` alone is not enough to drop into the seek-averse
+/// tier.
+///
+/// The corroborating signal is `queue/scheduler`: the kernel picks
+/// `mq-deadline` (or `bfq`) for devices it believes are rotational and
+/// leaves `none` for the ones it doesn't, so **`rotational=1` together with
+/// an active `none` scheduler is self-contradictory** — the kernel's own
+/// elevator choice disagrees with the flag. That combination resolves to
+/// [`Media::Unknown`] (the honest answer: `min(2× cores, 8)` workers)
+/// rather than to SSD, because "not a spinning disk" is all it establishes.
+///
+/// An unreadable or missing `queue/scheduler` leaves `rotational` believed:
+/// a real HDD must keep its tier when there is nothing to check it against.
+/// The deliberate false negative is an administrator who sets `none` on a
+/// genuine spinning disk — a choice the kernel does not make on its own.
+fn rotational_is_credible(device_dir: &Path) -> bool {
+    match fs::read_to_string(device_dir.join("queue").join("scheduler")) {
+        Ok(contents) => active_scheduler(&contents) != Some("none"),
+        Err(_) => true,
+    }
+}
+
+/// The active scheduler in a `queue/scheduler` line — the bracketed one,
+/// e.g. `"none"` out of `[none] mq-deadline kyber`. `None` when the file
+/// has no bracketed entry (a shape this code does not recognize, treated
+/// by the caller as "nothing to contradict `rotational`").
+fn active_scheduler(contents: &str) -> Option<&str> {
+    contents
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix('[')?.strip_suffix(']'))
 }
 
 // --- /proc/self/mountinfo parsing ------------------------------------
@@ -647,6 +701,95 @@ mod tests {
             resolve_via_dev_block(8, 0, tmp.path()),
             Media::Hdd {
                 device: "sda".into(),
+                via: None,
+            }
+        );
+    }
+
+    /// Write `queue/scheduler` into an existing device directory.
+    fn set_scheduler(device_dir: &Path, line: &str) {
+        fs::write(device_dir.join("queue/scheduler"), format!("{line}\n")).unwrap();
+    }
+
+    #[test]
+    fn rotational_with_a_none_scheduler_is_unknown_not_hdd() {
+        // What a Scaleway SBS volume (and other cloud block storage)
+        // looks like: rotational=1 on network-attached flash. The kernel
+        // never leaves `none` active on a device it believes is
+        // rotational, so the pair is self-contradictory and must not buy
+        // the 2-worker seek-averse tier.
+        let tmp = tempfile::tempdir().unwrap();
+        let device_dir = make_device(tmp.path(), "sdb", "1");
+        set_scheduler(&device_dir, "[none] mq-deadline");
+        link_dev_block(tmp.path(), 8, 16, &device_dir);
+
+        assert_eq!(
+            resolve_via_dev_block(8, 16, tmp.path()),
+            Media::Unknown {
+                reason: "rotational=1 contradicted by scheduler=none (virtualized device)"
+            }
+        );
+    }
+
+    #[test]
+    fn rotational_with_a_seek_aware_scheduler_stays_hdd() {
+        // A real spinning disk: the kernel picks mq-deadline (or bfq),
+        // which corroborates `rotational` — the HDD tier stands.
+        let tmp = tempfile::tempdir().unwrap();
+        for (name, minor, line) in [
+            ("sda", 0u32, "[mq-deadline] none"),
+            ("sdc", 32, "mq-deadline [bfq] none"),
+        ] {
+            let device_dir = make_device(tmp.path(), name, "1");
+            set_scheduler(&device_dir, line);
+            link_dev_block(tmp.path(), 8, minor, &device_dir);
+
+            assert_eq!(
+                resolve_via_dev_block(8, minor, tmp.path()),
+                Media::Hdd {
+                    device: name.into(),
+                    via: None,
+                },
+                "scheduler line: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_rotational_is_ssd_whatever_the_scheduler_says() {
+        // The corroboration only ever guards a `1`: `none` on an NVMe is
+        // the normal case, not a contradiction.
+        let tmp = tempfile::tempdir().unwrap();
+        let device_dir = make_device(tmp.path(), "nvme0n1", "0");
+        set_scheduler(&device_dir, "[none] mq-deadline");
+        link_dev_block(tmp.path(), 259, 0, &device_dir);
+
+        assert_eq!(
+            resolve_via_dev_block(259, 0, tmp.path()),
+            Media::Ssd { via: None }
+        );
+    }
+
+    #[test]
+    fn active_scheduler_reads_the_bracketed_entry() {
+        assert_eq!(active_scheduler("[none] mq-deadline\n"), Some("none"));
+        assert_eq!(active_scheduler("mq-deadline [bfq] none\n"), Some("bfq"));
+        assert_eq!(active_scheduler("none mq-deadline\n"), None);
+        assert_eq!(active_scheduler(""), None);
+    }
+
+    #[test]
+    fn unreadable_scheduler_leaves_rotational_believed() {
+        // Nothing to check `rotational` against — a real HDD keeps its
+        // tier rather than being promoted on a missing file.
+        let tmp = tempfile::tempdir().unwrap();
+        let device_dir = make_device(tmp.path(), "sdd", "1"); // no scheduler file
+        link_dev_block(tmp.path(), 8, 48, &device_dir);
+
+        assert_eq!(
+            resolve_via_dev_block(8, 48, tmp.path()),
+            Media::Hdd {
+                device: "sdd".into(),
                 via: None,
             }
         );

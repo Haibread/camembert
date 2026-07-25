@@ -80,7 +80,13 @@ pub(crate) struct ScanArgs {
     /// The auto policy probes the scan root's backing device once per
     /// scan and adapts: non-rotational storage (SSD/NVMe) uses
     /// `min(cores, 16)` threads; rotational storage (spinning disks,
-    /// where parallel readers thrash the seek head) is capped at 2. On
+    /// where parallel readers thrash the seek head) is capped at 2. A
+    /// `rotational` flag of 1 is only believed when the device's active
+    /// I/O scheduler agrees (anything but `none`): cloud block volumes
+    /// report themselves as rotational while being network-attached
+    /// flash, and taking that at face value costs up to 1.7x the scan
+    /// time. A device that claims to spin while the kernel left `none`
+    /// scheduling active is treated as undetermined instead. On
     /// filesystems that report an anonymous device number (btrfs,
     /// notably — no direct sysfs node), it instead resolves the covering
     /// mount's real backing device from `/proc/self/mountinfo` and
@@ -123,15 +129,16 @@ pub(crate) struct ScanArgs {
     /// Per-entry metadata (statx) is fetched either with plain syscalls
     /// (`sync`) or batched through per-worker io_uring rings (`io_uring`,
     /// kernel 5.6+; unavailable under default-seccomp Docker, gVisor, and
-    /// the io_uring_disabled sysctl). `auto` uses io_uring only for
-    /// low-parallelism scans (2 workers or fewer, the rotational-media
-    /// policy) where its batching measurably helps, and plain syscalls
-    /// otherwise; it probes io_uring once at scan start and falls back to
-    /// sync when it is denied. A forced `io_uring` also falls back rather
-    /// than fail the scan. Scan results are identical whichever engine
-    /// runs — only speed can differ. The choice is logged at info level
-    /// (`statx=io_uring` / `statx=sync`). Experimental: this knob and the
-    /// auto heuristic may change once cold-cache data is in.
+    /// the io_uring_disabled sysctl). `auto` resolves to `sync`: io_uring
+    /// batching measured 12-21% faster at 2 workers or fewer on this
+    /// project's NVMe development machine, and 1.2-1.7x *slower* at every
+    /// worker count (1 to 8, warm and cold, on ext4/XFS/btrfs/f2fs) on
+    /// cloud block storage, so the default takes the engine that is never
+    /// the slow one. Forcing `io_uring` still works and falls back to
+    /// sync rather than fail the scan when the probe is denied. Scan
+    /// results are identical whichever engine runs — only speed can
+    /// differ. The choice is logged at info level (`statx=io_uring` /
+    /// `statx=sync`). Experimental: this knob may change or disappear.
     #[arg(long, env = "STATX_ENGINE", value_enum, default_value_t = StatxEngineArg::Auto)]
     pub(crate) statx_engine: StatxEngineArg,
 

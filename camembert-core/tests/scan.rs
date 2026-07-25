@@ -91,8 +91,12 @@ fn scan_a_known_tree() {
     // Apparent totals exact, verified against an independent walk.
     assert_eq!(outcome.totals.apparent, expected_apparent);
     assert_eq!(outcome.entries, expected_inodes);
-    // 11 nodes: root, a, f1, f2, sub, b, big, link, hard1, hard2, locked.
-    assert_eq!(outcome.tree().node_count(), 11);
+    // 11 nodes: root, a, f1, f2, sub, b, big, link, hard1, hard2, locked
+    // — plus `locked/hidden` when the suite runs as root, since chmod 000
+    // does not stop root from descending (a containerized CI runs as root
+    // by default; this assertion used to fail there).
+    let expected_nodes = if runs_as_root { 12 } else { 11 };
+    assert_eq!(outcome.tree().node_count(), expected_nodes);
     // 5 directories carry metadata: root, a, sub, b, locked.
     assert_eq!(outcome.dirs, 5);
 

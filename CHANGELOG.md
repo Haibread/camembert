@@ -9,6 +9,36 @@ one is called out under **Breaking** with the migration to apply.
 
 ## [Unreleased]
 
+### Changed
+
+- **Cloud block storage no longer costs 40 % of the scan.** Scaleway SBS
+  volumes (and virtualized block devices generally) report
+  `queue/rotational = 1` while being network-attached flash; camembert
+  believed them, dropped to the 2-worker rotational tier, and engaged
+  io_uring on top. A `rotational` flag of `1` is now cross-checked against
+  the device's active I/O scheduler and disbelieved when the kernel left
+  `none` scheduling active — a combination the kernel never produces for a
+  real spinning disk. Measured on a 2-vCPU cloud instance, 100k entries:
+  ext4 warm 340 → 210 ms, cold 1840 → 1017 ms; XFS warm 379 → 178 ms, cold
+  2122 → 968 ms. A real HDD, and any device whose `queue/scheduler` cannot
+  be read, keeps the rotational tier.
+- **`--statx-engine auto` now resolves to `sync` at every worker count.**
+  io_uring batching measured 12-21 % faster at ≤ 2 workers on the
+  development machine and 1.2-1.7× *slower* at every worker count from 1
+  to 8 (warm and cold, ext4/XFS/btrfs/f2fs) on cloud block storage. With
+  the evidence pointing both ways, the default takes the engine that is
+  never the slow one; `--statx-engine io_uring` still forces the other.
+
+### Fixed
+
+- **`camembert … --no-ui | head` no longer panics.** The Rust runtime
+  leaves `SIGPIPE` ignored, which turned a closed stdout into a write
+  error and a panic (stack trace, exit 101) where every other tool in a
+  pipeline exits quietly; the default disposition is now restored at
+  startup. The dump is also written *before* any summary text, so a
+  truncated pipeline costs the reader nothing but the text they stopped
+  reading.
+
 ### Added
 
 - **Man pages** — `camembert-mangen <OUT_DIR>` renders `camembert.1` (plus

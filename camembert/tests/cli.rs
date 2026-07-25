@@ -4,6 +4,7 @@
 
 use std::fs;
 use std::io::Write as _;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, SystemTime};
@@ -43,11 +44,41 @@ fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-/// Write `len` bytes so the file's on-disk size is deterministic enough
-/// for classification (exact block counts are filesystem-dependent, so
-/// assertions compare classifications and signs, not raw byte counts).
+/// Write `len` bytes and fsync them, so the file's on-disk size is
+/// deterministic enough for classification (exact block counts stay
+/// filesystem-dependent, so assertions compare classifications and signs,
+/// not raw byte counts).
 fn write_file(path: &Path, len: usize) {
-    fs::write(path, vec![0x61u8; len]).expect("write file");
+    let mut file = fs::File::create(path).expect("create file");
+    file.write_all(&vec![0x61u8; len]).expect("write file");
+    file.sync_all().expect("fsync file");
+}
+
+/// Guard: skip (returning `true`) when the temp filesystem does not
+/// account `st_blocks` by the time a written, fsynced file is stat-ed.
+///
+/// ZFS accounts allocation when the transaction group commits, not when
+/// the write lands: a 512 KiB fsynced file reports 512 allocated bytes
+/// immediately and 532 KiB about six seconds later (OpenZFS 2.2, kernel
+/// 6.8, 2026-07-25). Every real-size ranking here would then rank noise.
+/// This is a property of the filesystem under `TMPDIR`, not of camembert
+/// — which reports what `stat` reports, exactly as `du` does, and never
+/// syncs a filesystem it is measuring (the caveat is in the README's
+/// "Honest numbers").
+fn skip_unless_blocks_are_accounted(dir: &Path) -> bool {
+    let probe = dir.join(".block-accounting-probe");
+    write_file(&probe, 512 * 1024);
+    let blocks = fs::metadata(&probe).map(|m| m.blocks() * 512).unwrap_or(0);
+    let _ = fs::remove_file(&probe);
+    if blocks < 256 * 1024 {
+        eprintln!(
+            "skipping: {} reports {blocks} allocated bytes for a synced 512 KiB file \
+             (deferred block accounting, e.g. ZFS)",
+            dir.display()
+        );
+        return true;
+    }
+    false
 }
 
 fn set_mtime(path: &Path, secs_ago: u64) {
@@ -98,6 +129,9 @@ fn diff_fixture(root: &Path) -> (PathBuf, PathBuf) {
 #[test]
 fn diff_classifies_and_orders_a_real_mutation() {
     let dir = tempfile::tempdir().expect("tempdir");
+    if skip_unless_blocks_are_accounted(dir.path()) {
+        return;
+    }
     let (old, new) = diff_fixture(dir.path());
 
     let output = run(&["diff", old.to_str().unwrap(), new.to_str().unwrap()]);
@@ -216,6 +250,9 @@ fn diff_json_schema_and_summary_deltas() {
 #[test]
 fn diff_threshold_drives_the_exit_code() {
     let dir = tempfile::tempdir().expect("tempdir");
+    if skip_unless_blocks_are_accounted(dir.path()) {
+        return;
+    }
     let (old, new) = diff_fixture(dir.path());
     let (old, new) = (old.to_str().unwrap(), new.to_str().unwrap());
 

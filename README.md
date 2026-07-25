@@ -187,7 +187,7 @@ schema.
 | --- | --- | --- |
 | `--threads` | `THREADS` | scan worker threads (`0` = auto, media-adaptive: see below) |
 | `--one-filesystem` | `ONE_FILESYSTEM` | stay on the scan root's filesystem, stopping at mount points, instead of the default of crossing them (kernel pseudo-filesystems are always excluded either way; also avoids multiply-counting btrfs snapshot subvolumes) |
-| `--statx-engine` | `STATX_ENGINE` | **experimental** — stat engine: `auto` (io_uring for ≤ 2-worker scans, probed, sync otherwise), `sync`, `io_uring` (see below) |
+| `--statx-engine` | `STATX_ENGINE` | **experimental** — stat engine: `auto` (resolves to `sync`), `sync`, `io_uring` (probed, sync fallback — see below) |
 | `--top` | `TOP` | entries in the summary's "top directories" **and** "top files" (D5) lists — one flag, two lists; the interactive `t` mode's own cap is the separate `flat_cap` config key |
 | `--no-ui` | `NO_UI` | summary mode: scan to completion, print totals, top directories, top files, no TUI |
 | `-o`/`--output` | `OUTPUT` | write a `.cmbt` dump once the scan completes (`-` = stdout); **never** filtered |
@@ -209,6 +209,19 @@ backing device, probed once per scan:
 - **undetectable** (network filesystems, unreadable sysfs, no matching
   mount, a `tmpfs`/`overlay` source): `min(2x cores, 8)`, the historical
   safe default.
+
+A `rotational` flag of `1` is cross-checked against the device's active
+I/O scheduler before it buys the 2-worker tier. **Cloud block storage
+lies**: Scaleway's SBS volumes (network-attached flash over virtio-SCSI)
+report `rotational=1`, and believing them measured 1.7× slower than the
+undetectable tier on the same volume (ext4, 100k entries, cold: 1476 ms
+at 2 workers vs 874 ms at 8). The kernel leaves `none` scheduling active
+only on devices it does *not* treat as seek-sensitive, so `rotational=1`
+together with `scheduler=none` is self-contradictory and resolves to
+**undetectable** — not to SSD, since all it establishes is "not a
+spinning disk". A missing `queue/scheduler` leaves `rotational`
+believed; the deliberate false negative is an administrator who sets
+`none` on a real spinning disk.
 
 Filesystems that report an anonymous device number with no direct sysfs
 node — btrfs, notably — aren't automatically "undetectable": camembert
@@ -237,17 +250,19 @@ once per scan and logged at `info` level (`statx=io_uring` /
 - **sync**: one `statx` syscall per entry (with an `fstatat` fallback on
   kernels without `statx`). Always available, supported forever.
 
-`--statx-engine auto` (the default) therefore uses io_uring only for
-low-parallelism scans (2 workers or fewer — notably the rotational-media
-thread policy) and plain syscalls otherwise; the heuristic is
-warm-cache-derived and may be retuned as cold-cache data comes in. Auto
-probes io_uring once at scan start and falls back to `sync` wherever it
-is denied — default-seccomp Docker, gVisor, the
-`kernel.io_uring_disabled` sysctl, kernels older than 5.6. A scan never
-fails because io_uring is unavailable, and results are identical
-whichever engine runs; only speed can differ. Forcing `io_uring` on a
-machine that denies it also falls back (with a warning) rather than
-fail. **This knob is experimental**: it exists for tests, benchmarks,
+`--statx-engine auto` (the default) resolves to `sync`. The io_uring win
+above is not portable: a cross-filesystem run on a 2-vCPU cloud instance
+(virtio-SCSI block storage, kernel 6.8, 100k entries) measured io_uring
+**1.2–1.7× slower** at *every* worker count from 1 to 8, warm and cold,
+on ext4, XFS, btrfs and f2fs — the opposite of the development machine's
+result at the same worker counts. With two measurements pointing
+opposite ways, the default takes the engine that is never the slow one,
+and `--statx-engine io_uring` stays available for hardware that looks
+like the first measurement. Forcing it falls back to `sync` (with a
+warning) rather than fail wherever io_uring is denied — default-seccomp
+Docker, gVisor, the `kernel.io_uring_disabled` sysctl, kernels older
+than 5.6. A scan never fails because io_uring is unavailable, and
+results are identical whichever engine runs; only speed can differ. **This knob is experimental**: it exists for tests, benchmarks,
 and diagnostics, and may change or disappear once the automatic choice
 has proven itself.
 
@@ -884,6 +899,14 @@ truncated dump is refused with exit code 2.
 - Hardlinked inodes count **once**, attributed to their canonical
   (smallest-path) link — deterministic across scans, so diffs never
   show phantom growth.
+- **On ZFS, freshly written data reads as ~0 real bytes for a few
+  seconds.** ZFS accounts `st_blocks` when the transaction group commits,
+  not when the write lands — measured on OpenZFS 2.2 / kernel 6.8, a
+  512 KiB file reported 512 allocated bytes right after `fsync` and
+  532 KiB six seconds later. camembert reports what `stat` reports (`du`
+  behaves identically) and never syncs a filesystem it is measuring, so a
+  scan launched immediately after a large write understates on ZFS until
+  the pool settles. Apparent sizes are correct throughout.
 - Unreadable directories never abort a scan and never vanish: the
   summary lists exactly where reads failed, the errno reason is preserved
   end to end (see [Error reporting](#error-reporting)); in the TUI, sort
