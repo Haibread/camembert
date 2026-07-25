@@ -7,8 +7,8 @@
 //! that is the sole writer of a plain, non-concurrent arena
 //! ([`crate::tree::Tree`]). No async runtime; per-entry metadata is
 //! fetched either with plain `statx` syscalls or batched through a
-//! per-worker io_uring ring ([`uring`]), probed once at scan start and
-//! falling back to the sync path wherever io_uring is unavailable
+//! per-worker io_uring ring (`scan/linux/uring.rs`), probed once at scan
+//! start and falling back to the sync path wherever io_uring is unavailable
 //! (seccomp'd containers, gVisor, old kernels, `io_uring_disabled`).
 //! Both engines resolve every stat before a section is sent, preserving
 //! the completion invariant documented in [`message`] and `owner.rs`.
@@ -23,20 +23,26 @@
 //! integrations and on receive timeouts), per D5.
 
 mod hardlink;
-mod media;
+#[cfg(target_os = "linux")]
+mod linux;
 pub(crate) mod message;
 pub(crate) mod owner;
-mod uring;
-mod worker;
+
+#[cfg(target_os = "linux")]
+use linux as backend;
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+compile_error!(
+    "camembert-core's scan engine has no backend for this target; implement one \
+     following the contract in `camembert-core/src/scan/linux.rs`"
+);
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crossbeam_deque::{Injector, Worker as WorkerQueue};
-use rustix::fs::{Mode, OFlags};
 use tracing::{debug, info, warn};
 
 use crate::flat::{Accumulator, FlatConfig, FlatSummary};
@@ -44,10 +50,9 @@ use crate::size::Size;
 use crate::tree::{DirId, DirMeta, Node, NodeId, Tree};
 use crate::view::{ViewBus, ViewPublisher};
 
+pub use backend::path_on_compressed_mount;
 pub use hardlink::{HardlinkGroup, HardlinkLink};
-pub use media::path_on_compressed_mount;
-use owner::{Owner, ROOT_TOKEN};
-use worker::{Job, JobFd, WorkerShared};
+use owner::Owner;
 
 /// Bound of the worker → owner channel (sections). Backpressure: workers
 /// stall rather than letting integration lag grow unbounded.
@@ -94,9 +99,10 @@ pub enum StatxBackend {
 #[derive(Debug, Clone, Default)]
 pub struct ScanOptions {
     /// Worker threads. `0` = media-adaptive auto policy, decided per scan
-    /// from the root's backing device (see [`ScanOptions::effective_threads`]):
-    /// non-rotational storage gets `min(cores, 16)`, rotational storage
-    /// (seek thrashing under parallel readers) gets `2`, and an
+    /// from the root's backing device (see the scan backend's
+    /// `effective_threads`, e.g. `scan::linux::effective_threads` on
+    /// Linux): non-rotational storage gets `min(cores, 16)`, rotational
+    /// storage (seek thrashing under parallel readers) gets `2`, and an
     /// undetectable medium keeps the historical `min(2× cores, 8)`.
     pub threads: usize,
     /// Descend into other filesystems instead of recording the mount
@@ -104,31 +110,6 @@ pub struct ScanOptions {
     pub cross_filesystems: bool,
     /// Stat engine selection (experimental, see [`StatxEngine`]).
     pub statx_engine: StatxEngine,
-}
-
-impl ScanOptions {
-    /// Resolve `threads` into a worker count for a scan of `root_path`
-    /// (whose `st_dev` is `root_dev`), plus a human-readable description
-    /// of the decision for logging (`"explicit"`, `"ssd"`, `"hdd (sda
-    /// rotational)"`, `"unknown (anon bdev (major 0), …)"`, `"ssd (btrfs
-    /// via /dev/nvme0n1p2)"`, …).
-    ///
-    /// An explicit (non-zero) `threads` always wins, unchanged, and skips
-    /// media detection entirely. `0` runs the auto policy: [`media::resolve_media`]
-    /// probes the root's backing device (real sysfs in production, with a
-    /// `/proc/self/mountinfo` fallback for anonymous `major == 0` devices
-    /// such as btrfs — see the [`media`] module docs) and
-    /// [`media::thread_count`] — a pure function, unit-tested on its own —
-    /// turns that plus the core count into a worker count.
-    fn effective_threads(&self, root_dev: u64, root_path: &Path) -> (usize, String) {
-        if self.threads > 0 {
-            return (self.threads, "explicit".to_string());
-        }
-        let cores = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
-        let media = media::resolve_media(root_dev, root_path, Path::new(media::DEFAULT_SYSFS_ROOT));
-        let threads = media::thread_count(cores, &media);
-        (threads, media.describe())
-    }
 }
 
 /// Cheap shared progress counters, updated by the owner per integrated
@@ -299,34 +280,13 @@ impl Scanner {
         let start = Instant::now();
         self.progress.reset();
 
-        // Open + stat the root. O_DIRECTORY (a non-dir root is an error),
-        // no O_NOFOLLOW: a symlink *as the root argument* is followed;
-        // symlinks below the root never are.
-        let root_fd = rustix::fs::open(
-            path,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|errno| {
-            if errno == rustix::io::Errno::NOTDIR {
-                ScanError::NotADirectory {
-                    path: path.to_path_buf(),
-                }
-            } else {
-                ScanError::OpenRoot {
-                    path: path.to_path_buf(),
-                    source: errno.into(),
-                }
-            }
-        })?;
-        let root_stat = rustix::fs::fstat(&root_fd).map_err(|errno| ScanError::StatRoot {
-            path: path.to_path_buf(),
-            source: errno.into(),
-        })?;
-        let root_dev = root_stat.st_dev;
-        let root_size = Size::new(root_stat.st_size as u64, root_stat.st_blocks as u64);
+        // Open + stat the root (backend-specific: `O_DIRECTORY`/`fstat` on
+        // Linux). A symlink *as the root argument* is followed; symlinks
+        // below the root never are.
+        let (root_fd, root_stat) = backend::open_root(path)?;
+        let root_dev = root_stat.dev;
 
-        let (threads, media) = self.options.effective_threads(root_dev, path);
+        let (threads, media) = backend::effective_threads(self.options.threads, root_dev, path);
         info!(
             path = %path.display(),
             threads,
@@ -369,7 +329,7 @@ impl Scanner {
                 );
                 StatxBackend::Sync
             }
-            StatxEngine::IoUring => match uring::probe() {
+            StatxEngine::IoUring => match backend::probe_uring() {
                 Ok(()) => {
                     info!(
                         statx = "io_uring",
@@ -390,22 +350,13 @@ impl Scanner {
         };
 
         let (tx, rx) = crossbeam_channel::bounded::<message::Batch>(CHANNEL_CAP);
-        let queues: Vec<WorkerQueue<Job>> = (0..threads).map(|_| WorkerQueue::new_fifo()).collect();
-        let shared = WorkerShared {
-            injector: Injector::new(),
-            stealers: queues.iter().map(WorkerQueue::stealer).collect(),
-            pending_jobs: AtomicUsize::new(1),
-            next_token: AtomicU64::new(ROOT_TOKEN + 1),
-            statx_supported: AtomicBool::new(true),
-            use_uring: statx_backend == StatxBackend::IoUring,
-            cross_filesystems: self.options.cross_filesystems,
-            abort: AtomicBool::new(false),
-        };
-        shared.injector.push(Job {
-            fd: JobFd::Opened(root_fd),
-            token: ROOT_TOKEN,
-            dev: root_dev,
-        });
+        let (shared, queues) = backend::start(
+            threads,
+            root_fd,
+            root_dev,
+            statx_backend == StatxBackend::IoUring,
+            self.options.cross_filesystems,
+        );
 
         // The root node's interned name is deliberately the FULL scan path
         // (not its final component): the dump header's `root` field is
@@ -417,8 +368,8 @@ impl Scanner {
         // filter engine (`crate::query`, query-attack-a finding 11).
         let mut owner = Owner::new(
             path.as_os_str().as_encoded_bytes(),
-            root_size,
-            root_stat.st_mtime,
+            root_stat.size,
+            root_stat.mtime,
             root_dev,
             Arc::clone(&self.progress),
         );
@@ -443,7 +394,7 @@ impl Scanner {
                 let tx = tx.clone();
                 std::thread::Builder::new()
                     .name(format!("camembert-scan-{id}"))
-                    .spawn_scoped(scope, move || worker::run(id, queue, shared, &tx))
+                    .spawn_scoped(scope, move || backend::run(id, queue, shared, &tx))
                     .expect("spawn scan worker");
             }
             drop(tx);

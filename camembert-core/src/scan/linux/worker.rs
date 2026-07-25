@@ -32,8 +32,8 @@ use tracing::{debug, trace, warn};
 use crate::size::Size;
 use crate::tree::{ExcludedReason, Kind};
 
-use super::message::{Batch, BatchEntry, SECTION_CAP, SectionSums};
 use super::uring::{STAT_BURST, StatxBatcher};
+use crate::scan::message::{Batch, BatchEntry, SECTION_CAP, SectionSums};
 
 /// getdents64 buffer size per job. Comfortably above the largest single
 /// dirent (~280 bytes); 32 KiB amortizes syscalls on big directories.
