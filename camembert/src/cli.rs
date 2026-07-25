@@ -440,12 +440,16 @@ Themes (--theme, env THEME):
   relative luminance is > 0.5; a terminal that never answers, is not a
   tty, or reports TERM=dumb is treated as dark (today's default,
   unchanged). This never blocks longer than the timeout and never
-  consumes more than that narrow window of stdin.
+  consumes more than that narrow window of stdin. The query relies on
+  Unix raw terminal mode and is not implemented on Windows, where this
+  step is always skipped (same as a silent terminal) -- set --theme or
+  THEME explicitly on a light background there.
 
 Config file (camembert.toml):
   Path: $XDG_CONFIG_HOME/camembert/camembert.toml, or
-  ~/.config/camembert/camembert.toml when XDG_CONFIG_HOME is unset.
-  A missing file is silently fine. All keys are optional:
+  ~/.config/camembert/camembert.toml when XDG_CONFIG_HOME is unset; on
+  Windows, %APPDATA%\\camembert\\camembert.toml (no XDG dir to fall back
+  through there). A missing file is silently fine. All keys are optional:
 
     theme = \"tokyo-night\" | \"light\" | \"high-contrast\"
     color = \"auto\" | \"always\" | \"never\"
@@ -587,6 +591,7 @@ Filtering (Ctrl-K/`/`, docs/design/query-decisions.md):
   are interpreted specially -- every other key, q included, is text.
   Up/Down recall query history (persisted to
   $XDG_STATE_HOME/camembert/history, or ~/.local/state/camembert/history,
+  or on Windows %LOCALAPPDATA%\\camembert\\history (no XDG dir there),
   one query per line, bounded to 200, written atomically); on an empty
   query box they instead browse camembert.toml's read-only [queries]
   table. See --filter below for the same grammar on the command line.

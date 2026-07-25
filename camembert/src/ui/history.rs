@@ -39,6 +39,14 @@ pub const MAX_ENTRIES: usize = 200;
 /// `~/.local/state/camembert/history` when `XDG_STATE_HOME` is unset or
 /// empty. `None` when neither it nor `HOME` is available (same shape as
 /// `config::config_path`) — treated exactly like a missing file.
+///
+/// Windows has no XDG state dir — `%LOCALAPPDATA%\camembert\history`
+/// replaces the fallback chain above the same way `config::config_path`
+/// replaces its `XDG_CONFIG_HOME`/`HOME` chain with `%APPDATA%`;
+/// `%LOCALAPPDATA%` (not `%APPDATA%`) because history is
+/// machine-local, non-roaming data, matching state's own non-syncing
+/// intent under XDG.
+#[cfg(unix)]
 pub fn history_path() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_STATE_HOME")
         && !xdg.is_empty()
@@ -47,6 +55,12 @@ pub fn history_path() -> Option<PathBuf> {
     }
     let home = std::env::var_os("HOME")?;
     Some(PathBuf::from(home).join(".local/state/camembert/history"))
+}
+
+#[cfg(not(unix))]
+pub fn history_path() -> Option<PathBuf> {
+    let local_appdata = std::env::var_os("LOCALAPPDATA")?;
+    Some(PathBuf::from(local_appdata).join("camembert/history"))
 }
 
 /// Load the history file: one entry per (non-empty, trimmed) line, oldest

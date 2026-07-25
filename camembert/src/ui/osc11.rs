@@ -30,17 +30,23 @@
 //! is a thin, deliberately untested wrapper around them — there is no
 //! tty in a test process to query.
 
-use std::io::{Read, Write};
+use std::io::Read;
+#[cfg(unix)]
+use std::io::Write;
+#[cfg(unix)]
 use std::os::fd::AsFd;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 use rustix::termios::{self, LocalModes, OptionalActions, SpecialCodeIndex};
+#[cfg(unix)]
 use tracing::debug;
 
 /// How long to wait for a reply before assuming the terminal will not
 /// answer. Long enough for a real terminal's round-trip (local ptys
 /// answer in well under 10ms; even an ssh hop rarely exceeds this),
 /// short enough that a silent terminal never makes startup feel stuck.
+#[cfg(unix)]
 const TIMEOUT: Duration = Duration::from_millis(150);
 
 /// Hard cap on the reply buffer: the longest valid reply
@@ -53,8 +59,19 @@ const MAX_REPLY_LEN: usize = 64;
 /// either end) would never answer and a read against it can behave
 /// unpredictably, and `TERM=dumb`/unset terminals are not expected to
 /// implement any OSC sequence.
+#[cfg(unix)]
 pub fn should_query(term: Option<&str>, stdin_is_tty: bool, stdout_is_tty: bool) -> bool {
     stdin_is_tty && stdout_is_tty && !matches!(term, None | Some("dumb"))
+}
+
+/// No termios equivalent is implemented on Windows (see the module
+/// docs) — this always says no, so [`super::resolve_theme_name`] takes
+/// the same "terminal never answered" path it already has for a silent
+/// Unix terminal (assume dark) instead of this module inventing a
+/// Console-API query it cannot back up.
+#[cfg(not(unix))]
+pub fn should_query(_term: Option<&str>, _stdin_is_tty: bool, _stdout_is_tty: bool) -> bool {
+    false
 }
 
 /// Relative luminance (ITU-R BT.709 coefficients on linearized sRGB
@@ -127,10 +144,19 @@ pub fn extract_body(raw: &[u8]) -> Option<&str> {
 /// each individual `read` return within ~100ms regardless of whether a
 /// byte arrived, so [`read_until_terminator`] can honor the overall
 /// [`TIMEOUT`] just by checking a deadline between attempts.
+#[cfg(unix)]
 pub fn query_terminal_background() -> Option<(u8, u8, u8)> {
     let raw = read_reply_bounded(TIMEOUT)?;
     let body = extract_body(&raw)?;
     parse_reply(body)
+}
+
+/// [`should_query`] always returns `false` on this platform, so
+/// `resolve_theme_name` never actually calls this — but the stub keeps
+/// the signature identical for any caller built on any platform.
+#[cfg(not(unix))]
+pub fn query_terminal_background() -> Option<(u8, u8, u8)> {
+    None
 }
 
 /// RAII guard that restores stdin's original termios settings on drop —
@@ -146,11 +172,13 @@ pub fn query_terminal_background() -> Option<(u8, u8, u8)> {
 /// Stdin's descriptor is open for the whole process lifetime and this
 /// guard never outlives the function that created it, so re-borrowing
 /// it as needed in [`Drop::drop`] is sound.
+#[cfg(unix)]
 struct TermiosGuard {
     fd: std::os::fd::RawFd,
     original: termios::Termios,
 }
 
+#[cfg(unix)]
 impl Drop for TermiosGuard {
     fn drop(&mut self) {
         // Safety: `fd` is stdin's descriptor (fd 0), which stays open
@@ -163,6 +191,7 @@ impl Drop for TermiosGuard {
     }
 }
 
+#[cfg(unix)]
 fn read_reply_bounded(timeout: Duration) -> Option<Vec<u8>> {
     use std::os::fd::AsRawFd;
 

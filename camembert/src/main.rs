@@ -60,6 +60,7 @@ impl From<cli::ThemeNameArg> for ui::theme::ThemeName {
 /// Restoring `SIG_DFL` makes the process die from the signal instead —
 /// exit status 141, no trace, the shell's normal end for a pipeline whose
 /// reader went away.
+#[cfg(unix)]
 fn restore_default_sigpipe() {
     // SAFETY: sets one signal to its default disposition, before any
     // thread is spawned and before any handler is installed — nothing to
@@ -68,6 +69,12 @@ fn restore_default_sigpipe() {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 }
+
+/// Windows has no `SIGPIPE` to restore — a closed pipe reader surfaces as
+/// a normal `ErrorKind::BrokenPipe` write error there instead of a signal,
+/// so there is nothing for this platform to do.
+#[cfg(not(unix))]
+fn restore_default_sigpipe() {}
 
 fn main() -> ExitCode {
     restore_default_sigpipe();

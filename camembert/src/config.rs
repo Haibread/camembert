@@ -73,6 +73,13 @@ pub struct FileConfig {
 /// or empty (the XDG base-directory spec's own fallback rule). `None`
 /// when neither variable is available — treated exactly like a missing
 /// file.
+///
+/// Windows has no XDG spec to honor at all — `%APPDATA%\camembert\
+/// camembert.toml` is the platform's own per-user config convention
+/// (`%APPDATA%` is what Windows itself sets for "roaming application
+/// data"), so that replaces the whole `XDG_CONFIG_HOME`/`HOME` fallback
+/// chain above rather than bolting onto it.
+#[cfg(unix)]
 fn config_path() -> Option<PathBuf> {
     if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME")
         && !xdg.is_empty()
@@ -81,6 +88,12 @@ fn config_path() -> Option<PathBuf> {
     }
     let home = std::env::var_os("HOME")?;
     Some(PathBuf::from(home).join(".config/camembert/camembert.toml"))
+}
+
+#[cfg(not(unix))]
+fn config_path() -> Option<PathBuf> {
+    let appdata = std::env::var_os("APPDATA")?;
+    Some(PathBuf::from(appdata).join("camembert/camembert.toml"))
 }
 
 /// Load the config file from its standard location. Never fails: a

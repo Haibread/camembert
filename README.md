@@ -469,11 +469,13 @@ delete everything underneath, matched or not. File marks are unaffected.
 
 Every committed query is recalled with `Up`/`Down` inside the palette,
 persisted to `$XDG_STATE_HOME/camembert/history` (falling back to
-`~/.local/state/camembert/history`), one query per line, newest last,
-bounded to 200 entries, written atomically (temp file + rename) — the
-first thing this otherwise read-only-config tool ever writes to disk on
-its own. A read/write failure there is logged and otherwise ignored; it
-never interrupts browsing.
+`~/.local/state/camembert/history`; on Windows,
+`%LOCALAPPDATA%\camembert\history` — there is no XDG state dir to fall
+back through there), one query per line, newest last, bounded to 200
+entries, written atomically (temp file + rename) — the first thing this
+otherwise read-only-config tool ever writes to disk on its own. A
+read/write failure there is logged and otherwise ignored; it never
+interrupts browsing.
 
 `camembert.toml`'s `[queries]` table holds read-only saved queries, shown
 in the palette (with their labels) whenever the query box is empty:
@@ -711,9 +713,10 @@ error that maps to a node is.
 
 Beyond flags and environment variables, camembert reads an optional TOML
 config file at `$XDG_CONFIG_HOME/camembert/camembert.toml` (falling back
-to `~/.config/camembert/camembert.toml` when `XDG_CONFIG_HOME` is unset).
-A missing file is perfectly fine — nothing here is required. All keys are
-optional:
+to `~/.config/camembert/camembert.toml` when `XDG_CONFIG_HOME` is unset;
+on Windows, `%APPDATA%\camembert\camembert.toml` — there is no XDG config
+dir to fall back through there). A missing file is perfectly fine —
+nothing here is required. All keys are optional:
 
 ```toml
 theme = "tokyo-night"  # "tokyo-night" | "light" | "high-contrast"
@@ -775,6 +778,11 @@ picked a theme, is skipped outright on a non-terminal or `TERM=dumb`,
 and treats "no answer in time" as dark — the same look as before this
 feature existed. It can never block longer than the timeout and never
 consumes more than that narrow slice of stdin.
+
+The query relies on Unix raw terminal mode and is not implemented on
+Windows — the step is always skipped there, same as a silent terminal:
+set `--theme light`/`THEME=light` (or `camembert.toml`'s `theme` key)
+explicitly on a light background.
 
 ## The dump format
 
