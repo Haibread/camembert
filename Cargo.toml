@@ -6,7 +6,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 # Floor set by the dependency graph (ratatui 0.30 and darling 0.23 both
 # require 1.88), not by a policy. The `msrv` CI job builds against exactly
