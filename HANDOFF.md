@@ -347,6 +347,84 @@ pitch.
   tracking); relative times in the selection card can go stale while
   the loop idles between events.
 
+## Windows port — in progress, started 2026-07-25
+
+Not on the next-steps list below; started on the user's explicit ask.
+Aiming at **tier T1 only**: it compiles, traverses, and shows logical
+sizes. Three slices are merged on `main`, all Linux-invisible (592 tests
+green, warm 200k-file bench 70.8 → 68.3 ms across the seam commit —
+noise, as a pure rename should be).
+
+Merged: `358e05b` (binary's Unix couplings: SIGPIPE, OSC 11 termios,
+`%APPDATA%`/`%LOCALAPPDATA%`), `b47d898` (platform seam under
+`scan/linux/`, six once-per-scan hooks documented in `scan/linux.rs`),
+`c2a9ccf` (`cfg`-gated modules and deps in core).
+
+Remaining, in order — each step compiles and tests green on Linux alone:
+
+1. **`errno::ScanErrno` newtype. Do this before any Windows code.** This
+   is the actual blocker, not traversal. Fifteen of the 25 errnos in
+   `errno.rs`'s TABLE are `#[cfg(not(windows))]` in rustix, and the ten
+   survivors carry *Winsock* values — `Errno::ACCESS` is 10013 there, so
+   the dump spec's documented decimal fallback (§6.4) would silently
+   mis-classify a Linux dump read on Windows. Fix: a crate-local
+   `ScanErrno(i32)` pinned to Linux numbering, `#[cfg(unix)] From<rustix::
+   io::Errno>`, TABLE as integer literals. Same 4 bytes, same wire
+   strings, **no dump-schema change**. Touches `errno.rs`, `tree.rs`,
+   `view.rs`, `scan/message.rs`, `dump.rs`, `dump/read.rs`,
+   `scan/owner.rs:530`, `ui.rs:2663`.
+2. Windows error mapping goes through `io::ErrorKind`, never
+   `raw_os_error()`: Win32 `ERROR_ACCESS_DENIED` is 5, same as `EIO`, so
+   a raw map would report a dying disk for a permission denial. Unmapped
+   kinds emit **no `er` field** — already legal per spec §6.4.
+3. `crate::tree::{os_name_bytes, os_name_from_bytes}` helper for the
+   `OsStr`↔bytes bridge (`tree.rs:475`, `ncdu.rs:109`). Lossy UTF-8 on
+   Windows is fine for display and dump, and is a wrong-file-deleted bug
+   for anything that round-trips to the filesystem — `delete` is
+   `cfg(unix)`, keep it that way until someone writes a WTF-8 encoder.
+4. `scan/windows/worker.rs` on `std::fs` only. Free win: Rust's `std`
+   serves `DirEntry::metadata()` from the `NtQueryDirectoryFile` listing
+   with no syscall, so there is no Windows analogue of the sync/io_uring
+   split and `StatxBackend` needs no new variant.
+5. Test suite (`#![cfg(unix)]` on the Unix-shaped files, portable subset
+   runs on both), `windows-latest` CI job, README + `--help`.
+
+Two decisions the user has **not** ruled on yet — both schema-clean, both
+product calls rather than compile problems:
+
+- **`Size::real` has no honest Windows value in `std`.** Proposal:
+  `real = apparent` and declare `sem:"apparent"` (an already-specified
+  value, spec §6.1, refusal path already exists in `read.rs:51`). The
+  compile problem is trivial; the honesty problem is that `real` is the
+  default sort key in `view.rs`/`flat.rs`/`query.rs`/`top_dirs_by_disk`
+  and every UI label saying "disk" becomes wrong. Needs a UI answer.
+- **NTFS hardlinks are real and T1 double-counts them silently.**
+  `nlink` needs `GetFileInformationByHandle`; with `nlink = 1`,
+  `hardlink_inodes == 0` makes the D3 status-bar note stay hidden, so the
+  UI actively signals "no hardlink problem here". Wants an explicit
+  capability flag (`ScanOutcome::hardlink_dedup()`), not a sentinel.
+
+Both are avoidable by taking a `windows-sys` dependency at T1 instead —
+that is the trade to decide, not to discover in review.
+
+Also worth stating in the README when this lands: Windows T1 is a
+**path-based** walker, not a port of the fd-relative one. It reintroduces
+`MAX_PATH` (mitigable by canonicalizing the root so std applies `\\?\`,
+not by construction) and loses the `O_NOFOLLOW` TOCTOU closure — skipping
+reparse points, which is the plan, contains that. And there is no
+cross-check partner on Windows: `tests/statx_engine.rs` and the
+`MetadataExt` oracle in `tests/scan.rs` have no equivalent, and
+`scripts/bench-compare.sh` is bash + Linux tools, so CLAUDE.md's
+benchmark mandate is unenforceable there.
+
+Feasibility note, since it was asked: a Windows VM is *not* the right
+place to do this work. Scaleway locks Windows to five `POP2-*-WIN` SKUs
+in `fr-par-1`/`fr-par-2`, RDP-only, ~€0.19/h for 2C/8G and ~€0.38/h for
+4C/16G all-in — twenty times the DEV1-S validation lab, for a box that
+compiles no faster than `cargo check`. `windows-latest` CI is the
+authoritative check; a VM only earns its keep for eyeballing
+`GetFileInformationByHandleEx` and reparse-point behaviour at T2.
+
 ## Suggested next steps, in value order
 
 1. **Freeable phase 2 slice 3** — composition: floor figures on
