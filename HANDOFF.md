@@ -400,14 +400,35 @@ a genuine allocated size, so `sem` stays `"blocks"` and hardlink dedup
 stays on. That removes the whole `SizeSemantics` / declared-capability
 workstream the `std`-only route would have needed.
 
-What we bought it with, recorded so nobody rediscovers it in review:
-a HANDLE per entry, which forfeits the metadata `NtQueryDirectoryFile`
-already hands back for free in the listing; and a 128-bit `FileIdInfo`
-truncated to 64 bits to fit the arena's and the dump's `ino: u64`. The
-truncation is safe on NTFS and **not guaranteed on ReFS** — that has to
-be documented, not silently assumed. Reopening `dump-format-decisions.md`
-for a wider `ino` is the price of correct ReFS, and it is not being paid
-at T1.
+**Corrected 2026-07-26, same day**, after the Win32 design pass. Two
+things written above were wrong when written:
+
+- *"a HANDLE per entry"* — not the plan. `GetFileInformationByHandleEx`
+  with `FileIdExtdDirectoryInfo` returns name, `EndOfFile`,
+  **`AllocationSize`**, attributes, reparse tag and the 128-bit file ID
+  for the whole directory in one buffered call, no per-entry syscall.
+  Only `NumberOfLinks` is missing, and
+  `NtQueryInformationByName(FileStatInformation)` fetches it "without
+  opening the actual file" (its own Remarks). So the per-directory shape
+  is 1 open + ⌈n/1000⌉ listing calls + n lightweight stats — the same
+  order as Linux's `openat` + `getdents64` + `statx`, not the 20-200×
+  penalty a `CreateFileW` per entry would cost.
+- *"truncated to 64 bits … not guaranteed on ReFS"* — understated to the
+  point of being wrong. MS-FSCC Appendix B fn.11: on ReFS the file ID's
+  **low** 64 bits identify the file's *parent directory*, the high half
+  identifies the file within it. Truncation would give every sibling in a
+  directory the same inode and dedup the whole directory away. So: fold,
+  don't truncate, and only when the high half is non-zero (NTFS documents
+  it as zero, so the common path stays exact and equals the number
+  `fsutil file queryfileid` prints). Surface the fold through
+  `ScanOutcome` so the UI can say identity was folded rather than imply
+  NTFS-grade precision. `dump-format-decisions.md` is not reopened.
+
+Also refuse the two sentinels: an all-`0xFF` ID means "no unique ID
+available" and an all-zero one means the filesystem issues no IDs
+(FAT/exFAT/UDF). Both mean *unknown* — force `nlink` to 1. Reading them
+as inodes would turn every file on a scanned USB stick into one hardlink
+group.
 
 Also worth stating in the README when this lands: Windows T1 is a
 **path-based** walker, not a port of the fd-relative one. It reintroduces
