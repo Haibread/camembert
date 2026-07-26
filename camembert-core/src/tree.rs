@@ -35,8 +35,8 @@ mod interner;
 pub use interner::{NameInterner, NameRef};
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use rustix::io::Errno;
 
+use crate::errno::ScanErrno;
 use crate::size::Size;
 
 /// Bits of `Node::name_kind` used for the name reference.
@@ -327,7 +327,7 @@ pub struct Tree {
     /// matters (`EIO` must never be buried), so the reason is preserved end
     /// to end rather than collapsed into the single error bit. Feeds the
     /// dump's `er` field, the selection card, and the per-errno breakdown.
-    error_reasons: FxHashMap<NodeId, Errno>,
+    error_reasons: FxHashMap<NodeId, ScanErrno>,
     /// Removed nodes ([`Tree::apply_removal`]). A side set rather than a
     /// node flag: [`NodeFlags`] is full (3 bits), deletions are rare, and
     /// a per-row set lookup at iteration time is cheap. Tombstoned rows
@@ -396,11 +396,11 @@ impl Tree {
     /// unreadable directory or a failed stat). `None` for a node without the
     /// error flag, and for error nodes imported from a source that did not
     /// carry the reason (e.g. an ncdu export, which records only a boolean).
-    pub fn error_reason(&self, id: NodeId) -> Option<Errno> {
+    pub fn error_reason(&self, id: NodeId) -> Option<ScanErrno> {
         self.error_reasons.get(&id).copied()
     }
 
-    pub(crate) fn set_error_reason(&mut self, id: NodeId, errno: Errno) {
+    pub(crate) fn set_error_reason(&mut self, id: NodeId, errno: ScanErrno) {
         self.error_reasons.insert(id, errno);
     }
 
@@ -409,8 +409,8 @@ impl Tree {
     /// per-errno breakdown ([`crate::errno::breakdown`]). Tombstoned nodes
     /// are already dropped from the table by [`Tree::apply_removal`], so the
     /// counts stay consistent with the live `te` aggregates after a delete.
-    pub fn error_reason_counts(&self) -> FxHashMap<Errno, u64> {
-        let mut counts: FxHashMap<Errno, u64> = FxHashMap::default();
+    pub fn error_reason_counts(&self) -> FxHashMap<ScanErrno, u64> {
+        let mut counts: FxHashMap<ScanErrno, u64> = FxHashMap::default();
         for &errno in self.error_reasons.values() {
             *counts.entry(errno).or_insert(0) += 1;
         }
@@ -1161,8 +1161,8 @@ mod tests {
     fn error_reasons_are_stored_and_queryable() {
         let (mut tree, root, f1, _sub, _sub_node, _leaf) = removal_tree();
         assert_eq!(tree.error_reason(f1), None, "no reason before it is set");
-        tree.set_error_reason(f1, Errno::ACCESS);
-        assert_eq!(tree.error_reason(f1), Some(Errno::ACCESS));
+        tree.set_error_reason(f1, ScanErrno::ACCESS);
+        assert_eq!(tree.error_reason(f1), Some(ScanErrno::ACCESS));
         // Untouched nodes stay absent.
         assert_eq!(tree.error_reason(tree.dir(root).node), None);
     }
@@ -1170,25 +1170,25 @@ mod tests {
     #[test]
     fn error_reason_counts_histogram() {
         let (mut tree, root, f1, _sub, sub_node, leaf) = removal_tree();
-        tree.set_error_reason(f1, Errno::ACCESS);
-        tree.set_error_reason(leaf, Errno::ACCESS);
-        tree.set_error_reason(sub_node, Errno::IO);
+        tree.set_error_reason(f1, ScanErrno::ACCESS);
+        tree.set_error_reason(leaf, ScanErrno::ACCESS);
+        tree.set_error_reason(sub_node, ScanErrno::IO);
         let _ = root;
         let counts = tree.error_reason_counts();
-        assert_eq!(counts.get(&Errno::ACCESS), Some(&2));
-        assert_eq!(counts.get(&Errno::IO), Some(&1));
+        assert_eq!(counts.get(&ScanErrno::ACCESS), Some(&2));
+        assert_eq!(counts.get(&ScanErrno::IO), Some(&1));
         assert_eq!(counts.values().sum::<u64>(), 3);
     }
 
     #[test]
     fn removal_drops_error_reasons() {
         let (mut tree, _root, f1, _sub, sub_node, leaf) = removal_tree();
-        tree.set_error_reason(f1, Errno::ACCESS);
-        tree.set_error_reason(leaf, Errno::IO);
+        tree.set_error_reason(f1, ScanErrno::ACCESS);
+        tree.set_error_reason(leaf, ScanErrno::IO);
         // Removing the file drops just its reason.
         tree.apply_removal(f1).expect("file removal");
         assert_eq!(tree.error_reason(f1), None);
-        assert_eq!(tree.error_reason(leaf), Some(Errno::IO));
+        assert_eq!(tree.error_reason(leaf), Some(ScanErrno::IO));
         // Removing the subtree drops the descendant's reason too, keeping
         // the histogram consistent with the subtracted `te`.
         tree.apply_removal(sub_node).expect("dir removal");

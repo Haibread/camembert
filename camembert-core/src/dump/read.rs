@@ -29,11 +29,10 @@ use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::Path;
 
-use rustix::io::Errno;
 use serde_json::Value;
 
 use super::decode_name;
-use crate::errno;
+use crate::errno::{self, ScanErrno};
 
 /// Errors that abort reading a dump. Truncation is *not* an error (see
 /// module docs); malformed JSON on a line is, because it means the input
@@ -110,7 +109,7 @@ pub struct DirBlock {
     /// The `errno` behind `err`, when the dump preserved it (`er` field);
     /// `None` for an error without a recorded reason or an unrecognized
     /// value. Repopulates the tree's error side-table on load.
-    pub error_reason: Option<Errno>,
+    pub error_reason: Option<ScanErrno>,
     /// Excluded reason (`"otherfs"`, `"kernfs"`, …) for never-scanned
     /// mount-point stubs; unknown values preserved opaquely.
     pub ex: Option<String>,
@@ -144,7 +143,7 @@ pub struct Entry {
     /// The `errno` behind `err`, when the dump preserved it (`er` field);
     /// `None` for an error without a recorded reason or an unrecognized
     /// value.
-    pub error_reason: Option<Errno>,
+    pub error_reason: Option<ScanErrno>,
     /// Excluded reason, unknown values preserved opaquely.
     pub ex: Option<String>,
 }

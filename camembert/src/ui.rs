@@ -2660,7 +2660,7 @@ fn draw_metric_cards(
 fn draw_error_breakdown(
     frame: &mut Frame<'_>,
     area: Rect,
-    rows: &[(rustix::io::Errno, u64, Severity)],
+    rows: &[(errno::ScanErrno, u64, Severity)],
     ctx: &RenderCtx,
 ) {
     let theme = &ctx.theme;

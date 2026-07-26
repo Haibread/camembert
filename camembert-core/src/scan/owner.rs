@@ -527,7 +527,7 @@ mod tests {
             sums: SectionSums::default(),
             is_last_section: true,
             child_dirs: 0,
-            dir_error: Some(rustix::io::Errno::ACCESS),
+            dir_error: Some(crate::errno::ScanErrno::ACCESS),
         });
         assert!(owner.root_complete());
         let root_meta = owner.tree().dir(owner.root());

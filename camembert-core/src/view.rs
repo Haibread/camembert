@@ -27,9 +27,8 @@ use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 
+use crate::errno::ScanErrno;
 use crate::flat::{Accumulator, FlatSummary};
-use rustix::io::Errno;
-
 use crate::tree::{DirId, DirState, NodeFlags, NodeId, Tree};
 
 /// Normal snapshot publication cadence (D5: ≈30 fps).
@@ -85,7 +84,7 @@ pub struct Row {
     /// unreadable directory ([`RowState::Error`]) or a failed-stat entry.
     /// `None` for healthy rows and for errors imported without a reason.
     /// Drives the selection card's severity note.
-    pub error_reason: Option<Errno>,
+    pub error_reason: Option<ScanErrno>,
     /// mtime in unix seconds (the entry's own).
     pub mtime: i64,
 }

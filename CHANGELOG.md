@@ -9,6 +9,26 @@ one is called out under **Breaking** with the migration to apply.
 
 ## [Unreleased]
 
+### Breaking
+
+- **`camembert-core` no longer exposes `rustix::io::Errno` in its error
+  taxonomy**, replaced by `camembert_core::errno::ScanErrno` — a newtype
+  over the canonical POSIX errno number in Linux/x86-64 numbering.
+  `Tree::error_reason`, `Tree::error_reason_counts`, `Row::error_reason`,
+  `errno::{name, from_name, label, severity, breakdown}` and the dump
+  reader's `error_reason` fields all change type. Migration: swap
+  `Errno::ACCESS` for `ScanErrno::ACCESS` (the taxonomy's names are
+  mirrored as associated constants), and convert a host errno at the
+  boundary with `ScanErrno::from(errno)` on Unix. Dumps are unaffected —
+  the `er` field's bytes are unchanged, in both directions.
+
+### Changed
+
+- The `directory unreadable` debug log renders its errno as the canonical
+  name (`EACCES`) instead of the host's prose description (`Permission
+  denied (os error 13)`). Asking the host to describe a canonical number
+  would reintroduce the very numbering assumption the newtype removes.
+
 ## [0.3.0] - 2026-07-25
 
 ### Changed

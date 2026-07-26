@@ -12,8 +12,8 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+use camembert_core::errno::ScanErrno;
 use camembert_core::scan::{ScanOptions, ScanOutcome, Scanner, StatxBackend, StatxEngine};
-use rustix::io::Errno;
 
 fn child_by_name(outcome: &ScanOutcome, name: &[u8]) -> camembert_core::tree::NodeId {
     outcome
@@ -60,7 +60,7 @@ fn unreadable_dir_preserves_eacces_end_to_end() {
         let locked = child_by_name(&outcome, b"locked");
         assert_eq!(
             outcome.tree().error_reason(locked),
-            Some(Errno::ACCESS),
+            Some(ScanErrno::ACCESS),
             "engine {engine:?}: the openat EACCES must reach the tree side-table",
         );
     }
@@ -253,5 +253,5 @@ fn unreadable_dir_with_non_utf8_name() {
     fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
 
     let node = child_by_name(&outcome, b"lock\xffed");
-    assert_eq!(outcome.tree().error_reason(node), Some(Errno::ACCESS));
+    assert_eq!(outcome.tree().error_reason(node), Some(ScanErrno::ACCESS));
 }

@@ -5,8 +5,7 @@
 //! and send it over the single bounded channel. Giants produce multiple
 //! sections (D2); each integrated section becomes one child run.
 
-use rustix::io::Errno;
-
+use crate::errno::ScanErrno;
 use crate::tree::{ExcludedReason, Kind};
 
 /// Section flush threshold (entries). One run per flushed section.
@@ -50,7 +49,7 @@ pub(crate) struct BatchEntry {
     /// record *why* (severity matters — `EIO` ≠ `EACCES`). `Some` implies
     /// sizes are zero and only `kind` (from `d_type`, may be [`Kind::Other`])
     /// is known.
-    pub error: Option<Errno>,
+    pub error: Option<ScanErrno>,
     /// For child directories that will be scanned: the token the worker
     /// assigned to the child's own future batches.
     pub child_token: Option<u64>,
@@ -83,5 +82,5 @@ pub(crate) struct Batch {
     pub child_dirs: u32,
     /// The directory itself could not be opened/read. Terminal:
     /// `is_last_section` is true and `entries` is empty.
-    pub dir_error: Option<Errno>,
+    pub dir_error: Option<ScanErrno>,
 }

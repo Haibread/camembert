@@ -470,7 +470,7 @@ fn handle_entry(
                                 "mount point unreadable"
                             );
                             section.sums.errors += 1;
-                            entry.error = Some(errno);
+                            entry.error = Some(errno.into());
                         }
                         MountKind::Unreadable(_) => {
                             // We were not going to descend anyway.
@@ -510,7 +510,9 @@ fn handle_entry(
                 nlink: 0,
                 ino: 0,
                 dev: 0,
-                error: Some(errno),
+                // Host errno → canonical only on the error arm; the success
+                // path never touches it.
+                error: Some(errno.into()),
                 child_token: None,
                 excluded: None,
             }
@@ -529,7 +531,7 @@ fn error_batch(token: u64, errno: Errno) -> Batch {
         sums: SectionSums::default(),
         is_last_section: true,
         child_dirs: 0,
-        dir_error: Some(errno),
+        dir_error: Some(errno.into()),
     }
 }
 
@@ -633,7 +635,8 @@ mod tests {
 
     use rustix::fd::OwnedFd;
     use rustix::fs::{Mode, OFlags};
-    use rustix::io::Errno;
+
+    use crate::errno::ScanErrno;
 
     use super::*;
 
@@ -676,7 +679,7 @@ mod tests {
     fn error_batch_is_terminal_and_carries_errno() {
         let batch = error_batch(42, Errno::ACCESS);
         assert_eq!(batch.dir_token, 42);
-        assert_eq!(batch.dir_error, Some(Errno::ACCESS));
+        assert_eq!(batch.dir_error, Some(ScanErrno::ACCESS));
         assert!(batch.is_last_section);
         assert!(batch.entries.is_empty());
         assert_eq!(batch.child_dirs, 0);
