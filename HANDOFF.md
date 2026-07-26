@@ -382,30 +382,32 @@ Remaining, in order — each step compiles and tests green on Linux alone:
    Windows is fine for display and dump, and is a wrong-file-deleted bug
    for anything that round-trips to the filesystem — `delete` is
    `cfg(unix)`, keep it that way until someone writes a WTF-8 encoder.
-4. `scan/windows/worker.rs` on `std::fs` only. Free win: Rust's `std`
-   serves `DirEntry::metadata()` from the `NtQueryDirectoryFile` listing
-   with no syscall, so there is no Windows analogue of the sync/io_uring
-   split and `StatxBackend` needs no new variant.
+4. `scan/windows/worker.rs`, enumerating with `std::fs::read_dir` but
+   taking a `FILE_READ_ATTRIBUTES` handle per entry for the size and
+   link-count facts `std` cannot give (see the decision below). Only one
+   engine either way: there is no Windows analogue of the sync/io_uring
+   split, so `StatxBackend` needs no new variant.
 5. Test suite (`#![cfg(unix)]` on the Unix-shaped files, portable subset
    runs on both), `windows-latest` CI job, README + `--help`.
 
-Two decisions the user has **not** ruled on yet — both schema-clean, both
-product calls rather than compile problems:
+**Decided 2026-07-26: `windows-sys` is a T1 dependency, not a T2
+follow-up.** The alternative was a `std`-only walker, which had two holes
+that turned out to share one key — `Size::real` has no honest value in
+`std` on Windows, and NTFS hardlinks are real so a `std`-only walk
+double-counts them. `GetFileInformationByHandle` closes both (it returns
+`nNumberOfLinks` and the file index), and `GetCompressedFileSizeW` gives
+a genuine allocated size, so `sem` stays `"blocks"` and hardlink dedup
+stays on. That removes the whole `SizeSemantics` / declared-capability
+workstream the `std`-only route would have needed.
 
-- **`Size::real` has no honest Windows value in `std`.** Proposal:
-  `real = apparent` and declare `sem:"apparent"` (an already-specified
-  value, spec §6.1, refusal path already exists in `read.rs:51`). The
-  compile problem is trivial; the honesty problem is that `real` is the
-  default sort key in `view.rs`/`flat.rs`/`query.rs`/`top_dirs_by_disk`
-  and every UI label saying "disk" becomes wrong. Needs a UI answer.
-- **NTFS hardlinks are real and T1 double-counts them silently.**
-  `nlink` needs `GetFileInformationByHandle`; with `nlink = 1`,
-  `hardlink_inodes == 0` makes the D3 status-bar note stay hidden, so the
-  UI actively signals "no hardlink problem here". Wants an explicit
-  capability flag (`ScanOutcome::hardlink_dedup()`), not a sentinel.
-
-Both are avoidable by taking a `windows-sys` dependency at T1 instead —
-that is the trade to decide, not to discover in review.
+What we bought it with, recorded so nobody rediscovers it in review:
+a HANDLE per entry, which forfeits the metadata `NtQueryDirectoryFile`
+already hands back for free in the listing; and a 128-bit `FileIdInfo`
+truncated to 64 bits to fit the arena's and the dump's `ino: u64`. The
+truncation is safe on NTFS and **not guaranteed on ReFS** — that has to
+be documented, not silently assumed. Reopening `dump-format-decisions.md`
+for a wider `ino` is the price of correct ReFS, and it is not being paid
+at T1.
 
 Also worth stating in the README when this lands: Windows T1 is a
 **path-based** walker, not a port of the fd-relative one. It reintroduces
