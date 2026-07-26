@@ -106,8 +106,7 @@ pub fn import<R: Read>(input: R) -> Result<ScanOutcome, ImportError> {
         ..
     } = importer;
 
-    use std::os::unix::ffi::OsStrExt;
-    let root_path = PathBuf::from(std::ffi::OsStr::from_bytes(&root_name));
+    let root_path = PathBuf::from(crate::tree::os_name_from_bytes(&root_name).into_owned());
     let mut outcome = ScanOutcome::from_tree(
         tree,
         root,

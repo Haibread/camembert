@@ -39,6 +39,41 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use crate::errno::ScanErrno;
 use crate::size::Size;
 
+/// Decode one interned name back into an [`OsStr`](std::ffi::OsStr).
+///
+/// Names are interned as the bytes of the platform's own `OsStr` encoding
+/// (`OsStr::as_encoded_bytes`), so on Unix this is exact and free: every
+/// byte sequence is a valid name.
+///
+/// Windows is where it gets a caveat. Its `OsStr` encoding is WTF-8, and
+/// std offers no *safe* way back — only `from_encoded_bytes_unchecked`,
+/// whose contract we cannot honour: these bytes may have come from a dump
+/// written on another platform, where arbitrary non-UTF-8 sequences are
+/// legal names. Feeding those to the unchecked constructor would be UB for
+/// a display string. So Windows takes valid UTF-8 exactly and everything
+/// else lossily.
+///
+/// That is sound for display and for dumps, and it is *not* sound for
+/// anything that round-trips to the filesystem — a lossily decoded name
+/// handed to a delete path is a wrong-file-deleted bug. [`crate::delete`]
+/// is `cfg(unix)`, where this function is exact, and it must stay that way
+/// until someone writes a real WTF-8 decoder.
+#[cfg(unix)]
+pub(crate) fn os_name_from_bytes(bytes: &[u8]) -> std::borrow::Cow<'_, std::ffi::OsStr> {
+    use std::os::unix::ffi::OsStrExt;
+    std::borrow::Cow::Borrowed(std::ffi::OsStr::from_bytes(bytes))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn os_name_from_bytes(bytes: &[u8]) -> std::borrow::Cow<'_, std::ffi::OsStr> {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => std::borrow::Cow::Borrowed(std::ffi::OsStr::new(s)),
+        Err(_) => std::borrow::Cow::Owned(std::ffi::OsString::from(
+            String::from_utf8_lossy(bytes).into_owned(),
+        )),
+    }
+}
+
 /// Bits of `Node::name_kind` used for the name reference.
 const NAME_BITS: u32 = 26;
 const NAME_MASK: u32 = (1 << NAME_BITS) - 1;
@@ -472,7 +507,6 @@ impl Tree {
     /// of where the entry was at scan time — deletion re-verifies it on
     /// disk before acting (see [`crate::delete`]).
     pub fn path_of_node(&self, node: NodeId) -> std::path::PathBuf {
-        use std::os::unix::ffi::OsStrExt;
         let mut components: Vec<&[u8]> = Vec::new();
         let mut cur = node;
         loop {
@@ -485,7 +519,7 @@ impl Tree {
         }
         let mut path = std::path::PathBuf::new();
         for component in components.into_iter().rev() {
-            path.push(std::ffi::OsStr::from_bytes(component));
+            path.push(os_name_from_bytes(component));
         }
         path
     }
