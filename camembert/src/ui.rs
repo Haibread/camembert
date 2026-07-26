@@ -34,15 +34,29 @@
 //! keyboard/mouse maps are documented in [`keymap`], the single table the
 //! `?` cheatsheet renders from.
 
+// The reclaim subsystem — deletion, the freeable panel, the selection
+// oracle's confidence verdict, the exclusive-floor line — is `cfg(unix)`
+// throughout this crate, in one piece rather than feature by feature. Its
+// four core dependencies (`delete`, `freeable`, `fiemap`, `confidence`) are
+// themselves gated in `camembert-core/src/lib.rs`, and everything the UI
+// builds on top of them is only meaningful when all four are present: the
+// confirm modal quotes the oracle, the oracle needs FIEMAP, the floor line
+// needs FIEMAP, and the pre-deletion advisory needs the `/proc` sweep. See
+// `docs/design/windows-backend-design.md` §10.9. On Windows the whole
+// cluster is absent — no marks, no `Space`/`u`/`v`/`D`/`f` bindings, and no
+// cheatsheet entries for them (`keymap::EXTRA_RECLAIM`).
 mod anim;
 pub mod caps;
 mod filterview;
 mod flatview;
+#[cfg(unix)]
 mod floor_rt;
 mod fmt;
+#[cfg(unix)]
 mod freeable_panel;
 mod history;
 mod keymap;
+#[cfg(unix)]
 mod oracle;
 mod osc11;
 mod palette;
@@ -71,25 +85,35 @@ use ratatui::widgets::{
 use ratatui::{DefaultTerminal, Frame};
 use tracing::{debug, error, info, warn};
 
+#[cfg(unix)]
 use camembert_core::confidence::{Confidence, Verdict};
+#[cfg(unix)]
 use camembert_core::delete;
 use camembert_core::dump::{self, DumpMeta};
 use camembert_core::errno::{self, Severity};
+#[cfg(unix)]
 use camembert_core::fiemap::shared_bit_reliable;
 use camembert_core::flat::{self, FlatConfig};
+#[cfg(unix)]
 use camembert_core::freeable::{self, Ledger};
 use camembert_core::query::{self, ApplyOptions, FilterResult, HardlinkIndex, Query};
 use camembert_core::scan::{LiveScan, ScanOutcome, Scanner, path_on_compressed_mount};
 use camembert_core::size::HumanSize;
-use camembert_core::tree::{DirId, NodeFlags, NodeId, Tree};
+// Only the reclaim subsystem names nodes in production code; the test
+// module builds synthetic snapshots out of them on every platform.
+#[cfg(any(unix, test))]
+use camembert_core::tree::NodeId;
+use camembert_core::tree::{DirId, NodeFlags, Tree};
 use camembert_core::view::{self, RowState};
 
 use caps::{Caps, GlyphLevel};
 use fmt::DiskSpace;
 use palette::{CommandAction, PaletteMode};
+#[cfg(unix)]
+use state::{ConfirmState, MarkRefusal, ReviewState};
 use state::{
-    ConfirmState, FrameGeometry, MarkRefusal, ReviewState, SortKey, TableGeometry, UiState,
-    ViewMode, WheelGeometry, show_hardlink_note, show_updating_note,
+    FrameGeometry, SortKey, TableGeometry, UiState, ViewMode, WheelGeometry, show_hardlink_note,
+    show_updating_note,
 };
 use theme::{Theme, ThemeName};
 use toast::ToastQueue;
@@ -157,11 +181,13 @@ const BAR_WIDTH: usize = 12;
 const MIN_WHEEL_TERMINAL_WIDTH: u16 = 100;
 
 /// Footer hint while mark/delete keys are inactive during the scan.
+#[cfg(unix)]
 const DELETION_LOCKED: &str = "deletion available once the scan completes";
 
 /// Flash for a directory-mark attempt under an active filter (D4): the row
 /// shows only matching descendants, so marking it would delete everything
 /// inside it, matched or not — the exact trap query-attack-a names.
+#[cfg(unix)]
 const DIR_MARK_FILTER_LOCKED: &str =
     "directory marks are disabled while a filter is active — clear the filter first";
 
@@ -261,6 +287,7 @@ fn read_outcome(lock: &RwLock<ScanOutcome>) -> std::sync::RwLockReadGuard<'_, Sc
 }
 
 /// Acquire the write side (deletion only — see [`Phase::Done`]'s doc).
+#[cfg(unix)]
 fn write_outcome(lock: &RwLock<ScanOutcome>) -> std::sync::RwLockWriteGuard<'_, ScanOutcome> {
     lock.write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -415,6 +442,7 @@ fn disable_mouse_capture() {
 
 /// statvfs on the scan root, for the disk gauge. A failure is logged and
 /// degrades the gauge to "unavailable" — never fatal.
+#[cfg(unix)]
 fn disk_space(path: &Path) -> Option<DiskSpace> {
     match rustix::fs::statvfs(path) {
         Ok(vfs) => {
@@ -435,6 +463,59 @@ fn disk_space(path: &Path) -> Option<DiskSpace> {
             None
         }
     }
+}
+
+/// `GetDiskFreeSpaceExW` on the scan root, for the disk gauge — Windows has
+/// no `statvfs`. Same contract as the Unix arm: a failure is logged and
+/// degrades the gauge to "unavailable", never fatal.
+///
+/// Of the two "free" figures Win32 returns, the total is what matches
+/// `statvfs`'s `f_bfree`: `lpFreeBytesAvailableToCaller` is the *quota*-aware
+/// one, so on a volume with per-user quotas it would make the bar report the
+/// caller's remaining allowance as if it were the disk's. The gauge is about
+/// the disk.
+///
+/// `compressed` stays whatever the backend says (`false` on Windows today):
+/// NTFS per-file compression is a file attribute, not a mount property, and
+/// the scan's own sizes are `AllocationSize`-based, so there is no
+/// mount-wide logical-vs-physical mismatch to flag — see
+/// `docs/design/windows-backend-design.md` §7.1 for the part of this that is
+/// still unresolved.
+#[cfg(windows)]
+fn disk_space(path: &Path) -> Option<DiskSpace> {
+    use std::os::windows::ffi::OsStrExt;
+
+    // `GetDiskFreeSpaceExW` takes a *directory* name and wants it
+    // NUL-terminated; `encode_wide` does not add the terminator.
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut capacity: u64 = 0;
+    let mut free: u64 = 0;
+    // SAFETY: `wide` is a NUL-terminated UTF-16 buffer that outlives the
+    // call, and the two out-params are live `u64`s written only on success.
+    // `lpFreeBytesAvailableToCaller` is optional and passed as null, which
+    // the API documents as "not returned".
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            std::ptr::null_mut(),
+            &raw mut capacity,
+            &raw mut free,
+        )
+    };
+    if ok == 0 {
+        let err = std::io::Error::last_os_error();
+        warn!(%err, path = %path.display(), "GetDiskFreeSpaceExW failed: disk gauge unavailable");
+        return None;
+    }
+    Some(DiskSpace {
+        capacity,
+        used: capacity.saturating_sub(free),
+        compressed: path_on_compressed_mount(path),
+    })
 }
 
 /// Result of [`finish_scan`]'s dump attempt, driving the "dump written"
@@ -507,21 +588,10 @@ fn event_loop(
     // Bar/donut animation state (design slice 5) — see the `anim` module
     // doc. `ctx.animate` is `false` for `--no-motion`/`NO_MOTION`.
     let mut motion = anim::Motion::new(ctx.animate);
-    // Freeable phase 1 (D4): `Some` from scan end until the off-thread
-    // sweep's result lands, polled non-blockingly below (step 2.5) — never
-    // set at all under `--no-proc-sweep`/`NO_PROC_SWEEP`.
-    let mut sweep_rx: Option<Receiver<Ledger>> = None;
-    // Freeable phase 2 D4: the mark-time selection oracle's session-long
-    // runtime (job channel, per-inode/per-device caches, per-mark landed
-    // results) — `ctx.no_fiemap` disables it outright (no job ever spawns).
-    let mut oracle_rt = oracle::OracleRuntime::new(ctx.no_fiemap);
-    // Freeable phase 2 slice 2 (D3): the ambient exclusive floor pass's
-    // session-long runtime (spawn state, job channel) — gated on both
-    // `--no-fiemap`/`NO_FIEMAP` and the kernel version (unlike the oracle
-    // above, which is NOT kernel-gated). Computed once here so the gate
-    // is never re-probed mid-session; see `floor_rt`'s module doc for the
-    // full spawn-sequencing and deletion-interlock design.
-    let mut floor_rt = floor_rt::FloorRuntime::new(!ctx.no_fiemap && shared_bit_reliable());
+    // Deletion, freeable sweep, selection oracle, ambient floor pass — the
+    // whole reclaim subsystem's session-long state, empty on platforms
+    // without it (see the `mod` gates at the top of this file).
+    let mut reclaim = Reclaim::new(ctx.no_fiemap);
     // D6: the palette's clock/IO-owning runtime (history file, the
     // debounce timer, the off-thread filter fold's channel) — kept out of
     // `PaletteState`/`UiState` the same way `Flash`/`sweep_rx` are kept out
@@ -536,21 +606,13 @@ fn event_loop(
         //    while something needs a timely redraw of its own accord —
         //    otherwise idle: a quiescent UI costs nothing between
         //    keypresses, design slice 5).
-        let mut deadline = if needs_frequent_polling(
-            &phase,
-            &flash,
-            &toasts,
-            &motion,
-            &sweep_rx,
-            &palette_rt,
-            &ui,
-            &oracle_rt,
-            &floor_rt,
-        ) {
-            FRAME
-        } else {
-            IDLE_POLL
-        };
+        let mut deadline =
+            if needs_frequent_polling(&phase, &flash, &toasts, &motion, &palette_rt, &ui, &reclaim)
+            {
+                FRAME
+            } else {
+                IDLE_POLL
+            };
         while event::poll(deadline)? {
             deadline = Duration::ZERO;
             match event::read()? {
@@ -566,8 +628,7 @@ fn event_loop(
                         ctx.no_proc_sweep,
                         &mut palette_rt,
                         &ctx.flat_config,
-                        &mut oracle_rt,
-                        &mut floor_rt,
+                        &mut reclaim,
                     ) {
                         Action::Quit => {
                             if let Phase::Scanning(live) = phase {
@@ -630,9 +691,10 @@ fn event_loop(
             // is cheaper and more honest than a fresh `statat` here, which
             // would race a filesystem that changed underneath since the
             // scan started.
+            #[cfg(unix)]
             if !ctx.no_proc_sweep {
                 let root_dev = outcome.dir(outcome.root()).dev;
-                sweep_rx = spawn_freeable_sweep(root_dev);
+                reclaim.sweep_rx = spawn_freeable_sweep(root_dev);
             }
             local_generation = ui.snapshot().generation;
             phase = Phase::Done(Arc::new(RwLock::new(outcome)));
@@ -641,10 +703,11 @@ fn event_loop(
             // when no sweep will ever run at all (`--no-proc-sweep`);
             // otherwise step 2.5 below kicks it off the instant `sweep_rx`
             // resolves to `None` (see `floor_rt`'s module doc).
+            #[cfg(unix)]
             if ctx.no_proc_sweep
                 && let Phase::Done(lock) = &phase
             {
-                floor_rt.spawn_full(Arc::clone(lock));
+                reclaim.floor.spawn_full(Arc::clone(lock));
             }
             // Re-view the current dir so states/totals show final values,
             // resolving any nav request the owner no longer serves.
@@ -677,63 +740,73 @@ fn event_loop(
             }
         }
 
-        // 2.5. Freeable sweep result landed? (D4/D5 — polled
-        // non-blockingly; `needs_frequent_polling` above keeps the loop at
-        // FRAME cadence while `sweep_rx` is still pending, so this lands
-        // within a frame or two of the sweep actually finishing.)
-        if let Some(rx) = &sweep_rx {
-            match rx.try_recv() {
-                Ok(ledger) => {
-                    let freeable_bytes = ledger.root_fs_freeable_bytes();
-                    let capacity = ctx.disk.map_or(0, |disk| disk.capacity);
-                    if freeable_panel::should_toast(freeable_bytes, capacity) {
-                        toasts.push(format!(
-                            "{} freeable by closing files — press f",
-                            HumanSize(freeable_bytes)
-                        ));
+        // 2.5 / 2.55 / 2.56. The reclaim subsystem's three non-blocking
+        // polls, in one gate because they are one feature (see the `mod`
+        // gates at the top of this file).
+        #[cfg(unix)]
+        {
+            // 2.5. Freeable sweep result landed? (D4/D5 — polled
+            // non-blockingly; `needs_frequent_polling` above keeps the loop
+            // at FRAME cadence while `sweep_rx` is still pending, so this
+            // lands within a frame or two of the sweep actually finishing.)
+            if let Some(rx) = &reclaim.sweep_rx {
+                match rx.try_recv() {
+                    Ok(ledger) => {
+                        let freeable_bytes = ledger.root_fs_freeable_bytes();
+                        let capacity = ctx.disk.map_or(0, |disk| disk.capacity);
+                        if freeable_panel::should_toast(freeable_bytes, capacity) {
+                            toasts.push(format!(
+                                "{} freeable by closing files — press f",
+                                HumanSize(freeable_bytes)
+                            ));
+                        }
+                        ui.set_freeable_ledger(ledger);
+                        reclaim.sweep_rx = None;
+                        // D3 sequencing: the phase-1 sweep just landed —
+                        // this is the earliest the floor pass may spawn.
+                        if let Phase::Done(lock) = &phase {
+                            reclaim.floor.spawn_full(Arc::clone(lock));
+                        }
                     }
-                    ui.set_freeable_ledger(ledger);
-                    sweep_rx = None;
-                    // D3 sequencing: the phase-1 sweep just landed — this
-                    // is the earliest the floor pass may spawn.
-                    if let Phase::Done(lock) = &phase {
-                        floor_rt.spawn_full(Arc::clone(lock));
-                    }
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    debug!("freeable sweep thread ended without a result");
-                    sweep_rx = None;
-                    if let Phase::Done(lock) = &phase {
-                        floor_rt.spawn_full(Arc::clone(lock));
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        debug!("freeable sweep thread ended without a result");
+                        reclaim.sweep_rx = None;
+                        if let Phase::Done(lock) = &phase {
+                            reclaim.floor.spawn_full(Arc::clone(lock));
+                        }
                     }
                 }
             }
-        }
 
-        // 2.55. Selection oracle job results landed? (freeable phase 2 D4,
-        // attack-a finding [1]'s redesigned contract — polled
-        // non-blockingly, same idiom as the freeable sweep just above.) If
-        // the confirm modal is open, its oracle slot is re-assembled and
-        // updated *in place* so a "computing…" state resolves to the
-        // quantified answer without the user closing and reopening it.
-        if oracle_rt.poll(ui.flat_epoch(), |node| ui.is_marked(node))
-            && ui.confirm().is_some()
-            && let Phase::Done(lock) = &phase
-        {
-            let marks: Vec<NodeId> = ui.marks().iter().map(|mark| mark.node).collect();
-            let hardlink_groups = read_outcome(lock).hardlink_groups();
-            let slot = oracle::build_slot(&oracle_rt, &marks, &hardlink_groups);
-            ui.set_confirm_oracle(slot);
-        }
+            // 2.55. Selection oracle job results landed? (freeable phase 2
+            // D4, attack-a finding [1]'s redesigned contract — polled
+            // non-blockingly, same idiom as the freeable sweep just above.)
+            // If the confirm modal is open, its oracle slot is re-assembled
+            // and updated *in place* so a "computing…" state resolves to
+            // the quantified answer without the user closing and reopening
+            // it.
+            if reclaim
+                .oracle
+                .poll(ui.flat_epoch(), |node| ui.is_marked(node))
+                && ui.confirm().is_some()
+                && let Phase::Done(lock) = &phase
+            {
+                let marks: Vec<NodeId> = ui.marks().iter().map(|mark| mark.node).collect();
+                let hardlink_groups = read_outcome(lock).hardlink_groups();
+                let slot = oracle::build_slot(&reclaim.oracle, &marks, &hardlink_groups);
+                ui.set_confirm_oracle(slot);
+            }
 
-        // 2.56. Ambient exclusive floor pass landed? (freeable phase 2
-        // slice 2, D3 — polled non-blockingly, same `try_recv` idiom as
-        // the freeable sweep/oracle above.) A stale/superseded result was
-        // already discarded inside `poll` itself (`floor_rt`'s generation
-        // guard), so anything that comes back here is current.
-        if let Some(map) = floor_rt.poll() {
-            ui.set_floor(Arc::new(map), Instant::now());
+            // 2.56. Ambient exclusive floor pass landed? (freeable phase 2
+            // slice 2, D3 — polled non-blockingly, same `try_recv` idiom as
+            // the freeable sweep/oracle above.) A stale/superseded result
+            // was already discarded inside `poll` itself (`floor_rt`'s
+            // generation guard), so anything that comes back here is
+            // current.
+            if let Some(map) = reclaim.floor.poll() {
+                ui.set_floor(Arc::new(map), Instant::now());
+            }
         }
 
         // 2.6. Filter fold (D5): debounced trigger, then a non-blocking
@@ -783,7 +856,11 @@ fn event_loop(
                 .collect()
         };
         let mut geometry = FrameGeometry::default();
-        let floor_progress = floor_rt.progress();
+        // No floor pass, so no "mapping extents…" footer line to feed.
+        #[cfg(unix)]
+        let floor_progress = reclaim.floor.progress();
+        #[cfg(not(unix))]
+        let floor_progress = None;
         terminal.draw(|frame| {
             geometry = draw(
                 frame,
@@ -802,6 +879,7 @@ fn event_loop(
         })?;
         // Recomputed every frame (design slice 3): mouse events hit-test
         // against exactly what is on screen right now.
+        #[cfg(unix)]
         if let Some(total_rows) = geometry.freeable_rows {
             // Same feedback idiom as `set_geometry` itself: the freeable
             // panel's true row count is only known once actually drawn, so
@@ -810,6 +888,84 @@ fn event_loop(
             ui.clamp_freeable_cursor(total_rows);
         }
         ui.set_geometry(geometry);
+    }
+}
+
+/// Session-long state owned by the reclaim subsystem: the freeable sweep's
+/// one-shot channel, the selection oracle's runtime, and the ambient floor
+/// pass's runtime.
+///
+/// It exists as a struct so the shared dispatch functions that merely
+/// *forward* it — [`handle_key`], [`handle_palette_key`], [`palette_enter`],
+/// [`execute_command`] — take one parameter that is present on every
+/// platform. A `cfg` cannot be written on a call's argument, so gating the
+/// three runtimes individually would have meant two copies of each of those
+/// signatures; gating them here costs three field attributes and leaves the
+/// dispatch code identical on both platforms. On Windows the struct is
+/// genuinely empty — there is no disabled runtime standing in for a real
+/// one, just nothing.
+struct Reclaim {
+    /// Freeable phase 1 (D4): `Some` from scan end until the off-thread
+    /// sweep's result lands, polled non-blockingly in the render loop
+    /// (step 2.5) — never set at all under `--no-proc-sweep`/`NO_PROC_SWEEP`.
+    #[cfg(unix)]
+    sweep_rx: Option<Receiver<Ledger>>,
+    /// Freeable phase 2 D4: the mark-time selection oracle's runtime (job
+    /// channel, per-inode/per-device caches, per-mark landed results) —
+    /// `--no-fiemap` disables it outright (no job ever spawns).
+    #[cfg(unix)]
+    oracle: oracle::OracleRuntime,
+    /// Freeable phase 2 slice 2 (D3): the ambient exclusive floor pass's
+    /// runtime (spawn state, job channel).
+    #[cfg(unix)]
+    floor: floor_rt::FloorRuntime,
+}
+
+impl Reclaim {
+    /// The floor pass is gated on both `--no-fiemap`/`NO_FIEMAP` and the
+    /// kernel version (unlike the oracle, which is NOT kernel-gated).
+    /// Probed once here so the gate is never re-probed mid-session; see
+    /// `floor_rt`'s module doc for the full spawn-sequencing and
+    /// deletion-interlock design.
+    #[cfg(unix)]
+    fn new(no_fiemap: bool) -> Self {
+        Self {
+            sweep_rx: None,
+            oracle: oracle::OracleRuntime::new(no_fiemap),
+            floor: floor_rt::FloorRuntime::new(!no_fiemap && shared_bit_reliable()),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn new(_no_fiemap: bool) -> Self {
+        Self {}
+    }
+
+    /// Whether anything the reclaim subsystem owns still needs the render
+    /// loop at [`FRAME`] cadence: a sweep whose result hasn't landed yet
+    /// (`sweep_rx` is `Some` from scan end until `try_recv` succeeds), an
+    /// oracle job still in flight, the confirm modal open with its slot
+    /// still [`oracle::OracleSlot::Pending`] (the spinner needs a timely
+    /// redraw even between job landings), or a floor pass in flight — its
+    /// "mapping extents… N files" status line needs to tick too.
+    #[cfg(unix)]
+    fn has_pending(&self, ui: &UiState) -> bool {
+        self.sweep_rx.is_some()
+            || self.oracle.has_pending()
+            || matches!(
+                ui.confirm(),
+                Some(ConfirmState {
+                    oracle: oracle::OracleSlot::Pending,
+                    ..
+                })
+            )
+            || self.floor.has_pending()
+    }
+
+    /// Nothing to wait for where the subsystem does not exist.
+    #[cfg(not(unix))]
+    fn has_pending(&self, _ui: &UiState) -> bool {
+        false
     }
 }
 
@@ -823,6 +979,7 @@ fn event_loop(
 /// this from ever blocking a frame. Returns `None` (logged, never fatal)
 /// if the thread could not be spawned at all — the session simply has no
 /// freeable data this run, same as `--no-proc-sweep`.
+#[cfg(unix)]
 fn spawn_freeable_sweep(root_dev: u64) -> Option<Receiver<Ledger>> {
     let (tx, rx) = mpsc::channel();
     match thread::Builder::new()
@@ -844,45 +1001,27 @@ fn spawn_freeable_sweep(root_dev: u64) -> Option<Receiver<Ledger>> {
 /// Whether the render loop needs to keep polling at [`FRAME`] cadence
 /// even without new input: a running scan (progress arrives off the
 /// input stream), an in-flight bar/donut animation, a toast/flash that
-/// still needs to expire on schedule, a freeable sweep whose result
-/// hasn't landed yet (D4 — `sweep_rx` is `Some` from scan end until
-/// `try_recv` succeeds), the filter palette waiting out its debounce
-/// window / a fold already in flight (D5), or the freeable-2 selection
-/// oracle: any job still in flight, or the confirm modal open with its
-/// slot still [`oracle::OracleSlot::Pending`] (the spinner needs a timely
-/// redraw even between job landings), or the freeable-2 ambient floor
-/// pass ([`floor_rt::FloorRuntime::has_pending`]) — its "mapping extents…
-/// N files" status line needs to tick too. `false` means nothing on
-/// screen changes until the user does something, so the loop idles at
-/// [`IDLE_POLL`] instead (design slice 5).
-#[allow(clippy::too_many_arguments)]
+/// still needs to expire on schedule, the filter palette waiting out its
+/// debounce window / a fold already in flight (D5), or anything the
+/// reclaim subsystem still has in the air ([`Reclaim::has_pending`]).
+/// `false` means nothing on screen changes until the user does something,
+/// so the loop idles at [`IDLE_POLL`] instead (design slice 5).
 fn needs_frequent_polling(
     phase: &Phase,
     flash: &Flash,
     toasts: &ToastQueue,
     motion: &anim::Motion,
-    sweep_rx: &Option<Receiver<Ledger>>,
     palette_rt: &PaletteRuntime,
     ui: &UiState,
-    oracle_rt: &oracle::OracleRuntime,
-    floor_rt: &floor_rt::FloorRuntime,
+    reclaim: &Reclaim,
 ) -> bool {
     matches!(phase, Phase::Scanning(_))
         || motion.is_active()
         || flash.is_set()
         || !toasts.is_empty()
-        || sweep_rx.is_some()
         || palette_rt.last_edit.is_some()
         || palette_rt.fold_rx.is_some()
-        || oracle_rt.has_pending()
-        || matches!(
-            ui.confirm(),
-            Some(ConfirmState {
-                oracle: oracle::OracleSlot::Pending,
-                ..
-            })
-        )
-        || floor_rt.has_pending()
+        || reclaim.has_pending(ui)
 }
 
 // ---------------------------------------------------------------------------
@@ -1170,6 +1309,11 @@ enum Action {
 // the UI/phase/generation/flash/toast state it can mutate, and two
 // runtime flags/config): same shape as `draw`'s own too-many-arguments
 // allowance.
+// `generation` and `toasts` are only read on the deletion path.
+#[cfg_attr(
+    not(unix),
+    expect(unused_variables, reason = "reclaim-only parameters")
+)]
 #[allow(clippy::too_many_arguments)]
 fn handle_key(
     code: KeyCode,
@@ -1182,8 +1326,7 @@ fn handle_key(
     no_proc_sweep: bool,
     palette_rt: &mut PaletteRuntime,
     flat_config: &FlatConfig,
-    oracle_rt: &mut oracle::OracleRuntime,
-    floor_rt: &mut floor_rt::FloorRuntime,
+    reclaim: &mut Reclaim,
 ) -> Action {
     // The palette (D6) is the topmost rung: while open, it owns the
     // keyboard except Esc/Enter/arrows/Home/End/Backspace/Delete/Ctrl-C —
@@ -1198,55 +1341,61 @@ fn handle_key(
             no_proc_sweep,
             palette_rt,
             flat_config,
-            oracle_rt,
+            reclaim,
         );
     }
-    // The confirmation modal captures every key: `y` confirms, anything
-    // else cancels (Ctrl-C keeps quitting — safety hatch).
-    if ui.confirm().is_some() {
-        if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
-            return Action::Quit;
+    // Rungs of the ladder that only exist where the reclaim subsystem does
+    // (confirm, review, freeable panel) — none of these modals can be open
+    // on a platform that cannot mark anything in the first place.
+    #[cfg(unix)]
+    {
+        // The confirmation modal captures every key: `y` confirms, anything
+        // else cancels (Ctrl-C keeps quitting — safety hatch).
+        if ui.confirm().is_some() {
+            if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
+                return Action::Quit;
+            }
+            if code == KeyCode::Char('y') {
+                execute_deletion(ui, phase, generation, toasts, reclaim);
+            } else {
+                ui.cancel_confirm();
+            }
+            return Action::Continue;
         }
-        if code == KeyCode::Char('y') {
-            execute_deletion(ui, phase, generation, toasts, oracle_rt, floor_rt);
-        } else {
-            ui.cancel_confirm();
-        }
-        return Action::Continue;
-    }
-    if ui.review().is_some() {
-        match code {
-            KeyCode::Down | KeyCode::Char('j') => ui.review_move_down(),
-            KeyCode::Up | KeyCode::Char('k') => ui.review_move_up(),
-            KeyCode::Char(' ') => {
-                let node = ui
-                    .review()
-                    .and_then(|review| ui.marks().get(review.cursor))
-                    .map(|mark| mark.node);
-                ui.unmark_at_review_cursor();
-                if let Some(node) = node {
-                    oracle_rt.mark_removed(node);
+        if ui.review().is_some() {
+            match code {
+                KeyCode::Down | KeyCode::Char('j') => ui.review_move_down(),
+                KeyCode::Up | KeyCode::Char('k') => ui.review_move_up(),
+                KeyCode::Char(' ') => {
+                    let node = ui
+                        .review()
+                        .and_then(|review| ui.marks().get(review.cursor))
+                        .map(|mark| mark.node);
+                    ui.unmark_at_review_cursor();
+                    if let Some(node) = node {
+                        reclaim.oracle.mark_removed(node);
+                    }
                 }
+                // `D` is natural from inside the list too: close it and open
+                // the same confirm modal `D` opens from the main view.
+                KeyCode::Char('D') => {
+                    ui.close_review();
+                    open_delete_confirm(ui, phase, flash, no_proc_sweep, &reclaim.oracle);
+                }
+                KeyCode::Char('v') | KeyCode::Esc => ui.close_review(),
+                _ => {}
             }
-            // `D` is natural from inside the list too: close it and open
-            // the same confirm modal `D` opens from the main view.
-            KeyCode::Char('D') => {
-                ui.close_review();
-                open_delete_confirm(ui, phase, flash, no_proc_sweep, oracle_rt);
+            return Action::Continue;
+        }
+        if ui.freeable_open() {
+            match code {
+                KeyCode::Down | KeyCode::Char('j') => ui.freeable_move_down(),
+                KeyCode::Up | KeyCode::Char('k') => ui.freeable_move_up(),
+                KeyCode::Char('f') | KeyCode::Esc => ui.close_freeable_panel(),
+                _ => {}
             }
-            KeyCode::Char('v') | KeyCode::Esc => ui.close_review(),
-            _ => {}
+            return Action::Continue;
         }
-        return Action::Continue;
-    }
-    if ui.freeable_open() {
-        match code {
-            KeyCode::Down | KeyCode::Char('j') => ui.freeable_move_down(),
-            KeyCode::Up | KeyCode::Char('k') => ui.freeable_move_up(),
-            KeyCode::Char('f') | KeyCode::Esc => ui.close_freeable_panel(),
-            _ => {}
-        }
-        return Action::Continue;
     }
     if ui.cheatsheet_open() {
         if matches!(code, KeyCode::Char('?') | KeyCode::Esc) {
@@ -1292,17 +1441,29 @@ fn handle_key(
                 try_ascend(ui, phase);
             }
         }
-        KeyCode::Char(' ') => try_toggle_mark(ui, phase, flash, oracle_rt),
-        KeyCode::Char('D') => open_delete_confirm(ui, phase, flash, no_proc_sweep, oracle_rt),
+        // The five reclaim bindings. Absent where the subsystem is: these
+        // keys fall through to `keymap::dispatch_simple`, which does not
+        // claim them either, so they are inert rather than erroring — and
+        // `keymap::EXTRA_RECLAIM` is empty there too, so `?` never
+        // advertises a key that does nothing.
+        #[cfg(unix)]
+        KeyCode::Char(' ') => try_toggle_mark(ui, phase, flash, &mut reclaim.oracle),
+        #[cfg(unix)]
+        KeyCode::Char('D') => {
+            open_delete_confirm(ui, phase, flash, no_proc_sweep, &reclaim.oracle);
+        }
+        #[cfg(unix)]
         KeyCode::Char('v') => try_open_review(ui, flash),
+        #[cfg(unix)]
         KeyCode::Char('f') => open_freeable_panel(ui, phase),
         // `u` needs to reach the oracle runtime too (clear its per-mark
         // results/pending), context `keymap::SIMPLE` doesn't carry — same
         // reason the sort keys and mark/delete/review keys are
         // hand-written here (module docs on `keymap`).
+        #[cfg(unix)]
         KeyCode::Char('u') => {
             ui.unmark_all();
-            oracle_rt.clear_marks();
+            reclaim.oracle.clear_marks();
         }
         // The sort keys are mode-aware (D3: a group total has no mtime or
         // error count) and need the flash queue to say so when refused —
@@ -1341,7 +1502,7 @@ fn handle_palette_key(
     no_proc_sweep: bool,
     rt: &mut PaletteRuntime,
     flat_config: &FlatConfig,
-    oracle_rt: &mut oracle::OracleRuntime,
+    reclaim: &mut Reclaim,
 ) -> Action {
     if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
         return Action::Quit; // the one safety hatch that survives inside the palette
@@ -1352,7 +1513,7 @@ fn handle_palette_key(
         // applied while typing stays active.
         KeyCode::Esc => ui.close_palette(),
         KeyCode::Enter => {
-            return palette_enter(ui, phase, flash, no_proc_sweep, rt, flat_config, oracle_rt);
+            return palette_enter(ui, phase, flash, no_proc_sweep, rt, flat_config, reclaim);
         }
         KeyCode::Left => {
             if let Some(p) = ui.palette_mut() {
@@ -1460,7 +1621,7 @@ fn palette_enter(
     no_proc_sweep: bool,
     rt: &mut PaletteRuntime,
     flat_config: &FlatConfig,
-    oracle_rt: &mut oracle::OracleRuntime,
+    reclaim: &mut Reclaim,
 ) -> Action {
     let Some(mode) = ui.palette().map(palette::PaletteState::mode) else {
         return Action::Continue;
@@ -1480,7 +1641,7 @@ fn palette_enter(
             let action = filtered.get(selected).map(|&i| commands[i].action);
             ui.close_palette();
             if let Some(action) = action {
-                return execute_command(action, ui, phase, flash, no_proc_sweep, oracle_rt);
+                return execute_command(action, ui, phase, flash, no_proc_sweep, reclaim);
             }
         }
         PaletteMode::Query => {
@@ -1514,20 +1675,28 @@ fn palette_enter(
 /// exactly like `keymap::dispatch_simple`; the rest reuse the same
 /// hand-written helpers the equivalent keypress already calls, so a
 /// command can never do something its keyboard equivalent wouldn't.
+///
+/// The three reclaim commands are `cfg(unix)` here *and* absent from
+/// [`palette::all_commands`], so on Windows there is nothing to select in
+/// the first place — this gate only mirrors that.
+#[cfg_attr(not(unix), expect(unused_variables, reason = "reclaim-only params"))]
 fn execute_command(
     action: CommandAction,
     ui: &mut UiState,
     phase: &mut Phase,
     flash: &mut Flash,
     no_proc_sweep: bool,
-    oracle_rt: &mut oracle::OracleRuntime,
+    reclaim: &mut Reclaim,
 ) -> Action {
     match action {
         CommandAction::Simple(apply) => apply(ui),
+        #[cfg(unix)]
         CommandAction::ReviewMarks => try_open_review(ui, flash),
+        #[cfg(unix)]
         CommandAction::DeleteMarked => {
-            open_delete_confirm(ui, phase, flash, no_proc_sweep, oracle_rt);
+            open_delete_confirm(ui, phase, flash, no_proc_sweep, &reclaim.oracle);
         }
+        #[cfg(unix)]
         CommandAction::FreeablePanel => open_freeable_panel(ui, phase),
         CommandAction::ClearFilter => ui.clear_filter(),
         CommandAction::Quit => return Action::Quit,
@@ -1659,8 +1828,11 @@ fn handle_mouse(
         }
         return;
     }
-    if ui.confirm().is_some() || ui.review().is_some() || ui.freeable_open() || ui.cheatsheet_open()
-    {
+    #[cfg(unix)]
+    if ui.confirm().is_some() || ui.review().is_some() || ui.freeable_open() {
+        return;
+    }
+    if ui.cheatsheet_open() {
         return;
     }
     match mouse.kind {
@@ -1702,6 +1874,9 @@ fn handle_click(
     last_click: &mut Option<(Instant, u16, u16)>,
     flash: &mut Flash,
 ) {
+    // D5: the gauge's freeable suffix is only ever drawn where the sweep
+    // runs, so the hit region can only be live there too.
+    #[cfg(unix)]
     if ui.geometry().gauge_freeable_hit(col, row) {
         open_freeable_panel(ui, phase);
         *last_click = None;
@@ -1777,6 +1952,7 @@ fn handle_hover(col: u16, row: u16, ui: &mut UiState) {
 /// Mode-aware (D3): flat rows mark real nodes into the same shared basket;
 /// breakdown rows aren't markable at all (a group isn't a single node —
 /// group-level marking is a deliberate fast-follow, D6).
+#[cfg(unix)]
 fn try_toggle_mark(
     ui: &mut UiState,
     phase: &Phase,
@@ -1814,6 +1990,7 @@ fn try_toggle_mark(
 /// it; `ui.is_marked(node)` afterwards says which happened. Post-scan
 /// only (marking itself is refused during a scan, so `phase` is always
 /// `Phase::Done` here — the `let else` is defensive, never fatal).
+#[cfg(unix)]
 fn notify_oracle_mark_change(
     ui: &UiState,
     phase: &Phase,
@@ -1834,6 +2011,7 @@ fn notify_oracle_mark_change(
 /// same shared basket tree-mode marking uses. Only possible post-scan —
 /// same reason as [`try_jump_flat_row`] (the live accumulator's
 /// `TopFile` has no path to resolve).
+#[cfg(unix)]
 fn try_toggle_mark_flat(
     ui: &mut UiState,
     phase: &Phase,
@@ -1876,6 +2054,7 @@ fn try_toggle_mark_flat(
 /// `v`: open the review list over the marked entries. Refused (flashed,
 /// like `D`'s own "nothing marked") when the basket is empty — there is
 /// nothing to review, and an empty modal would just be confusing.
+#[cfg(unix)]
 fn try_open_review(ui: &mut UiState, flash: &mut Flash) {
     if !ui.open_review() {
         flash.set("nothing marked — Space marks the row under the cursor");
@@ -1887,6 +2066,7 @@ fn try_open_review(ui: &mut UiState, flash: &mut Flash) {
 /// D6 pre-deletion open-file advisory, and the freeable-2 D4 selection
 /// oracle's slot (`build_slot`: `Disabled` under `--no-fiemap`, `Pending`
 /// while any marked node's job hasn't landed, else `Ready`).
+#[cfg(unix)]
 fn open_delete_confirm(
     ui: &mut UiState,
     phase: &Phase,
@@ -1937,6 +2117,7 @@ fn open_delete_confirm(
 /// disk. `None` when the entry cannot be stat'd (it vanished, permission
 /// denied, …); the executor then falls back to no identity check for it,
 /// still fully descriptor-relative and still every other guard.
+#[cfg(unix)]
 fn mark_identity(path: &Path) -> Option<delete::InodeId> {
     use std::os::unix::fs::MetadataExt;
     std::fs::symlink_metadata(path)
@@ -1976,6 +2157,7 @@ fn mark_identity(path: &Path) -> Option<delete::InodeId> {
 /// (~25ms, well under the ~50ms a UI action can eat before feeling laggy)
 /// is a fair trade against threading a second off-thread machine through
 /// the UI for what is otherwise a one-shot, on-demand check.
+#[cfg(unix)]
 fn pre_deletion_open_warning(ui: &UiState) -> Option<freeable_panel::OpenWarning> {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
@@ -2024,6 +2206,7 @@ fn pre_deletion_open_warning(ui: &UiState) -> Option<freeable_panel::OpenWarning
 /// frozen tree's live directory paths) the first time it's needed for the
 /// current ledger. Always succeeds, even with no ledger yet — the panel
 /// then shows an explanatory empty state rather than refusing to open.
+#[cfg(unix)]
 fn open_freeable_panel(ui: &mut UiState, phase: &Phase) {
     if !ui.freeable_groups_built()
         && let Some(ledger) = ui.freeable_ledger()
@@ -2049,6 +2232,7 @@ fn open_freeable_panel(ui: &mut UiState, phase: &Phase) {
 /// arena (no syscalls), the same kind of one-time synchronous cost
 /// `delete::hardlink_files_in` already pays for the confirm modal's
 /// hardlink warning.
+#[cfg(unix)]
 fn live_dir_paths(outcome: &ScanOutcome) -> Vec<Vec<u8>> {
     use std::os::unix::ffi::OsStrExt;
     let tree = outcome.tree();
@@ -2064,13 +2248,13 @@ fn live_dir_paths(outcome: &ScanOutcome) -> Vec<Vec<u8>> {
 /// (design slice 4), not a footer flash — "deletion done" is exactly the
 /// kind of announcement-of-something-that-happened the toast mechanism
 /// exists for, see the `toast` module doc for the split.
+#[cfg(unix)]
 fn execute_deletion(
     ui: &mut UiState,
     phase: &mut Phase,
     generation: &mut u64,
     toasts: &mut ToastQueue,
-    oracle_rt: &mut oracle::OracleRuntime,
-    floor_rt: &mut floor_rt::FloorRuntime,
+    reclaim: &mut Reclaim,
 ) {
     let Phase::Done(lock) = phase else {
         // The modal only opens post-scan, but never delete on a stale
@@ -2098,7 +2282,7 @@ fn execute_deletion(
     // block a deletion the user expects to be near-instant). Capture
     // whatever map is currently displayed now, before it can be cleared,
     // so a completed one can still seed a cheap reaggregate afterward.
-    floor_rt.cancel_for_deletion();
+    reclaim.floor.cancel_for_deletion();
     let prev_floor = ui.floor().map(|(map, _)| Arc::clone(map));
     {
         // The write lock (D5: the sole writer against `Phase::Done`'s
@@ -2120,7 +2304,7 @@ fn execute_deletion(
             // Freeable phase 2 D4: the frozen arena just changed under
             // every cached oracle fact (inode maps, per-mark results,
             // in-flight job identities) -- invalidate them all.
-            oracle_rt.on_deletion();
+            reclaim.oracle.on_deletion();
             // Freeable phase 2 slice 2 (D3 "invalidated ... on in-app
             // deletion epochs"): drop the now-stale floor snapshot rather
             // than showing it against a tree it no longer describes (see
@@ -2158,7 +2342,9 @@ fn execute_deletion(
     // cancelled for nothing rather than leaving the floor pass stalled
     // for the rest of the session.
     if let Phase::Done(lock) = phase {
-        floor_rt.respawn_after_deletion(Arc::clone(lock), prev_floor);
+        reclaim
+            .floor
+            .respawn_after_deletion(Arc::clone(lock), prev_floor);
     }
     serve_local(phase, dir, generation, ui);
 }
@@ -2264,7 +2450,11 @@ fn draw(
     // anything never sees the layout shift, same idea as the selection
     // card below. Zen mode (`z`, design slice 5) collapses the cards row
     // and disk gauge the same way: table + footer + basket strip only.
+    #[cfg(unix)]
     let basket_height = if ui.marked_summary().is_some() { 1 } else { 0 };
+    // Nothing can be marked, so the strip never claims its row.
+    #[cfg(not(unix))]
+    let basket_height = 0;
     // D6: the filter pill takes a row the same way the basket strip does
     // — `Length(0)` while no filter is active, so browsing without ever
     // filtering never sees the layout shift. Sits just above the basket
@@ -2315,6 +2505,10 @@ fn draw(
     ])
     .areas(frame.area());
 
+    // Reserved at `Length(0)` where the basket strip cannot exist, so
+    // there is nothing to draw into it.
+    #[cfg(not(unix))]
+    let _ = basket_area;
     let breadcrumb = draw_header(frame, header_area, ui, spinner, ctx);
     let errors_card = if ui.zen() {
         None
@@ -2329,6 +2523,10 @@ fn draw(
     } else {
         draw_disk_gauge(frame, gauge_area, ui, outcome, ctx)
     };
+    // The gauge never grows a clickable freeable suffix here, so the rect
+    // it reports has no field in `FrameGeometry` to land in.
+    #[cfg(not(unix))]
+    let _ = gauge_freeable;
 
     // Main split: table (with selection card) left, wheel right — see
     // `wheel_layout` for the responsive-collapse/zen-mode rules (design
@@ -2349,12 +2547,16 @@ fn draw(
     // Freeable phase 2 slice 2 (D2): the card's floor figure/caveat lines,
     // computed once here so the card's own height (below) and its content
     // (`draw_selection_card`) never disagree about how many there are.
+    #[cfg(unix)]
     let floor_lines: Vec<String> = match (ui.floor(), ui.card_row()) {
         (Some((floor, computed_at)), Some(row)) => {
             floor_rt::card_lines(floor, row, Instant::now(), computed_at)
         }
         _ => Vec::new(),
     };
+    // No FIEMAP, no exclusive floor, so the card keeps its base height.
+    #[cfg(not(unix))]
+    let floor_lines: Vec<String> = Vec::new();
     let (table_area, card_area) = if show_selection_card {
         let card_height = 4 + floor_lines.len() as u16;
         let [table, card] = Layout::vertical([Constraint::Min(1), Constraint::Length(card_height)])
@@ -2438,6 +2640,7 @@ fn draw(
         wheel_area.and_then(|wheel_area| draw_wheel(frame, wheel_area, &wheel_source, motion, ctx));
 
     draw_filter_pill(frame, pill_area, ui, filter_fold_in_flight, ctx);
+    #[cfg(unix)]
     draw_basket_strip(frame, basket_area, ui, ctx);
     draw_footer(frame, footer_area, ui, flash, floor_progress, ctx);
 
@@ -2446,7 +2649,11 @@ fn draw(
     // either's centered dialog, but are skipped outright whenever one is
     // open — simpler than reasoning about overlap and correct for every
     // terminal size, not just the common ones.
-    if ui.confirm().is_none() && !ui.palette_open() {
+    #[cfg(unix)]
+    let confirm_open = ui.confirm().is_some();
+    #[cfg(not(unix))]
+    let confirm_open = false;
+    if !confirm_open && !ui.palette_open() {
         draw_toasts(frame, main_area, toasts, ctx);
     }
 
@@ -2456,12 +2663,8 @@ fn draw(
     let mut freeable_rows = None;
     if let Some(palette) = ui.palette() {
         draw_palette_modal(frame, palette, ui, phase, saved_queries, ctx);
-    } else if let Some(confirm) = ui.confirm() {
-        draw_confirm_modal(frame, ui, confirm, ctx, spinner);
-    } else if let Some(review) = ui.review() {
-        draw_review_modal(frame, ui, review, ctx);
-    } else if ui.freeable_open() {
-        freeable_rows = Some(draw_freeable_modal(frame, ui, ctx));
+    } else if draw_reclaim_modal(frame, ui, ctx, spinner, &mut freeable_rows) {
+        // One of the three reclaim modals took the frame.
     } else if ui.cheatsheet_open() {
         draw_cheatsheet_modal(frame, ctx);
     }
@@ -2472,7 +2675,9 @@ fn draw(
         breadcrumb,
         errors_card,
         wheel,
+        #[cfg(unix)]
         gauge_freeable,
+        #[cfg(unix)]
         freeable_rows,
     }
 }
@@ -2730,9 +2935,15 @@ fn draw_disk_gauge(
     // of compression, so that wording takes priority — see
     // `DiskSpace::coverage_caption`.
     let coverage_label = disk.coverage_caption(scan_disk_bytes, device_count);
+    // D5: the "· N freeable" suffix and its click target only exist where
+    // the `/proc` sweep does. Zero here means the suffix is never appended
+    // and `gauge_freeable` stays `None`, so nothing is clickable either.
+    #[cfg(unix)]
     let freeable_bytes = ui
         .freeable_ledger()
         .map_or(0, Ledger::root_fs_freeable_bytes);
+    #[cfg(not(unix))]
+    let freeable_bytes = 0_u64;
     let mut text = format!(
         " {} · {:.0}% used · {}",
         HumanSize(disk.capacity),
@@ -2846,7 +3057,10 @@ fn draw_table(
             }
             _ => (row.disk, row.apparent, row.items),
         };
+        #[cfg(unix)]
         let marked = ui.is_marked(row.node);
+        #[cfg(not(unix))]
+        let marked = false;
         let mark = if marked {
             Span::from("*").fg(coral).bold()
         } else {
@@ -2882,10 +3096,17 @@ fn draw_table(
         // and the rest, using whatever `bar_text` actually rendered —
         // reusing its own filled-cell count via `bright_split` keeps this
         // in lockstep with the eased reveal instead of fighting it.
-        let floor_bytes = ui
-            .floor()
-            .and_then(|(floor, _)| floor_rt::row_floor(floor, row));
-        let bright_len = floor_rt::bright_split(&bar_text, floor_bytes, disk);
+        #[cfg(unix)]
+        let bright_len = {
+            let floor_bytes = ui
+                .floor()
+                .and_then(|(floor, _)| floor_rt::row_floor(floor, row));
+            floor_rt::bright_split(&bar_text, floor_bytes, disk)
+        };
+        // No FIEMAP, no exclusive floor: the bar has no bright prefix to
+        // split off, so every fill renders in the row's own identity color.
+        #[cfg(not(unix))]
+        let bright_len = 0;
         let bar = if bright_len > 0 {
             let emphasis = match rank {
                 Some(rank) => theme.identity_emphasis(rank),
@@ -3058,7 +3279,10 @@ fn draw_flat_table(
     let coral = theme.color(theme::ERROR);
     let table_rows = order.iter().map(|&index| {
         let row = &flat_rows[index];
+        #[cfg(unix)]
         let marked = ui.is_marked(row.node);
+        #[cfg(not(unix))]
+        let marked = false;
         let mark = if marked {
             Span::from("*").fg(coral).bold()
         } else {
@@ -3686,6 +3910,10 @@ fn draw_footer(
             .italic(),
         );
     }
+    // The mark/review/delete run is dropped where the reclaim subsystem is
+    // absent: the footer is the most-read key hint on screen, and naming a
+    // key that does nothing is the one thing it must never do.
+    #[cfg(unix)]
     let hints = match ui.mode() {
         ViewMode::Tree => {
             " ↑↓/jk move · ⏎/l/→ open · ⌫/h/← up · g/G ends · d/a/n/m/c/e sort · p apparent · \
@@ -3694,6 +3922,20 @@ fn draw_footer(
         ViewMode::FlatTop => {
             " ↑↓/jk move · ⏎/l/→ jump to directory · g/G ends · d/a/n sort · p apparent · \
              Space mark · u unmark · v review · D delete · t back to tree · ? help · q quit"
+        }
+        ViewMode::Breakdown => {
+            " ↑↓/jk move · g/G ends · d/a/n/c sort · p apparent · b back to tree · ? help · q quit"
+        }
+    };
+    #[cfg(not(unix))]
+    let hints = match ui.mode() {
+        ViewMode::Tree => {
+            " ↑↓/jk move · ⏎/l/→ open · ⌫/h/← up · g/G ends · d/a/n/m/c/e sort · p apparent · \
+             t/b flat/breakdown · ? help · q quit"
+        }
+        ViewMode::FlatTop => {
+            " ↑↓/jk move · ⏎/l/→ jump to directory · g/G ends · d/a/n sort · p apparent · \
+             t back to tree · ? help · q quit"
         }
         ViewMode::Breakdown => {
             " ↑↓/jk move · g/G ends · d/a/n/c sort · p apparent · b back to tree · ? help · q quit"
@@ -3709,6 +3951,7 @@ fn draw_footer(
 /// `area` otherwise, so this simply has nothing to render into — no
 /// separate visibility check needed beyond the one `marked_summary`
 /// already does.
+#[cfg(unix)]
 fn draw_basket_strip(frame: &mut Frame<'_>, area: Rect, ui: &UiState, ctx: &RenderCtx) {
     let Some((count, disk)) = ui.marked_summary() else {
         return;
@@ -3929,9 +4172,48 @@ fn draw_palette_modal(
     render_floating_modal(frame, ctx, area, width, lines, title, theme::ACCENT);
 }
 
+/// The reclaim subsystem's three rungs of the modal ladder — confirm >
+/// review > freeable panel — drawn behind one gate so [`draw`]'s ladder
+/// reads the same on every platform. Returns whether one of them claimed
+/// the frame, and writes the freeable panel's drawn row count back through
+/// `freeable_rows` (only that panel knows it, and only once drawn).
+#[cfg(unix)]
+fn draw_reclaim_modal(
+    frame: &mut Frame<'_>,
+    ui: &UiState,
+    ctx: &RenderCtx,
+    spinner: char,
+    freeable_rows: &mut Option<usize>,
+) -> bool {
+    if let Some(confirm) = ui.confirm() {
+        draw_confirm_modal(frame, ui, confirm, ctx, spinner);
+    } else if let Some(review) = ui.review() {
+        draw_review_modal(frame, ui, review, ctx);
+    } else if ui.freeable_open() {
+        *freeable_rows = Some(draw_freeable_modal(frame, ui, ctx));
+    } else {
+        return false;
+    }
+    true
+}
+
+/// None of these modals exist here, so the ladder falls straight through
+/// to the cheatsheet.
+#[cfg(not(unix))]
+fn draw_reclaim_modal(
+    _frame: &mut Frame<'_>,
+    _ui: &UiState,
+    _ctx: &RenderCtx,
+    _spinner: char,
+    _freeable_rows: &mut Option<usize>,
+) -> bool {
+    false
+}
+
 /// Centered confirmation modal: count, cumulative size, the first few
 /// paths, the hardlink warning when applicable. `y` confirms, anything
 /// else cancels — rendering only; the key routing lives in `handle_key`.
+#[cfg(unix)]
 fn draw_confirm_modal(
     frame: &mut Frame<'_>,
     ui: &UiState,
@@ -4049,6 +4331,7 @@ fn draw_confirm_modal(
 /// its path and size, the cursor row picked out, `Space` unmarks it. Only
 /// ever drawn when [`ConfirmState`] is not open (see `draw`'s
 /// precedence), so it never has to reason about that overlap.
+#[cfg(unix)]
 fn draw_review_modal(frame: &mut Frame<'_>, ui: &UiState, review: &ReviewState, ctx: &RenderCtx) {
     let theme = &ctx.theme;
     let marks = ui.marks();
@@ -4127,6 +4410,7 @@ fn draw_review_modal(frame: &mut Frame<'_>, ui: &UiState, review: &ReviewState, 
 /// rendered — the same feedback idiom [`FrameGeometry`] itself uses for
 /// mouse hit-testing. Only ever drawn when neither the confirm nor the
 /// review modal is open (D5's precedence, see `draw`).
+#[cfg(unix)]
 fn draw_freeable_modal(frame: &mut Frame<'_>, ui: &UiState, ctx: &RenderCtx) -> usize {
     let theme = &ctx.theme;
     let area = frame.area();
@@ -4279,6 +4563,7 @@ fn draw_freeable_modal(frame: &mut Frame<'_>, ui: &UiState, ctx: &RenderCtx) -> 
 /// way the rest of the UI does. `ERROR` is deliberate for the bottom rung:
 /// an estimate that may overstate, right before an irreversible deletion,
 /// has earned the alarm color.
+#[cfg(unix)]
 fn verdict_line<'a>(verdict: &Verdict, theme: &Theme) -> Line<'a> {
     let slot = match verdict.level() {
         Confidence::Measured => theme::GOOD,
@@ -4340,7 +4625,7 @@ fn draw_cheatsheet_modal(frame: &mut Frame<'_>, ctx: &RenderCtx) {
     for key in keymap::SIMPLE {
         lines.push(key_line(key.keys, key.action));
     }
-    for key in keymap::EXTRA {
+    for key in keymap::extra() {
         lines.push(key_line(key.keys, key.action));
     }
     lines.push(Line::default());
@@ -4935,6 +5220,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     /// Post-scan, the errors card gains a severity-ordered per-errno
     /// breakdown line built from the frozen tree's side-table (issue #8).
     /// Needs a genuinely unreadable directory, so it is meaningful only for
@@ -5121,14 +5407,17 @@ mod tests {
 
     /// [`render`] at a chosen color rung, for the "does this still read
     /// with no color at all?" checks.
+    #[cfg(unix)]
     fn render_at(ui: &UiState, color: ColorLevel) -> String {
         render_with_caps(ui, &[], None, color)
     }
 
+    #[cfg(unix)]
     fn render(ui: &UiState, toasts: &[String], flash: Option<&str>) -> String {
         render_with_caps(ui, toasts, flash, ColorLevel::Truecolor)
     }
 
+    #[cfg(unix)]
     fn render_with_caps(
         ui: &UiState,
         toasts: &[String],
@@ -5166,6 +5455,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(unix)]
     /// No marks: no basket strip glyph anywhere (design slice 4 — the
     /// layout must not jump for users who never mark anything). One
     /// mark: the strip shows up with the count and size.
@@ -5184,6 +5474,7 @@ mod tests {
         assert!(content.contains("1 item"), "singular noun for one entry");
     }
 
+    #[cfg(unix)]
     #[test]
     fn basket_strip_pluralizes_and_sums_several_marks() {
         let mut ui = UiState::new(markable_snapshot());
@@ -5193,6 +5484,7 @@ mod tests {
         assert!(content.contains("2 items"), "plural noun for two entries");
     }
 
+    #[cfg(unix)]
     /// Toasts render top-right and are skipped outright while the
     /// confirm modal is open (must not obstruct it).
     #[test]
@@ -5212,6 +5504,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     /// Freeable phase 2 D4: `Pending` keeps the phase-1 qualitative
     /// hardlink note (it is the only figure known so far) and adds the
     /// spinner line — attack-a finding [1]'s "computing…" state.
@@ -5231,6 +5524,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     /// `Ready` replaces the phase-1 qualitative hardlink sentence with the
     /// quantified D4 wording and any caveats — the redesigned in-place
     /// update contract (attack-a finding [1]).
@@ -5262,6 +5556,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     /// The review list renders the marked path and its "row N of M" note
     /// once there are more marks than fit — and never panics at
     /// degenerate terminal sizes.
@@ -5302,6 +5597,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     /// The `?` cheatsheet lists entries from every `keymap` table (the
     /// generated-from-one-table guarantee, visible at the render layer)
     /// and never panics at degenerate sizes.
@@ -5404,8 +5700,7 @@ mod tests {
         // helper synchronous.
         let mut palette_rt = PaletteRuntime::new(Vec::new());
         let flat_config = FlatConfig::default();
-        let mut oracle_rt = oracle::OracleRuntime::new(true);
-        let mut floor_rt = floor_rt::FloorRuntime::new(false);
+        let mut reclaim = Reclaim::new(true);
         handle_key(
             code,
             KeyModifiers::NONE,
@@ -5417,11 +5712,11 @@ mod tests {
             false, // no_proc_sweep: not under test here
             &mut palette_rt,
             &flat_config,
-            &mut oracle_rt,
-            &mut floor_rt,
+            &mut reclaim,
         )
     }
 
+    #[cfg(unix)]
     /// `v` opens the review list; `D` from inside it closes the list and
     /// opens the same delete-confirmation modal `D` opens from the main
     /// view — "D from within the review list should work too".
@@ -5609,6 +5904,7 @@ mod tests {
         assert_eq!(flash.current(), Some(SORT_NOT_APPLICABLE));
     }
 
+    #[cfg(unix)]
     /// The attack's exact scenario (finding 1): mark a flat row, delete it
     /// *from within* flat mode, and confirm the very next render-time
     /// check recomputes the summary — the deleted file must never appear
@@ -5734,6 +6030,7 @@ mod tests {
         assert!(!ui.cheatsheet_open());
     }
 
+    #[cfg(unix)]
     /// Modal precedence (confirm > review > cheatsheet): once the confirm
     /// modal is open, every key belongs to it alone — `v`/`?` do not leak
     /// through and open another modal underneath.
@@ -5760,6 +6057,7 @@ mod tests {
         assert!(ui.review().is_none(), "and never opened review instead");
     }
 
+    #[cfg(unix)]
     /// While the review list is open, `?` is not handled by it (only
     /// move/unmark/`D`/`v`/`Esc` are) — it is silently ignored rather
     /// than leaking through to open the cheatsheet underneath.
@@ -5784,6 +6082,7 @@ mod tests {
 
     // ---- `f` freeable panel (freeable phase 1) ----
 
+    #[cfg(unix)]
     /// `f` opens the panel from the main view; `f`/`Esc` closes it, same
     /// shape as the cheatsheet's own open/close test.
     #[test]
@@ -5812,6 +6111,7 @@ mod tests {
         assert!(!ui.freeable_open(), "Esc closed it");
     }
 
+    #[cfg(unix)]
     /// D5's precedence (confirm > review > freeable panel > cheatsheet):
     /// with the confirm modal open, `f` is just another non-`y` cancel key
     /// — it never leaks through to open the panel underneath.
@@ -5836,6 +6136,7 @@ mod tests {
         assert!(!ui.freeable_open(), "never opened the panel underneath");
     }
 
+    #[cfg(unix)]
     /// While the freeable panel is open, `?` does not leak through to the
     /// cheatsheet underneath (same non-leaking guarantee as the review
     /// list's own test).
@@ -5857,6 +6158,7 @@ mod tests {
         assert!(!ui.cheatsheet_open(), "? did not leak through to it");
     }
 
+    #[cfg(unix)]
     /// A real deleted-open file (same "gold case" technique as
     /// `camembert_core::freeable`'s own tests): once swept into the
     /// ledger, the disk gauge grows a clickable "· X.X GiB freeable"
@@ -5909,6 +6211,7 @@ mod tests {
         drop(file);
     }
 
+    #[cfg(unix)]
     /// D6 amendment's primary real-world scenario, with a real open fd:
     /// marking a *directory* (a database's data directory, in spirit)
     /// whose own `(dev, ino)` is never open, but a file *inside* it is.
@@ -5967,6 +6270,7 @@ mod tests {
         drop(file);
     }
 
+    #[cfg(unix)]
     /// A sibling directory named to collide at the byte level ("data-old"
     /// starts with "data") must never be treated as contained by a mark on
     /// "data" — same path-boundary rule as the panel's ancestor grouping,
@@ -6017,6 +6321,7 @@ mod tests {
         drop(file);
     }
 
+    #[cfg(unix)]
     /// Before the sweep lands, the panel shows an explanatory empty state
     /// rather than nothing — and the message differs when
     /// `--no-proc-sweep`/`NO_PROC_SWEEP` is why there is no data at all.
@@ -6078,6 +6383,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     /// The confidence verdict is a headline **above** the detail lines,
     /// in both places a freeable figure drives a decision — it never
     /// replaces a caveat, and the graded word is plain text so a
@@ -6128,6 +6434,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     /// A pending oracle is a confidence signal ("not known yet"), never an
     /// error and never a graded-but-weak figure — and the spinner line it
     /// already had stays put underneath.
@@ -6151,6 +6458,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     /// `--no-fiemap` shows nothing rather than a fallback figure
     /// (freeable2 D3) — the verdict names the absence instead of leaving
     /// the modal silently short of a number.

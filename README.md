@@ -146,6 +146,63 @@ build from source if you need PIE on ARM64.
 `camembert --version` embeds the exact commit it was built from (e.g.
 `camembert 0.3.0 (abc1234)`), so you can always tell what you're running.
 
+## Platform support
+
+Linux is the primary target and gets everything below. **Windows builds and
+runs a reduced interface**: `cargo install --path camembert` on
+`x86_64-pc-windows-msvc` (no prebuilt binary yet). It scans with a
+path-based walker, deduplicates hardlinks, and drives almost the whole
+interactive UI.
+
+Identical on both: the directory table, the donut wheel, the disk gauge
+(`GetDiskFreeSpaceExW` in place of `statvfs`), navigation, sorting, the `p`
+apparent-size toggle, zen mode, flat view (`t`), the pattern breakdown
+(`b`), the Ctrl-K/`/` palette and the full query grammar, themes, mouse and
+the `?` cheatsheet — plus `--no-ui`, `--output`, `camembert diff` and
+`camembert import`.
+
+**Absent on Windows, compiled out rather than disabled** — the keys do not
+exist, `?` does not list them, the palette does not offer them and the
+footer never names them:
+
+- **Deletion, entirely**: `Space` mark, `u` clear, `v` review, `D` delete,
+  and the basket strip. Not a platform limit so much as a refusal to guess:
+  camembert stores names as bytes, and decoding them back for a Windows
+  delete call needs a real WTF-8 encoder. Lossy is fine for display; it is
+  a wrong-file-deleted bug for anything that touches disk.
+- **[Freeable](#freeable-deleted-but-open-files)** — the `f` panel and the
+  gauge's "· N freeable" suffix. Structural: it reads `/proc/[pid]/fd`, and
+  Windows has no equivalent.
+- **[The reclaim oracle](#reclaim-oracle-freeable-phase-2)** and its
+  ambient exclusive floor — no confidence verdict, no `excl ≥ …` card line,
+  no bright in-bar segment. Both need `FS_IOC_FIEMAP`, a Linux-only ioctl.
+
+`--no-proc-sweep`/`NO_PROC_SWEEP` and `--no-fiemap`/`NO_FIEMAP` are
+therefore accepted but inert on Windows: there is nothing left to switch
+off.
+
+**Numbers differ in ways worth knowing before trusting one:**
+
+- Sizes come from `AllocationSize`, the NTFS analogue of `st_blocks` — it
+  does account for NTFS compression.
+- **Alternate data streams are invisible.** Every size is the unnamed
+  `$DATA` stream, so a file with a 2 GiB ADS reports as small. Explorer has
+  counted ADS since 8.1; camembert does not yet.
+- **Directories have no self-size.** Windows reports `AllocationSize = 0`
+  for a directory, where Linux reports real bytes. Subtree totals are
+  unaffected; a directory's own size is always 0.
+- **Junctions and volume mount points are refused, never descended**, with
+  or without `--one-filesystem`: a junction can point at its own ancestor
+  and there is no cycle detection yet. A junction-heavy tree under-counts.
+  Symlinks are recorded and not followed, exactly as on Linux.
+- **File identity is exact on NTFS, folded on ReFS.** ReFS splits its
+  128-bit file id between "which directory" and "which file in it", so the
+  hardlink key folds the two halves; camembert says so at runtime rather
+  than implying NTFS-grade precision.
+
+The full design, including what it still gets wrong, is in
+[`docs/design/windows-backend-design.md`](docs/design/windows-backend-design.md).
+
 ## Quick start
 
 ```bash
@@ -282,6 +339,10 @@ has proven itself.
 | `z` | toggle zen mode: table only — no metric cards, disk gauge or donut wheel |
 | `Esc` | close the palette, else a modal, else leave a flat/breakdown mode, else clear an active filter, else go up one directory like `Left` (contextual — never quits; quitting is `q`/`Ctrl-C`) |
 | `q` | quit unconditionally (cancels a running scan); inside the palette, only `Ctrl-C` quits — every other key, `q` included, is text |
+
+On Windows, `Space`, `u`, `v`, `D` and `f` are not in this table at all —
+no key, no cheatsheet row, no footer hint. Everything else, the palette
+included, is unchanged. See [Platform support](#platform-support).
 
 **Deletion is guarded**: mark-then-confirm, mount points refused, every
 entry re-checked (existence, file type, device) immediately before
@@ -504,6 +565,9 @@ the whole scan, always; filtering is a view, not a subset export.
 
 ## Freeable (deleted-but-open files)
 
+*Linux only — the whole feature is built on `/proc/[pid]/fd`. See
+[Platform support](#platform-support).*
+
 A process can `unlink` a file and keep writing to it: the name is gone,
 `du` (and camembert's own tree) has no path left to attribute the space
 to, but the inode's blocks stay allocated until the last open descriptor
@@ -598,6 +662,9 @@ purpose, and a figure that is exact for what it claims is not a doubtful
 one.
 
 ## Reclaim oracle (freeable phase 2)
+
+*Linux only — the oracle and the ambient exclusive floor below both need
+`FS_IOC_FIEMAP`. See [Platform support](#platform-support).*
 
 Deleting a selection doesn't always free `Σ disk`: on extent-sharing
 filesystems the same physical bytes can back a `cp --reflink` copy or a

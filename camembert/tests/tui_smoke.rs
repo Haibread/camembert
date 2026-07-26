@@ -22,6 +22,23 @@
 //! `portable-pty` is a dev-dependency of this crate only (see
 //! `camembert/Cargo.toml`); no production code changed to make this
 //! possible.
+//!
+//! **Unix only, for a harness reason rather than a product one.** The TUI
+//! itself runs on Windows: verified by hand on Windows Server 2022,
+//! driving the real binary through OpenSSH's ConPTY — full dashboard,
+//! keyboard navigation, clean terminal restore on `q`. Under
+//! `portable_pty`'s ConPTY on that same box, though, the master side
+//! receives exactly four bytes — `\x1b[6n`, the pseudoconsole's own
+//! cursor-position handshake — and then nothing, so every [`wait_for`]
+//! below times out before the child's first frame arrives. The harness is
+//! where it wedges, not the binary: the test process outlived its own
+//! watchdog (which only holds a kill handle on the *child*) and stayed
+//! resident afterwards, holding its executable open until killed by hand.
+//! Which side of that ConPTY plumbing swallows the output was not run to
+//! ground; what is established is that the same binary renders fine
+//! through a ConPTY with a terminal attached. Re-enabling this on Windows
+//! is a harness question, not an `event_loop` one.
+#![cfg(unix)]
 
 use std::io::{Read, Write};
 use std::path::Path;

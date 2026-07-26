@@ -25,6 +25,16 @@ tracing-subscriber = { workspace = true }
 libc = "0.2"
 rustix = { version = "1.1.4", features = ["fs", "termios"] }
 
+# Only the disk gauge needs Win32 here: `statvfs` has no Windows analogue,
+# so `ui::disk_space` calls `GetDiskFreeSpaceExW`. Kept to the two feature
+# groups that call needs — the scan engine's wider set lives in
+# camembert-core, which owns every other Windows syscall.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+
 [dev-dependencies]
 portable-pty = "0.9.0"
 serde_json = { workspace = true }

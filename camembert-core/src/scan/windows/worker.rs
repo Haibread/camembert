@@ -13,9 +13,9 @@
 //! - **One listing call replaces `getdents64` + n × `statx`.**
 //!   `GetFileInformationByHandleEx(FileIdExtdDirectoryInfo)` returns name,
 //!   both sizes, attributes, reparse tag and a 128-bit file id per entry,
-//!   for zero per-entry syscalls. The rejected alternative — `CreateFileW`
-//!   + `GetFileInformationByHandle` + `CloseHandle` per entry — is 20-200×
-//!   more expensive per published measurements.
+//!   for zero per-entry syscalls. The rejected alternative
+//!   (`CreateFileW` + `GetFileInformationByHandle` + `CloseHandle` per
+//!   entry) is 20-200× more expensive per published measurements.
 //! - **Only the link count still costs a call**, and only for plain files:
 //!   [`query_nlink`] via `NtQueryInformationByName(FileStatInformation)`,
 //!   which its own Remarks describe as working "without opening the actual
@@ -311,7 +311,7 @@ fn process_job(
 /// mid-`getdents` behaviour.
 fn enumerate(ctx: &JobCtx<'_>, section: &mut Section, buf: &mut [u64], tx: &Sender<Batch>) -> bool {
     let raw: HANDLE = ctx.handle.as_raw_handle().cast();
-    let byte_len = buf.len() * size_of::<u64>();
+    let byte_len = size_of_val(buf);
     loop {
         // SAFETY: `raw` is borrowed from the live `OwnedHandle` in `ctx`,
         // opened with FILE_LIST_DIRECTORY. The buffer is a live `&mut [u64]`
@@ -380,7 +380,7 @@ fn walk_buffer(
         };
         let name_bytes = info.FileNameLength as usize;
         let name_end = offset + NAME_OFFSET + name_bytes;
-        if name_bytes % 2 != 0 || name_end > byte_len {
+        if !name_bytes.is_multiple_of(2) || name_end > byte_len {
             warn!(
                 token = ctx.token,
                 name_bytes, "listing name runs past the buffer"

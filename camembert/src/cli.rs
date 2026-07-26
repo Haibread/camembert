@@ -218,7 +218,8 @@ pub(crate) struct ScanArgs {
     /// confirmation — for paranoid environments and containers with a
     /// masked /proc. Like NO_MOTION, any value at all counts as set, even
     /// the empty string; there is no camembert.toml key for this (see the
-    /// README's Freeable section).
+    /// README's Freeable section). Accepted but inert on Windows, which has
+    /// no /proc to sweep — the whole feature is absent there.
     #[arg(long = "no-proc-sweep")]
     pub(crate) no_proc_sweep: bool,
 
@@ -234,7 +235,8 @@ pub(crate) struct ScanArgs {
     /// `open`+FIEMAP cost on a large selection isn't wanted. Like
     /// NO_PROC_SWEEP, any value at all counts as set, even the empty
     /// string; there is no camembert.toml key for this (see the README's
-    /// Reclaim oracle section).
+    /// Reclaim oracle section). Accepted but inert on Windows: FIEMAP is a
+    /// Linux ioctl, so neither the oracle nor the floor exists there.
     #[arg(long = "no-fiemap")]
     pub(crate) no_fiemap: bool,
 
@@ -409,6 +411,21 @@ Modes:
   --top largest files (D5; same flag, both lists) -- suppressed like the
   rest of the summary text when --output - streams the dump to stdout.
 
+Platform:
+  Linux gets every feature documented here. Windows builds and runs a
+  reduced interface: scanning, the table, the donut wheel, the disk
+  gauge, navigation, sorting, flat view, the pattern breakdown, the
+  filter/command palette, themes, mouse, --no-ui, --output, diff and
+  import all behave the same. Absent there, compiled out rather than
+  disabled (no key, no cheatsheet row, no footer hint, no palette
+  command): deletion in full (Space/u/v/D and the basket strip), the
+  freeable panel (f) and the gauge's freeable suffix, and the reclaim
+  oracle's verdict plus the ambient exclusive floor. --no-proc-sweep and
+  --no-fiemap are accepted but inert on Windows. Windows sizes come from
+  AllocationSize, alternate data streams are not counted, directories
+  have no self-size, and junctions are refused rather than descended --
+  see the README's Platform support section.
+
 Look & feel (interactive mode):
   Colors and glyphs adapt to the terminal: truecolor -> 256 -> 16 -> mono
   (NO_COLOR honored, --color overrides), and sextant wheel -> half-block
@@ -538,6 +555,9 @@ Keys (interactive mode):
                    pressing y confirms, any other key cancels
   f                freeable files: deleted-but-open files still holding
                    disk space (see Freeable below); f or Esc closes it
+                   (Space, u, v, D and f are Linux-only -- see Platform
+                   below; on Windows they are not bound at all and the ?
+                   cheatsheet does not list them)
   Ctrl-K, /        open the filter/command palette (see Filtering below)
   ?                show the keyboard/mouse cheatsheet; ? or Esc closes it
   z                toggle zen mode: table only (no metric cards, disk

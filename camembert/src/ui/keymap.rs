@@ -126,7 +126,13 @@ pub fn dispatch_simple(code: KeyCode, ui: &mut UiState) -> bool {
     false
 }
 
-pub const EXTRA: &[ExtraKey] = &[
+/// The documented extra keys, in cheatsheet order. Split in three so the
+/// reclaim block can be `cfg`-gated without moving the surrounding rows:
+/// [`extra`] stitches them back together, and on a platform without the
+/// subsystem the middle slice is simply empty, so `?` never lists a key
+/// that does nothing. Order matters — it is the order the cheatsheet and
+/// the README's key table share.
+const EXTRA_BEFORE_RECLAIM: &[ExtraKey] = &[
     ExtraKey {
         keys: "d",
         action: "sort by real (disk) size [default; tree/flat/breakdown]",
@@ -159,6 +165,12 @@ pub const EXTRA: &[ExtraKey] = &[
         keys: "⌫/h/←",
         action: "go back up to the parent [tree only]",
     },
+];
+
+/// The mark/delete/review/freeable block — present only where the reclaim
+/// subsystem is (see the `mod` gates in `ui.rs`).
+#[cfg(unix)]
+const EXTRA_RECLAIM: &[ExtraKey] = &[
     ExtraKey {
         keys: "Space",
         action: "mark/unmark the row under the cursor for deletion [tree/flat]",
@@ -179,6 +191,12 @@ pub const EXTRA: &[ExtraKey] = &[
         keys: "f",
         action: "freeable files: deleted-but-open files holding disk space (f/Esc closes)",
     },
+];
+
+#[cfg(not(unix))]
+const EXTRA_RECLAIM: &[ExtraKey] = &[];
+
+const EXTRA_AFTER_RECLAIM: &[ExtraKey] = &[
     ExtraKey {
         keys: "Ctrl-K, /",
         action: "open the filter/command palette (query-first; > switches to commands; \
@@ -194,6 +212,14 @@ pub const EXTRA: &[ExtraKey] = &[
         action: "quit (cancels a running scan); inside the palette only Ctrl-C quits",
     },
 ];
+
+/// Every extra key the platform actually binds, in cheatsheet order.
+pub fn extra() -> impl Iterator<Item = &'static ExtraKey> {
+    EXTRA_BEFORE_RECLAIM
+        .iter()
+        .chain(EXTRA_RECLAIM)
+        .chain(EXTRA_AFTER_RECLAIM)
+}
 
 pub const MOUSE: &[ExtraKey] = &[
     ExtraKey {

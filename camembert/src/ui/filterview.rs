@@ -129,7 +129,11 @@ mod tests {
         let text = pill_text("*.log", &result, true);
         assert!(text.contains("/ *.log"));
         assert!(text.contains("1 matched"));
-        assert!(text.contains("directory inode"));
+        // The residual is the scanned directory's own bytes, which the
+        // Windows backend reports as 0 (`AllocationSize` is 0 for a
+        // directory there — see `docs/design/windows-backend-design.md`
+        // §7), so there is nothing for the line to explain.
+        assert_eq!(text.contains("directory inode"), cfg!(unix));
         assert!(text.ends_with("Esc clears"));
     }
 }

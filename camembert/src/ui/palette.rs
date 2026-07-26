@@ -62,11 +62,18 @@ pub struct PaletteCommand {
 /// extra context (`Phase`, the flash queue, `no_proc_sweep`) and are
 /// executed by `ui.rs` alongside its existing hand-written key handlers
 /// for the same actions.
+///
+/// The three reclaim actions are `cfg(unix)`: on a platform without the
+/// subsystem there is nothing to review, delete or free, so the palette
+/// must not be able to name them — see the `mod` gates in `ui.rs`.
 #[derive(Clone, Copy)]
 pub enum CommandAction {
     Simple(fn(&mut UiState)),
+    #[cfg(unix)]
     ReviewMarks,
+    #[cfg(unix)]
     DeleteMarked,
+    #[cfg(unix)]
     FreeablePanel,
     ClearFilter,
     Quit,
@@ -90,6 +97,7 @@ pub fn all_commands() -> Vec<PaletteCommand> {
             action: CommandAction::Simple(key.apply),
         })
         .collect();
+    #[cfg(unix)]
     commands.extend([
         PaletteCommand {
             label: "review marked entries",
@@ -106,6 +114,8 @@ pub fn all_commands() -> Vec<PaletteCommand> {
             hint: "f",
             action: CommandAction::FreeablePanel,
         },
+    ]);
+    commands.extend([
         PaletteCommand {
             label: "clear active filter",
             hint: "Esc",
@@ -512,9 +522,24 @@ mod tests {
 
     #[test]
     fn all_commands_includes_every_simple_row_and_the_extras() {
+        // Two extras everywhere, plus the three reclaim commands where the
+        // subsystem exists.
+        let extras = if cfg!(unix) { 5 } else { 2 };
         let commands = all_commands();
-        assert_eq!(commands.len(), keymap::SIMPLE.len() + 5);
+        assert_eq!(commands.len(), keymap::SIMPLE.len() + extras);
         assert!(commands.iter().any(|c| c.label == "quit"));
         assert!(commands.iter().any(|c| c.label == "clear active filter"));
+    }
+
+    /// The palette must never offer a command the platform cannot run: on
+    /// a build without the reclaim subsystem there is no `D`/`v`/`f` key
+    /// either, so naming them here would be advertising a dead end.
+    #[test]
+    fn reclaim_commands_only_exist_where_the_subsystem_does() {
+        let commands = all_commands();
+        let named = commands
+            .iter()
+            .any(|c| c.label == "delete marked entries" || c.label == "freeable files panel");
+        assert_eq!(named, cfg!(unix));
     }
 }

@@ -3,20 +3,30 @@
 //! (HANDOFF §5). No terminal types anywhere — everything here is
 //! unit-testable with synthetic snapshots.
 
+// `HashSet` backs the mark set, `PathBuf` a marked entry's display path
+// and `Instant` the floor snapshot's timestamp — all three reclaim-only.
+#[cfg(unix)]
 use std::collections::HashSet;
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::sync::Arc;
+#[cfg(unix)]
 use std::time::Instant;
 
+#[cfg(unix)]
 use camembert_core::delete::InodeId;
+#[cfg(unix)]
 use camembert_core::fiemap::FloorMap;
 use camembert_core::flat::FlatSummary;
+#[cfg(unix)]
 use camembert_core::freeable::Ledger;
 use camembert_core::query::FilterResult;
 use camembert_core::tree::{DirId, NodeId};
 use camembert_core::view::{Row, ViewSnapshot};
 
+#[cfg(unix)]
 use super::freeable_panel::{FreeableGroup, OpenWarning};
+#[cfg(unix)]
 use super::oracle::OracleSlot;
 use super::palette::PaletteState;
 
@@ -93,6 +103,7 @@ impl SortSpec {
 /// possible once the scan completed, when the arena (and therefore every
 /// row's node id, path, and aggregates) is frozen. A marked directory is
 /// the unit: its subtree is implied, there are no per-descendant marks.
+#[cfg(unix)]
 #[derive(Debug, Clone)]
 pub struct MarkedEntry {
     /// The row's node in the frozen arena.
@@ -112,6 +123,7 @@ pub struct MarkedEntry {
 }
 
 /// Why a mark keypress was refused (shown as a footer flash).
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkRefusal {
     /// Marks are inactive until the scan completes: deletion mutates the
@@ -145,6 +157,7 @@ pub struct ActiveFilter {
 /// State of the delete-confirmation modal, opened by
 /// [`UiState::open_confirm`]. While it exists, every key belongs to the
 /// modal: `y` confirms, anything else cancels.
+#[cfg(unix)]
 #[derive(Debug, Clone)]
 pub struct ConfirmState {
     /// Hardlinked files among the marked selection (incl. inside marked
@@ -169,6 +182,7 @@ pub struct ConfirmState {
 /// Modal precedence is confirm > review > cheatsheet — `ui.rs` only opens
 /// this when the confirm modal is not already up, and closes it before
 /// opening confirm from within the list (`D`).
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ReviewState {
     /// Position in [`UiState::marks`] (mark order) under the cursor.
@@ -197,12 +211,14 @@ pub struct FrameGeometry {
     /// The disk gauge's screen rect `(x, y, width, height)`, when the
     /// freeable suffix is showing (D5: clickable, opens the `f` panel).
     /// `None` when there is nothing freeable to click through to.
+    #[cfg(unix)]
     pub gauge_freeable: Option<(u16, u16, u16, u16)>,
     /// Total content rows the freeable panel drew this frame, when it was
     /// open — fed back into [`UiState::clamp_freeable_cursor`] right after
     /// the frame is drawn (same feedback idiom as `set_geometry` itself),
     /// so the scroll cursor can never run away past what was actually
     /// rendered. `None` while the panel is closed.
+    #[cfg(unix)]
     pub freeable_rows: Option<usize>,
 }
 
@@ -294,6 +310,7 @@ impl FrameGeometry {
     /// Whether `(col, row)` falls inside the disk gauge's freeable suffix
     /// (D5: clicking it opens the `f` panel, same rect as the whole gauge
     /// line for a generous, simple hit target).
+    #[cfg(unix)]
     pub fn gauge_freeable_hit(&self, col: u16, row: u16) -> bool {
         matches!(
             self.gauge_freeable,
@@ -344,12 +361,16 @@ pub struct UiState {
     pub show_apparent: bool,
     /// Rows marked for deletion, in mark order (drives the confirm
     /// dialog's path list). Marks persist across navigation.
+    #[cfg(unix)]
     marks: Vec<MarkedEntry>,
     /// Same nodes, for O(1) `is_marked` at render time.
+    #[cfg(unix)]
     marked_set: HashSet<NodeId>,
     /// `Some` while the delete-confirmation modal is open.
+    #[cfg(unix)]
     confirm: Option<ConfirmState>,
     /// `Some` while the `v` review-list modal is open.
+    #[cfg(unix)]
     review: Option<ReviewState>,
     /// Whether the `?` cheatsheet overlay is open. No extra data, unlike
     /// the other two modals, so a plain flag is enough.
@@ -378,18 +399,22 @@ pub struct UiState {
     /// tree nodes or view-snapshot data. `None` until the post-scan sweep
     /// lands (or forever, under `--no-proc-sweep`/`NO_PROC_SWEEP` or a
     /// dump-loaded session, D7).
+    #[cfg(unix)]
     freeable: Option<Ledger>,
     /// Root-fs entries grouped display-only under their deepest
     /// still-existing ancestor (D5) — built lazily the first time the `f`
     /// panel opens (needs the frozen tree's live directory paths) and
     /// cached here; invalidated whenever a new ledger lands.
+    #[cfg(unix)]
     freeable_groups: Vec<FreeableGroup>,
     /// Whether `freeable_groups` reflects the current `freeable` ledger —
     /// distinct from "groups is empty", which can legitimately happen when
     /// there are zero root-fs entries.
+    #[cfg(unix)]
     freeable_groups_built: bool,
     /// Whether the `f` freeable panel is open. Modal precedence (D5) is
     /// confirm > review > freeable panel > cheatsheet.
+    #[cfg(unix)]
     freeable_open: bool,
     /// Scroll position in the freeable panel's flat content-row list.
     /// Clamped every frame from [`FrameGeometry::freeable_rows`] (see
@@ -397,6 +422,7 @@ pub struct UiState {
     /// never needs to know the panel's rendered row count itself — the
     /// same feedback idiom `set_geometry` already uses for mouse
     /// hit-testing.
+    #[cfg(unix)]
     freeable_cursor: usize,
     /// Active table mode (D3): tree, flat top files, or pattern breakdown.
     mode: ViewMode,
@@ -436,6 +462,7 @@ pub struct UiState {
     /// transiently while a deletion's respawned pass is still in flight
     /// (the stale map is dropped rather than shown against a tree it no
     /// longer describes — [`Self::clear_floor`]).
+    #[cfg(unix)]
     floor: Option<(Arc<FloorMap>, Instant)>,
 }
 
@@ -452,25 +479,35 @@ impl UiState {
             pending_focus_node: None,
             stack: Vec::new(),
             show_apparent: true,
+            #[cfg(unix)]
             marks: Vec::new(),
+            #[cfg(unix)]
             marked_set: HashSet::new(),
+            #[cfg(unix)]
             confirm: None,
+            #[cfg(unix)]
             review: None,
             cheatsheet_open: false,
             hover: None,
             geometry: FrameGeometry::default(),
             zen: false,
             view_change_seq: 0,
+            #[cfg(unix)]
             freeable: None,
+            #[cfg(unix)]
             freeable_groups: Vec::new(),
+            #[cfg(unix)]
             freeable_groups_built: false,
+            #[cfg(unix)]
             freeable_open: false,
+            #[cfg(unix)]
             freeable_cursor: 0,
             mode: ViewMode::default(),
             flat: None,
             flat_epoch: 0,
             palette: None,
             filter: None,
+            #[cfg(unix)]
             floor: None,
         };
         state.ensure_sorted();
@@ -725,7 +762,15 @@ impl UiState {
     pub fn toggle_apparent(&mut self) {
         self.show_apparent = !self.show_apparent;
     }
+}
 
+/// Everything the mark-then-confirm deletion flow, the `v` review list,
+/// the `f` freeable panel and the ambient exclusive floor keep in the UI
+/// state. Split into its own `impl` block rather than gated method by
+/// method: the whole subsystem is `cfg(unix)` (see the `mod` gates in
+/// `ui.rs`), and one boundary is easier to keep honest than thirty.
+#[cfg(unix)]
+impl UiState {
     // ---- mark-then-confirm deletion (HANDOFF §5) ----
 
     /// Mark/unmark the row under the cursor, then move down one (like
@@ -945,7 +990,9 @@ impl UiState {
             self.review = Some(ReviewState { cursor });
         }
     }
+}
 
+impl UiState {
     // ---- `?` cheatsheet (design slice 4) ----
 
     pub fn cheatsheet_open(&self) -> bool {
@@ -959,7 +1006,15 @@ impl UiState {
     pub fn close_cheatsheet(&mut self) {
         self.cheatsheet_open = false;
     }
+}
 
+/// Everything the mark-then-confirm deletion flow, the `v` review list,
+/// the `f` freeable panel and the ambient exclusive floor keep in the UI
+/// state. Split into its own `impl` block rather than gated method by
+/// method: the whole subsystem is `cfg(unix)` (see the `mod` gates in
+/// `ui.rs`), and one boundary is easier to keep honest than thirty.
+#[cfg(unix)]
+impl UiState {
     // ---- `f` freeable panel (freeable phase 1, D4/D5) ----
 
     /// Adopt a freshly-swept ledger (called once the scan-end sweep's
@@ -1071,7 +1126,9 @@ impl UiState {
     pub fn clear_floor(&mut self) {
         self.floor = None;
     }
+}
 
+impl UiState {
     fn ensure_sorted(&mut self) {
         let filter_id = self
             .filter
@@ -1221,6 +1278,7 @@ impl UiState {
     /// render-time check in `ui.rs` recomputes the flat/breakdown summary
     /// before drawing — never showing a just-deleted row as still
     /// occupying space (attack finding 1).
+    #[cfg(unix)]
     pub fn bump_flat_epoch(&mut self) {
         self.flat_epoch += 1;
     }
@@ -1259,6 +1317,7 @@ impl UiState {
     /// i.e. the caller already has a [`camembert_core::scan::ScanOutcome`]
     /// in hand). Regular files only (D3), so there is no mount-point
     /// refusal to make here.
+    #[cfg(unix)]
     pub fn toggle_mark_flat(
         &mut self,
         node: NodeId,
@@ -1824,6 +1883,7 @@ mod tests {
 
     /// Marking test fixture: big (file, node 1), sub (dir, node 2), mnt
     /// (excluded mount, node 3) — scan complete unless stated otherwise.
+    #[cfg(unix)]
     fn markable_rows() -> Vec<Row> {
         let mut big = file_row(b"big", 100, 100, 0);
         big.node = NodeId::from_raw(1);
@@ -1836,6 +1896,7 @@ mod tests {
         vec![big, sub, mnt]
     }
 
+    #[cfg(unix)]
     #[test]
     fn marking_is_locked_out_while_the_scan_runs() {
         let mut state = UiState::new(snapshot(1, 0, None, markable_rows(), false));
@@ -1848,6 +1909,7 @@ mod tests {
         assert!(state.confirm().is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn marking_toggles_captures_the_path_and_moves_down() {
         let mut state = UiState::new(snapshot(1, 0, None, markable_rows(), true));
@@ -1873,6 +1935,7 @@ mod tests {
         assert_eq!(state.marks().len(), 1);
     }
 
+    #[cfg(unix)]
     #[test]
     fn mount_points_refuse_marks_and_empty_views_are_a_no_op() {
         let mut state = UiState::new(snapshot(1, 0, None, markable_rows(), true));
@@ -1885,6 +1948,7 @@ mod tests {
         assert!(empty.marks().is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn error_rows_stay_markable() {
         let mut err_dir = dir_row(b"locked", 4, 10, 1);
@@ -1895,6 +1959,7 @@ mod tests {
         assert!(state.is_marked(NodeId::from_raw(9)));
     }
 
+    #[cfg(unix)]
     #[test]
     fn marked_summary_sums_count_and_disk() {
         let mut state = UiState::new(snapshot(1, 0, None, markable_rows(), true));
@@ -1907,6 +1972,7 @@ mod tests {
         assert!(!state.is_marked(NodeId::from_raw(1)));
     }
 
+    #[cfg(unix)]
     #[test]
     fn confirm_modal_state_machine() {
         let mut state = UiState::new(snapshot(1, 0, None, markable_rows(), true));
@@ -1935,6 +2001,7 @@ mod tests {
         assert!(!state.is_marked(NodeId::from_raw(1)));
     }
 
+    #[cfg(unix)]
     #[test]
     fn review_refuses_to_open_with_nothing_marked_and_moves_within_bounds() {
         let mut state = UiState::new(snapshot(1, 0, None, markable_rows(), true));
@@ -1959,6 +2026,7 @@ mod tests {
         assert_eq!(state.marks().len(), 2, "closing keeps the marks");
     }
 
+    #[cfg(unix)]
     #[test]
     fn unmark_at_review_cursor_removes_exactly_that_entry_and_closes_when_empty() {
         let mut state = UiState::new(snapshot(1, 0, None, markable_rows(), true));
@@ -1983,6 +2051,7 @@ mod tests {
         assert!(state.marks().is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn unmark_at_review_cursor_without_a_review_open_is_a_no_op() {
         let mut state = UiState::new(snapshot(1, 0, None, markable_rows(), true));
@@ -2087,6 +2156,7 @@ mod tests {
 
     // ---- `f` freeable panel (freeable phase 1) ----
 
+    #[cfg(unix)]
     #[test]
     fn freeable_panel_open_close_and_scroll() {
         let mut state = UiState::new(snapshot(1, 0, None, Vec::new(), true));
@@ -2112,6 +2182,7 @@ mod tests {
         assert!(!state.freeable_open());
     }
 
+    #[cfg(unix)]
     #[test]
     fn freeable_ledger_and_groups_round_trip_and_invalidate() {
         let mut state = UiState::new(snapshot(1, 0, None, Vec::new(), true));
@@ -2139,6 +2210,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn confirm_modal_carries_the_open_file_warning() {
         let mut state = UiState::new(snapshot(1, 0, None, markable_rows(), true));
@@ -2289,6 +2361,7 @@ mod tests {
         assert_eq!(state.cursor(), 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn toggle_mark_flat_marks_a_real_node_and_shares_the_basket() {
         let mut state = UiState::new(snapshot(1, 0, None, Vec::new(), true));
@@ -2313,6 +2386,7 @@ mod tests {
         assert_eq!(state.marked_summary(), None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn toggle_mark_flat_is_locked_while_the_scan_runs() {
         let mut state = UiState::new(snapshot(1, 0, None, Vec::new(), false));
@@ -2377,6 +2451,7 @@ mod tests {
         assert_eq!(state.cursor(), 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn flat_epoch_bumps_independently_of_the_cached_summary() {
         let mut state = UiState::new(snapshot(1, 0, None, Vec::new(), true));
@@ -2459,6 +2534,7 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
     #[test]
     fn directory_marks_are_refused_under_an_active_filter_but_files_are_fine() {
         use camembert_core::flat::PatternSet;

@@ -30,11 +30,13 @@
 //! is a thin, deliberately untested wrapper around them — there is no
 //! tty in a test process to query.
 
+#[cfg(any(unix, test))]
 use std::io::Read;
 #[cfg(unix)]
 use std::io::Write;
 #[cfg(unix)]
 use std::os::fd::AsFd;
+#[cfg(any(unix, test))]
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
@@ -53,6 +55,7 @@ const TIMEOUT: Duration = Duration::from_millis(150);
 /// (`\x1b]11;rgb:ffff/ffff/ffff\x1b\\`) is 26 bytes. Anything longer
 /// without a terminator is garbage — stop reading rather than buffer
 /// unboundedly from a misbehaving terminal (or a user typing).
+#[cfg(any(unix, test))]
 const MAX_REPLY_LEN: usize = 64;
 
 /// Whether attempting the query is even worth it: a pipe (not a tty on
@@ -101,6 +104,7 @@ pub fn is_light(r: u8, g: u8, b: u8) -> bool {
 /// `rgb:RRRR/GGGG/BBBB` (16 bit per channel) and `rgb:RR/GG/BB` (8 bit);
 /// anything else (a different color model, wrong channel count, non-hex
 /// digits, an empty channel) is rejected rather than guessed at.
+#[cfg(any(unix, test))]
 pub fn parse_reply(body: &str) -> Option<(u8, u8, u8)> {
     let rest = body.strip_prefix("rgb:")?;
     let mut parts = rest.split('/');
@@ -125,6 +129,7 @@ pub fn parse_reply(body: &str) -> Option<(u8, u8, u8)> {
 /// or ST (`\x1b\\`). `None` for anything that does not look like an OSC
 /// 11 response at all: garbage, a different OSC number, or a truncated
 /// read that never reached a terminator.
+#[cfg(any(unix, test))]
 pub fn extract_body(raw: &[u8]) -> Option<&str> {
     let text = std::str::from_utf8(raw).ok()?;
     let text = text.strip_prefix("\x1b]11;")?;
@@ -245,6 +250,7 @@ fn read_reply_bounded(timeout: Duration) -> Option<Vec<u8>> {
 /// what a raw-mode fd with `VMIN=0`/`VTIME=1` yields when a `read`
 /// attempt times out — so this loop spins on that at negligible cost
 /// until `deadline`.
+#[cfg(any(unix, test))]
 fn read_until_terminator<R: Read>(reader: &mut R, deadline: Instant) -> Option<Vec<u8>> {
     let mut buf = Vec::with_capacity(32);
     let mut byte = [0u8; 1];
@@ -270,7 +276,11 @@ mod tests {
 
     #[test]
     fn should_query_requires_a_real_terminal_on_both_ends() {
-        assert!(should_query(Some("xterm-256color"), true, true));
+        // The only case that varies by platform: without termios there is
+        // no query to make, so the Windows arm always declines (see
+        // `should_query`'s two definitions above). Every *refusal* below
+        // holds on both.
+        assert_eq!(should_query(Some("xterm-256color"), true, true), cfg!(unix));
         assert!(
             !should_query(Some("xterm-256color"), false, true),
             "stdin not a tty"
