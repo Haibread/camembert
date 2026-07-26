@@ -349,104 +349,102 @@ pitch.
 
 ## Windows port — in progress, started 2026-07-25
 
-Not on the next-steps list below; started on the user's explicit ask.
-Aiming at **tier T1 only**: it compiles, traverses, and shows logical
-sizes. Three slices are merged on `main`, all Linux-invisible (592 tests
-green, warm 200k-file bench 70.8 → 68.3 ms across the seam commit —
-noise, as a pure rename should be).
+Not on the value-ordered list below; started on the user's explicit ask.
+The Win32 details, the API choices and the facts measured on real hardware
+live in
+[windows-backend-design.md](docs/design/windows-backend-design.md) — read
+that before touching any of this. This section is only the state.
 
-Merged: `358e05b` (binary's Unix couplings: SIGPIPE, OSC 11 termios,
-`%APPDATA%`/`%LOCALAPPDATA%`), `b47d898` (platform seam under
-`scan/linux/`, six once-per-scan hooks documented in `scan/linux.rs`),
-`c2a9ccf` (`cfg`-gated modules and deps in core).
+### Where it stands
 
-Remaining, in order — each step compiles and tests green on Linux alone:
+`camembert-core` **compiles and scans on `x86_64-pc-windows-msvc`**: 0
+errors, 0 warnings, 170 lib tests green there, verified on a rented
+Windows Server 2022 box. Linux is untouched throughout — 595 tests green
+at every commit, and the warm 200k-file bench moved 70.8 -> 68.3 ms across
+the seam commit, which is noise.
 
-1. **`errno::ScanErrno` newtype. Do this before any Windows code.** This
-   is the actual blocker, not traversal. Fifteen of the 25 errnos in
-   `errno.rs`'s TABLE are `#[cfg(not(windows))]` in rustix, and the ten
-   survivors carry *Winsock* values — `Errno::ACCESS` is 10013 there, so
-   the dump spec's documented decimal fallback (§6.4) would silently
-   mis-classify a Linux dump read on Windows. Fix: a crate-local
-   `ScanErrno(i32)` pinned to Linux numbering, `#[cfg(unix)] From<rustix::
-   io::Errno>`, TABLE as integer literals. Same 4 bytes, same wire
-   strings, **no dump-schema change**. Touches `errno.rs`, `tree.rs`,
-   `view.rs`, `scan/message.rs`, `dump.rs`, `dump/read.rs`,
-   `scan/owner.rs:530`, `ui.rs:2663`.
-2. Windows error mapping goes through `io::ErrorKind`, never
-   `raw_os_error()`: Win32 `ERROR_ACCESS_DENIED` is 5, same as `EIO`, so
-   a raw map would report a dying disk for a permission denial. Unmapped
-   kinds emit **no `er` field** — already legal per spec §6.4.
-3. `crate::tree::{os_name_bytes, os_name_from_bytes}` helper for the
-   `OsStr`↔bytes bridge (`tree.rs:475`, `ncdu.rs:109`). Lossy UTF-8 on
-   Windows is fine for display and dump, and is a wrong-file-deleted bug
-   for anything that round-trips to the filesystem — `delete` is
-   `cfg(unix)`, keep it that way until someone writes a WTF-8 encoder.
-4. `scan/windows/worker.rs`, enumerating with `std::fs::read_dir` but
-   taking a `FILE_READ_ATTRIBUTES` handle per entry for the size and
-   link-count facts `std` cannot give (see the decision below). Only one
-   engine either way: there is no Windows analogue of the sync/io_uring
-   split, so `StatxBackend` needs no new variant.
-5. Test suite (`#![cfg(unix)]` on the Unix-shaped files, portable subset
-   runs on both), `windows-latest` CI job, README + `--help`.
+The `camembert` **binary** does not build on Windows yet. That work is in
+flight: 29 errors, all in the TUI layer, all from `delete`/`freeable`/
+`fiemap`/`confidence` imports plus a handful of `std::os::unix` uses.
 
-**Decided 2026-07-26: `windows-sys` is a T1 dependency, not a T2
-follow-up.** The alternative was a `std`-only walker, which had two holes
-that turned out to share one key — `Size::real` has no honest value in
-`std` on Windows, and NTFS hardlinks are real so a `std`-only walk
-double-counts them. `GetFileInformationByHandle` closes both (it returns
-`nNumberOfLinks` and the file index), and `GetCompressedFileSizeW` gives
-a genuine allocated size, so `sem` stays `"blocks"` and hardlink dedup
-stays on. That removes the whole `SizeSemantics` / declared-capability
-workstream the `std`-only route would have needed.
+Merged, in order: `358e05b` binary's Unix couplings; `b47d898` the
+platform seam under `scan/linux/`; `c2a9ccf` `cfg`-gated modules and deps;
+`dccada7` `ScanErrno` (the actual blocker — see below); `ae8dd04` the
+`OsStr` bridge; `9e837fd` the design doc; `afdc727` the windows-2025 CI
+job; `c656ea2` the Windows scan backend.
 
-**Corrected 2026-07-26, same day**, after the Win32 design pass. Two
-things written above were wrong when written:
+### Decisions taken, not to be relitigated without a new element
 
-- *"a HANDLE per entry"* — not the plan. `GetFileInformationByHandleEx`
-  with `FileIdExtdDirectoryInfo` returns name, `EndOfFile`,
-  **`AllocationSize`**, attributes, reparse tag and the 128-bit file ID
-  for the whole directory in one buffered call, no per-entry syscall.
-  Only `NumberOfLinks` is missing, and
-  `NtQueryInformationByName(FileStatInformation)` fetches it "without
-  opening the actual file" (its own Remarks). So the per-directory shape
-  is 1 open + ⌈n/1000⌉ listing calls + n lightweight stats — the same
-  order as Linux's `openat` + `getdents64` + `statx`, not the 20-200×
-  penalty a `CreateFileW` per entry would cost.
-- *"truncated to 64 bits … not guaranteed on ReFS"* — understated to the
-  point of being wrong. MS-FSCC Appendix B fn.11: on ReFS the file ID's
-  **low** 64 bits identify the file's *parent directory*, the high half
-  identifies the file within it. Truncation would give every sibling in a
-  directory the same inode and dedup the whole directory away. So: fold,
-  don't truncate, and only when the high half is non-zero (NTFS documents
-  it as zero, so the common path stays exact and equals the number
-  `fsutil file queryfileid` prints). Surface the fold through
-  `ScanOutcome` so the UI can say identity was folded rather than imply
-  NTFS-grade precision. `dump-format-decisions.md` is not reopened.
+- **`windows-sys` is a T1 dependency** (2026-07-26). A `std`-only walker
+  had two holes sharing one key: `std` exposes neither allocation size nor
+  link count on Windows on stable. So `sem` stays `"blocks"` and hardlink
+  dedup stays on, which is what the thesis requires.
+- **The taxonomy grows non-POSIX rows** (2026-07-26). `ERROR_SHARING_
+  VIOLATION` is the error a Windows scan hits most after access-denied and
+  `EBUSY` does not describe it. Wire name `WIN_SHARING_VIOLATION`, no `E`
+  prefix, numbered from 2^24 so the decimal fallback can never collide
+  with an errno, and unconditional so a Windows-written dump decodes on
+  Linux.
+- **The Windows TUI is reduced, not absent** (2026-07-26). Table, wheel,
+  gauge, navigation, sorting, filtering, flat view, diff, dump and themes
+  survive; deletion, the freeable panel, the confidence verdict and the
+  FIEMAP floor line do not. A feature that cannot work is absent from the
+  keymap and the help, never present-and-failing.
 
-Also refuse the two sentinels: an all-`0xFF` ID means "no unique ID
-available" and an all-zero one means the filesystem issues no IDs
-(FAT/exFAT/UDF). Both mean *unknown* — force `nlink` to 1. Reading them
-as inodes would turn every file on a scanned USB stick into one hardlink
-group.
+### Why `errno.rs` was the blocker, in case it comes up again
 
-Also worth stating in the README when this lands: Windows T1 is a
-**path-based** walker, not a port of the fd-relative one. It reintroduces
-`MAX_PATH` (mitigable by canonicalizing the root so std applies `\\?\`,
-not by construction) and loses the `O_NOFOLLOW` TOCTOU closure — skipping
-reparse points, which is the plan, contains that. And there is no
-cross-check partner on Windows: `tests/statx_engine.rs` and the
-`MetadataExt` oracle in `tests/scan.rs` have no equivalent, and
-`scripts/bench-compare.sh` is bash + Linux tools, so CLAUDE.md's
-benchmark mandate is unenforceable there.
+Eleven of the taxonomy's 25 constants are `#[cfg(not(windows))]` in
+rustix, and the fourteen that survive carry *Winsock* values — `EACCES` is
+10013 there. The dump spec's decimal fallback (§6.4) would have silently
+mis-classified a Linux-written dump read on Windows: the field that tells
+a user whether their disk is dying or their permissions are wrong. Fixed
+by owning the numbering. Note the pre-existing `known_names_round_trip`
+test did NOT pin the wire — it walked TABLE against TABLE and would have
+passed through a wholesale renaming. `wire_names_and_numbers_are_pinned`
+is the one that actually pins it; update it deliberately.
 
-Feasibility note, since it was asked: a Windows VM is *not* the right
-place to do this work. Scaleway locks Windows to five `POP2-*-WIN` SKUs
-in `fr-par-1`/`fr-par-2`, RDP-only, ~€0.19/h for 2C/8G and ~€0.38/h for
-4C/16G all-in — twenty times the DEV1-S validation lab, for a box that
-compiles no faster than `cargo check`. `windows-latest` CI is the
-authoritative check; a VM only earns its keep for eyeballing
-`GetFileInformationByHandleEx` and reparse-point behaviour at T2.
+### Known gaps, in rough value order
+
+1. **Reparse points get no link count**, because the guard skips the stat
+   call for anything the listing flagged. WinSxS is both heavily
+   hardlinked *and* heavily WOF-compressed, so on a Compact-OS system
+   those hardlinks will not dedup and `C:\Windows` over-reports. The §7.3
+   measurement says the call is already lstat-shaped with or without
+   `OBJ_DONT_REPARSE`, so relaxing the guard for ordinary tags looks safe.
+   This is the obvious next fix.
+2. **The integration tests do not compile on Windows** — the fixtures
+   import `symlink`/`PermissionsExt` at module level, so every test file
+   fails regardless of which test runs. That is why the CI job is `cargo
+   check` and not `cargo test`; gating them is what graduates it.
+3. **Subdirectories contribute 0 to directory-index bytes** while the root
+   contributes its real size, because listing entries report
+   `AllocationSize = 0` for directories but a by-handle query does not.
+   Root size then appears to come from nowhere.
+4. **Junctions are refused, not resolved**, so `--one-filesystem` is a
+   no-op and junction-heavy trees under-count. Descending them needs cycle
+   detection camembert does not have.
+5. **No cross-check partner and no bench on Windows.** The APIs that would
+   serve as an oracle (`MetadataExt::{file_index, number_of_links}`) are
+   the nightly-only ones, and `scripts/bench-compare.sh` is bash plus
+   Linux tools, so CLAUDE.md's before/after mandate is unenforceable
+   there. `fsutil file queryfileid` shelled out from a test is the only
+   oracle available.
+6. Alternate data streams are invisible; deduplicated volumes report the
+   stub. Both out of T1 scope, both worth a README line.
+
+### Working on this without a Windows machine
+
+There is no local Windows toolchain (no rustup, no MSVC) and Scaleway
+Windows instances cost ~0.38 EUR/h on the only SKUs that support the
+image — twenty times the DEV1-S validation lab. The `windows-2025` CI job
+is the authoritative check and the thing that lasts. A VM earns its keep
+only for questions no amount of reading settles, which is exactly what it
+was used for on 2026-07-26; if you rent one, note that Scaleway's Windows
+images ship OpenSSH pre-installed and a `with-ssh` creation tag
+provisions the project's IAM keys at first boot, so it is drivable
+headlessly with no RDP and no password. The password-encryption key must
+be RSA. Delete the server WITH its SBS volume and its IP — both survive
+server deletion and keep billing.
 
 ## Suggested next steps, in value order
 
