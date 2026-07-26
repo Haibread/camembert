@@ -29,6 +29,28 @@ io-uring = "0.7.13"
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.4", features = ["fs", "system"] }
 
+# The Windows scan backend. `std` exposes neither an allocation size nor a
+# link count on Windows (`MetadataExt::{file_index, number_of_links}` are
+# still `#[unstable]`, rust#63010), so `sem = "blocks"` and hardlink dedup
+# both need the raw API. 0.61 links through `windows-link` + `raw-dylib`:
+# no import libraries, nothing for a CI runner to install.
+#
+# Two feature placements are counter-intuitive and cost a compile error if
+# guessed: the `IO_REPARSE_TAG_*` constants live in
+# `Win32_System_SystemServices`, not in `Win32_Storage_FileSystem`, and
+# `Win32_Security` is needed not for any security API but because
+# `OBJECT_ATTRIBUTES` has two `SECURITY_*` pointer fields.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_SystemServices",
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+] }
+
 [dev-dependencies]
 tempfile = "3.27.0"
 

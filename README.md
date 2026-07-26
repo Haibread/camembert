@@ -687,6 +687,15 @@ dump → TUI — because severity matters: `EACCES` is benign ("rerun as
 root"), `EIO` means the disk may be failing and must never be buried,
 `ESTALE` is a broken network mount, `ELOOP`/`ENOENT` are noise.
 
+Not every reason is a POSIX errno. On Windows the commonest failure after
+access-denied is a file another process holds open — antivirus, a backup
+agent, Office — and no errno says that honestly (`EBUSY` means a busy
+*device*, which would send you looking for the wrong cause). It gets its
+own reason, `WIN_SHARING_VIOLATION`, classed as a fault: the number is
+incomplete and there is something you can do about it. Non-POSIX reasons
+are deliberately named without the `E` prefix so they cannot be mistaken
+for an errno.
+
 - **Selection card** — a row that failed its own read (an unreadable
   directory, or an entry whose stat failed) shows the reason inline, e.g.
   `⚠ EACCES — permission denied · subtree partly unscanned, size shown is

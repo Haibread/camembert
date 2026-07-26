@@ -22,6 +22,24 @@ one is called out under **Breaking** with the migration to apply.
   boundary with `ScanErrno::from(errno)` on Unix. Dumps are unaffected —
   the `er` field's bytes are unchanged, in both directions.
 
+### Added
+
+- **A Windows scan backend** (`x86_64-pc-windows-msvc`). `camembert-core`
+  builds and its scan engine runs there: real allocated sizes from
+  `AllocationSize` (measured compression-aware on NTFS), real hardlink
+  dedup from `NtQueryInformationByName`, reparse points classified by tag,
+  and paths beyond `MAX_PATH`. The `camembert` binary does not build on
+  Windows yet — its TUI still assumes `delete`, `freeable` and the
+  confidence oracle, all of which are Linux-only.
+- `errno::ScanErrno::SHARING_VIOLATION`, the taxonomy's first non-POSIX
+  reason: Windows' `ERROR_SHARING_VIOLATION`/`ERROR_LOCK_VIOLATION`, i.e.
+  another process holding the file open. Its wire name is
+  `WIN_SHARING_VIOLATION`, deliberately without an `E` prefix so it cannot
+  be read as an errno, and non-POSIX reasons are numbered from 2^24 so the
+  dump's decimal fallback can never collide with a real errno. The entry is
+  unconditional, not `cfg(windows)`: a dump written on Windows has to
+  decode on Linux.
+
 ### Changed
 
 - The `directory unreadable` debug log renders its errno as the canonical

@@ -27,9 +27,13 @@ mod hardlink;
 mod linux;
 pub(crate) mod message;
 pub(crate) mod owner;
+#[cfg(target_os = "windows")]
+mod windows;
 
 #[cfg(target_os = "linux")]
 use linux as backend;
+#[cfg(target_os = "windows")]
+use windows as backend;
 
 #[cfg(not(any(target_os = "linux", target_os = "windows")))]
 compile_error!(

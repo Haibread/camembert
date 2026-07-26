@@ -88,6 +88,26 @@ impl ScanErrno {
     pub const DQUOT: Self = Self(122);
 }
 
+/// Base of the **non-POSIX reason band**. Platform-specific reasons that no
+/// errno names honestly are numbered from here upward, so their decimal
+/// wire fallback can never be mistaken for a POSIX errno on a reader that
+/// does not know the name (POSIX numbering stops well below 4096 on every
+/// platform camembert targets; 2^24 leaves that untouchable).
+const NON_POSIX_BASE: i32 = 0x0100_0000;
+
+/// Reasons that have no POSIX errno worth borrowing.
+impl ScanErrno {
+    /// Windows `ERROR_SHARING_VIOLATION` / `ERROR_LOCK_VIOLATION`: another
+    /// process (antivirus, Office, a backup agent) holds the file open with
+    /// a share mode that excludes us.
+    ///
+    /// Deliberately **not** `EBUSY`. "Resource busy" describes a device or
+    /// a mount, and a user reading it would look for the wrong cause; this
+    /// is the error a Windows scan hits most after access-denied, so it is
+    /// worth naming for what it is (Windows backend design §8).
+    pub const SHARING_VIOLATION: Self = Self(NON_POSIX_BASE + 32);
+}
+
 /// Renders as the canonical name (`EACCES`, or the bare number outside the
 /// taxonomy) rather than the OS's prose description. A log line that says
 /// `EACCES` means the same thing wherever it was written, which is the
@@ -111,6 +131,86 @@ impl fmt::Display for ScanErrno {
 impl From<rustix::io::Errno> for ScanErrno {
     fn from(errno: rustix::io::Errno) -> Self {
         Self(errno.raw_os_error())
+    }
+}
+
+/// Win32 code → canonical reason, the Windows half of the platform
+/// boundary. See [`from_win32`] for why this table exists and why it is
+/// consulted before [`std::io::ErrorKind`].
+#[cfg(windows)]
+const WIN32_TABLE: &[(u32, ScanErrno)] = &[
+    // --- the disk or the volume is in trouble ---
+    // 1392/1393: the Windows EIO. Precisely what Severity::Alert exists for.
+    (1392, ScanErrno::IO),   // ERROR_FILE_CORRUPT
+    (1393, ScanErrno::IO),   // ERROR_DISK_CORRUPT
+    (39, ScanErrno::NOSPC),  // ERROR_HANDLE_DISK_FULL
+    (112, ScanErrno::NOSPC), // ERROR_DISK_FULL
+    (55, ScanErrno::NODEV),  // ERROR_DEV_NOT_EXIST
+    (21, ScanErrno::NXIO),   // ERROR_NOT_READY — drive present, no media
+    // --- resources, locks, network ---
+    // The two errors this whole table exists for: std maps both to
+    // `ErrorKind::Uncategorized`, so an ErrorKind-only mapping would emit
+    // no reason at all for the failure Windows users hit most.
+    (32, ScanErrno::SHARING_VIOLATION), // ERROR_SHARING_VIOLATION
+    (33, ScanErrno::SHARING_VIOLATION), // ERROR_LOCK_VIOLATION — same cause,
+    // same remedy: something else has the file. One row, not two.
+    (4, ScanErrno::MFILE),        // ERROR_TOO_MANY_OPEN_FILES
+    (8, ScanErrno::NOMEM),        // ERROR_NOT_ENOUGH_MEMORY
+    (14, ScanErrno::NOMEM),       // ERROR_OUTOFMEMORY
+    (19, ScanErrno::ROFS),        // ERROR_WRITE_PROTECT
+    (121, ScanErrno::TIMEDOUT),   // ERROR_SEM_TIMEOUT
+    (59, ScanErrno::STALE),       // ERROR_UNEXP_NET_ERR
+    (64, ScanErrno::STALE),       // ERROR_NETNAME_DELETED
+    (53, ScanErrno::HOSTUNREACH), // ERROR_BAD_NETPATH
+    (6, ScanErrno::BADF),         // ERROR_INVALID_HANDLE
+    // --- permissions ---
+    (5, ScanErrno::ACCESS), // ERROR_ACCESS_DENIED — 5 is EIO in POSIX
+    // numbering, which is exactly why this is a lookup and never a cast.
+    // --- races, malformed names, loops ---
+    (2, ScanErrno::NOENT),         // ERROR_FILE_NOT_FOUND
+    (3, ScanErrno::NOENT),         // ERROR_PATH_NOT_FOUND
+    (267, ScanErrno::NOTDIR),      // ERROR_DIRECTORY
+    (206, ScanErrno::NAMETOOLONG), // ERROR_FILENAME_EXCED_RANGE
+    (123, ScanErrno::INVAL),       // ERROR_INVALID_NAME
+    (87, ScanErrno::INVAL),        // ERROR_INVALID_PARAMETER
+    // Otherwise unreachable: `io::ErrorKind::FilesystemLoop` is still
+    // nightly-only at 1.88, so the ErrorKind fallback can never produce
+    // ELOOP on its own.
+    (1921, ScanErrno::LOOP), // ERROR_CANT_RESOLVE_FILENAME
+];
+
+/// The Windows platform boundary: a raw Win32 code (`GetLastError`) into a
+/// canonical reason.
+///
+/// The table is consulted **before** [`std::io::ErrorKind`] because the two
+/// errors a Windows scan hits most after access-denied —
+/// `ERROR_SHARING_VIOLATION` and `ERROR_LOCK_VIOLATION` — both land in
+/// `ErrorKind::Uncategorized`, so an `ErrorKind`-only mapping would drop
+/// exactly the reasons users need. It does not reintroduce the hazard the
+/// module note warns about: a table is a lookup, not a reinterpretation of
+/// a Win32 number as an errno.
+///
+/// Unmapped codes fall through to `ErrorKind`, and anything `ErrorKind`
+/// cannot name either becomes an opaque numeric reason — visible as
+/// [`Severity::Fault`], never silently demoted to noise.
+#[cfg(windows)]
+pub(crate) fn from_win32(code: u32) -> ScanErrno {
+    if let Some(&(_, errno)) = WIN32_TABLE.iter().find(|&&(win32, _)| win32 == code) {
+        return errno;
+    }
+    match std::io::Error::from_raw_os_error(code as i32).kind() {
+        std::io::ErrorKind::PermissionDenied => ScanErrno::ACCESS,
+        std::io::ErrorKind::NotFound => ScanErrno::NOENT,
+        std::io::ErrorKind::OutOfMemory => ScanErrno::NOMEM,
+        std::io::ErrorKind::TimedOut => ScanErrno::TIMEDOUT,
+        std::io::ErrorKind::InvalidInput => ScanErrno::INVAL,
+        std::io::ErrorKind::ConnectionReset => ScanErrno::CONNRESET,
+        std::io::ErrorKind::HostUnreachable => ScanErrno::HOSTUNREACH,
+        std::io::ErrorKind::NetworkUnreachable => ScanErrno::NETUNREACH,
+        std::io::ErrorKind::NetworkDown => ScanErrno::NETDOWN,
+        // Keep the raw code rather than inventing a POSIX meaning for it;
+        // `name()` renders it as a decimal, which `from_name` reverses.
+        _ => ScanErrno::from_raw(NON_POSIX_BASE + code as i32),
     }
 }
 
@@ -254,6 +354,16 @@ const TABLE: &[Entry] = &[
         errno: ScanErrno::BADF,
         name: "EBADF",
         label: "bad file descriptor",
+        severity: Severity::Fault,
+    },
+    // Windows-only, and the only row here whose name is not a POSIX errno
+    // — see [`ScanErrno::SHARING_VIOLATION`]. Present in the table on every
+    // platform on purpose: a dump written on Windows has to decode on
+    // Linux, so the taxonomy cannot be `cfg`-dependent.
+    Entry {
+        errno: ScanErrno::SHARING_VIOLATION,
+        name: "WIN_SHARING_VIOLATION",
+        label: "file held open by another process (antivirus, backup, …)",
         severity: Severity::Fault,
     },
     // --- Denied: permissions ---
@@ -406,6 +516,10 @@ mod tests {
                 ("ENETDOWN", 100),
                 ("ECONNRESET", 104),
                 ("EBADF", 9),
+                // Windows backend, added deliberately: additive on the wire
+                // (a reader that predates it degrades the unknown name to
+                // `None`), and numbered outside POSIX range on purpose.
+                ("WIN_SHARING_VIOLATION", 0x0100_0000 + 32),
                 ("EACCES", 13),
                 ("EPERM", 1),
                 ("ELOOP", 40),

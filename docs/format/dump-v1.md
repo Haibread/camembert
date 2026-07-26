@@ -113,6 +113,17 @@ next `d`.
   records only the boolean). Readers that don't recognize the value keep it
   opaque (§10). Severity is the point: `EIO` (failing disk) must never be
   buried, `EACCES` is benign.
+
+  Not every reason is a POSIX errno. A scan can also emit
+  `"WIN_SHARING_VIOLATION"` — a Windows scan hit a file another process
+  holds open (antivirus, backup agent, Office), which is that platform's
+  most common failure after access-denied and which no errno describes
+  honestly (`EBUSY` means a busy *device*). Non-POSIX reasons are named
+  without the `E` prefix so they can never be mistaken for one, and their
+  decimal fallback is numbered from `16777216` (2²⁴) upward, outside every
+  POSIX range. Readers keep unrecognised names opaque as usual, so this is
+  additive: a reader that predates the name loses the reason, not the
+  error.
 - Subdirectories are **not** repeated as entry lines in the parent block;
   parenthood is implied by `path`.
 
