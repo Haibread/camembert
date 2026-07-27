@@ -1971,12 +1971,25 @@ fn try_ascend_to(ui: &mut UiState, phase: &Phase, dir: DirId) {
 /// follows the hovered row until the mouse leaves the table or a
 /// keyboard action reclaims it.
 fn handle_hover(col: u16, row: u16, ui: &mut UiState) {
-    match ui
+    // The wheel is tested first, matching `handle_click`'s precedence, and
+    // its hit test already returns a *row* position rather than a slice
+    // index — so a hovered slice drives the very same card a hovered row
+    // does. Without this the pointer entering the wheel cleared the hover
+    // instead, which left a clicked slice identified by nothing but its
+    // colour: the user could see one child dominates and still not read
+    // its name.
+    let target = ui
         .geometry()
-        .table
+        .wheel
         .as_ref()
-        .and_then(|table| table.hit_test(col, row))
-    {
+        .and_then(|wheel| wheel.hit_test(col, row))
+        .or_else(|| {
+            ui.geometry()
+                .table
+                .as_ref()
+                .and_then(|table| table.hit_test(col, row))
+        });
+    match target {
         Some(position) if position < ui.row_count() => ui.set_hover(position),
         _ => ui.clear_hover(),
     }
@@ -5069,6 +5082,50 @@ mod tests {
     /// pixels well below the header. Narrow terminal (design slice 5):
     /// the side panel disappears — no half-block pixels below the header
     /// row — and a compact mini-donut renders in the header row instead.
+    /// Hovering a wheel slice must drive the selection card exactly as
+    /// hovering its table row does. Before this, the pointer entering the
+    /// wheel *cleared* the hover, so a slice was identified by nothing but
+    /// its colour — you could see that one child dominates and still not
+    /// read its name without hunting for the matching row.
+    #[test]
+    fn hovering_a_wheel_slice_identifies_it_like_hovering_its_row() {
+        let mut ui = UiState::new(sample_snapshot());
+        // Wheel at (10,3), 2x2: cell (0,0) is slice 0 -> row 1; the rest
+        // of the disc is unlit. Table at (0,0), one row tall, row 0.
+        ui.set_geometry(FrameGeometry {
+            wheel: Some(WheelGeometry {
+                x: 10,
+                y: 3,
+                width: 2,
+                height: 2,
+                cells: vec![Some(0), None, None, None],
+                targets: vec![Some(1)],
+            }),
+            table: Some(TableGeometry {
+                x: 0,
+                y: 0,
+                width: 8,
+                height: 1,
+                offset: 0,
+            }),
+            ..Default::default()
+        });
+
+        handle_hover(10, 3, &mut ui);
+        assert_eq!(ui.hover(), Some(1), "a lit slice hovers its row");
+        assert_eq!(
+            ui.card_row().map(|row| row.name.clone()),
+            ui.snapshot().rows.get(1).map(|row| row.name.clone()),
+            "and the card names that child"
+        );
+
+        handle_hover(0, 0, &mut ui);
+        assert_eq!(ui.hover(), Some(0), "the table still hovers its own rows");
+
+        handle_hover(11, 3, &mut ui);
+        assert_eq!(ui.hover(), None, "an unlit wheel cell hovers nothing");
+    }
+
     #[test]
     fn wheel_collapses_to_a_header_mini_donut_below_the_width_threshold() {
         let draw_at = |width: u16| -> ratatui::buffer::Buffer {
