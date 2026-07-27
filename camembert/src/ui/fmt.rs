@@ -145,17 +145,42 @@ pub fn humanize_duration(elapsed: Duration) -> String {
 /// components with `…`, always keeping the last component (itself
 /// truncated with a leading `…` when alone too long).
 pub fn abbreviate_path(path: &str, max: usize) -> String {
+    abbreviate_path_on(path, max, cfg!(windows))
+}
+
+/// Whether `ch` ends a path component.
+///
+/// Windows accepts both separators and its own APIs hand back `\`, so both
+/// must count there. They cannot simply count everywhere: `\` is a
+/// perfectly legal *character in a filename* on Unix, and treating it as a
+/// separator would chop such names into fake components.
+fn is_sep(ch: char, windows: bool) -> bool {
+    ch == '/' || (windows && ch == '\\')
+}
+
+fn abbreviate_path_on(path: &str, max: usize, windows: bool) -> String {
     if path.chars().count() <= max {
         return path.to_owned();
     }
-    let last = path.rsplit('/').next().unwrap_or(path);
+    // The separator put back is the one the path itself used, not the
+    // platform's: a Unix-style path displayed on Windows (a dump written
+    // elsewhere, a path typed with forward slashes) must not have a
+    // backslash spliced into it.
+    let (last, sep) = match path
+        .char_indices()
+        .rev()
+        .find(|&(_, ch)| is_sep(ch, windows))
+    {
+        Some((i, ch)) => (&path[i + ch.len_utf8()..], ch),
+        None => (path, '/'),
+    };
     // "…/<last>" when it fits, else "…<tail of last>".
     let with_prefix_len = last.chars().count() + 2;
     if with_prefix_len <= max {
         // Keep as much of the leading path as fits before "…/last".
         let budget = max - with_prefix_len;
         let prefix: String = path.chars().take(budget).collect();
-        return format!("{prefix}…/{last}");
+        return format!("{prefix}…{sep}{last}");
     }
     let tail: String = last
         .chars()
@@ -169,18 +194,28 @@ pub fn abbreviate_path(path: &str, max: usize) -> String {
 }
 
 /// Char-index spans (start inclusive, end exclusive) of `path`'s non-empty
-/// `/`-separated components, in order — the breadcrumb's clickable
+/// separator-delimited components, in order — the breadcrumb's clickable
 /// column ranges once offset by where the path starts on screen. Byte
 /// offsets would misalign multi-byte UTF-8 against terminal columns, so
-/// this counts chars; leading/doubled slashes contribute no component
+/// this counts chars; leading/doubled separators contribute no component
 /// (never a zero-width clickable span).
+///
+/// The separator set is platform-dependent (see [`is_sep`]). Splitting a
+/// Windows path on `/` alone made `C:\Program Files\Common Files` a single
+/// component, and the sole component is always the current directory's own
+/// — which is deliberately *not* clickable — so the breadcrumb had no live
+/// segment at all on Windows, whatever the depth.
 pub fn path_segments(path: &str) -> Vec<(usize, usize)> {
+    path_segments_on(path, cfg!(windows))
+}
+
+fn path_segments_on(path: &str, windows: bool) -> Vec<(usize, usize)> {
     let mut segments = Vec::new();
     let mut start: Option<usize> = None;
     let mut chars = 0usize;
     for (i, ch) in path.chars().enumerate() {
         chars = i + 1;
-        if ch == '/' {
+        if is_sep(ch, windows) {
             if let Some(s) = start.take() {
                 segments.push((s, i));
             }
@@ -354,6 +389,45 @@ mod tests {
         assert_eq!(path_segments("noslash"), vec![(0, 7)]);
         // Multi-byte chars count as one char each, not by UTF-8 byte width.
         assert_eq!(path_segments("/café/日本"), vec![(1, 5), (6, 8)]);
+    }
+
+    /// Windows paths arrive backslash-separated, and splitting them on `/`
+    /// alone yielded one component — always the current directory's own,
+    /// which is never clickable — so the breadcrumb was inert on Windows at
+    /// any depth. The converse must stay true: `\` is a legal filename
+    /// character on Unix and must not split anything there.
+    #[test]
+    fn separators_are_platform_dependent() {
+        assert_eq!(
+            path_segments_on(r"C:\Program Files\Common Files", true),
+            vec![(0, 2), (3, 16), (17, 29)],
+            "windows: drive, then each component"
+        );
+        assert_eq!(
+            path_segments_on(r"C:\Program Files\Common Files", false),
+            vec![(0, 29)],
+            "unix: one component, backslashes are just characters"
+        );
+        // Windows accepts forward slashes too, and mixed input.
+        assert_eq!(path_segments_on("C:/Users/theo", true).len(), 3);
+        // A Unix file genuinely named `back\slash` keeps its name whole.
+        assert_eq!(
+            path_segments_on(r"/home/back\slash", false),
+            vec![(1, 5), (6, 16)]
+        );
+
+        // Abbreviation finds the last component by the same rule, and puts
+        // back the separator the path itself used rather than the
+        // platform's — a Unix path shown on Windows keeps its slashes.
+        assert_eq!(
+            abbreviate_path_on(r"C:\Users\theo\projects\deep\nested\dir", 20, true),
+            r"C:\Users\theo\p…\dir"
+        );
+        assert_eq!(
+            abbreviate_path_on("/home/theo/projects/deep/nested/dir", 20, true),
+            "/home/theo/proj…/dir",
+            "a unix-style path keeps its own separator on windows"
+        );
     }
 
     #[test]
