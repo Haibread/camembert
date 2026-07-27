@@ -10,7 +10,8 @@
 //!   `--color auto` — the strictest reading of <https://no-color.org>;
 //! - `COLORTERM` = `truecolor`/`24bit` (case-insensitive) → truecolor;
 //! - `TERM` containing `256color` → 256;
-//! - `TERM` unset or `dumb` → mono; anything else → ANSI-16;
+//! - `TERM` = `dumb` → mono; anything else → ANSI-16;
+//! - `TERM` unset → mono **on Unix**, truecolor **on a Windows console**;
 //! - `--color always` skips `NO_COLOR` and never yields mono (floor:
 //!   ANSI-16) — it cannot conjure truecolor out of a 16-color terminal.
 //!
@@ -22,6 +23,27 @@
 //! - half-blocks (`▀▄`, 1×2 subpixels) everywhere else with color;
 //! - ASCII (`#` bars, no wheel) when mono or `TERM=dumb`: a donut whose
 //!   slices cannot be told apart by color is decoration, not data.
+//!
+//! # Why an absent `TERM` means the opposite thing on Windows
+//!
+//! `TERM` and `COLORTERM` are a Unix convention. A Windows console sets
+//! neither — not `cmd`, not PowerShell, not Windows Terminal — so reading
+//! "unset" as "no capabilities" put **every** Windows user on the bottom
+//! rung of both ladders: mono text and `#` bars, no wheel, on machines
+//! that render 24-bit colour perfectly. Measured on Windows 11 before this
+//! was fixed: `caps=Caps { color: Mono, glyphs: Ascii }`.
+//!
+//! The console has accepted 24-bit SGR sequences since Windows 10 1511
+//! once virtual-terminal processing is on, which crossterm enables when it
+//! takes the screen. So on Windows an absent `TERM` is not evidence of a
+//! poor terminal; it is no evidence at all, and the platform floor is
+//! higher than the Unix one. An explicitly set `TERM` still wins — under
+//! MSYS/Git Bash/Cygwin it is set, and it is then the better source.
+//!
+//! Glyphs deliberately stop at half-blocks there: those live in the base
+//! console fonts, whereas U+1FB00 sextant coverage depends on the font the
+//! user picked. A wheel drawn at 1×2 subpixels is what most Linux
+//! terminals get too.
 
 use clap::ValueEnum;
 use serde::Deserialize;
@@ -69,6 +91,11 @@ pub struct TermEnv {
     pub term_program: Option<String>,
     /// Present means set — the value is irrelevant (any value = no color).
     pub no_color: Option<String>,
+    /// The process is attached to a Windows console rather than a Unix
+    /// terminal. Carried as data, not read from `cfg!` inside the
+    /// detection, so the whole Windows matrix stays unit-testable from a
+    /// Linux CI runner and vice versa.
+    pub windows_console: bool,
 }
 
 impl TermEnv {
@@ -79,6 +106,7 @@ impl TermEnv {
             colorterm: var("COLORTERM"),
             term_program: var("TERM_PROGRAM"),
             no_color: var("NO_COLOR"),
+            windows_console: cfg!(windows),
         }
     }
 }
@@ -129,6 +157,10 @@ fn advertised_color(env: &TermEnv) -> ColorLevel {
         Some(term) if term.contains("256color") => ColorLevel::Ansi256,
         Some(term) if term == "dumb" => ColorLevel::Mono,
         Some(_) => ColorLevel::Ansi16,
+        // An absent `TERM` is the normal state of a Windows console, not a
+        // signal of a poor one: the variable is a Unix convention nothing
+        // on Windows sets. See the module docs.
+        None if env.windows_console => ColorLevel::Truecolor,
         None => ColorLevel::Mono,
     }
 }
@@ -169,6 +201,15 @@ mod tests {
             colorterm: colorterm.map(str::to_owned),
             term_program: term_program.map(str::to_owned),
             no_color: no_color.map(str::to_owned),
+            windows_console: false,
+        }
+    }
+
+    /// The same environment as [`env`], but attached to a Windows console.
+    fn win(term: Option<&str>, colorterm: Option<&str>, no_color: Option<&str>) -> TermEnv {
+        TermEnv {
+            windows_console: true,
+            ..env(term, colorterm, None, no_color)
         }
     }
 
@@ -284,5 +325,48 @@ mod tests {
                 "env {env:?} mode {mode:?}"
             );
         }
+    }
+
+    /// A Windows console sets neither `TERM` nor `COLORTERM`, and reading
+    /// that silence as "no capabilities" put every Windows user on mono +
+    /// ASCII — no colour, no wheel — on hardware that renders 24-bit fine.
+    /// This is the regression test for that: the bare Windows console is
+    /// the *top* colour rung, not the bottom.
+    #[test]
+    fn a_bare_windows_console_is_not_a_dumb_terminal() {
+        use ColorLevel::*;
+        use ColorMode::*;
+        use GlyphLevel::*;
+
+        let bare = win(None, None, None);
+        assert_eq!(Caps::detect(&bare, Auto).color, Truecolor);
+        assert_eq!(
+            Caps::detect(&bare, Auto).glyphs,
+            HalfBlock,
+            "the wheel draws; sextants need font coverage we cannot assume"
+        );
+
+        // The same silence on Unix still means mono — this is a platform
+        // floor, not a change to the ladder everyone else walks.
+        assert_eq!(Caps::detect(&env(None, None, None, None), Auto).color, Mono);
+
+        // Opting out still works, by either route.
+        assert_eq!(Caps::detect(&win(None, None, Some("")), Auto).color, Mono);
+        assert_eq!(Caps::detect(&bare, Never).color, Mono);
+
+        // An explicitly set TERM is better evidence than the platform
+        // floor and keeps winning: MSYS/Git Bash/Cygwin all set it.
+        assert_eq!(
+            Caps::detect(&win(Some("dumb"), None, None), Auto).color,
+            Mono
+        );
+        assert_eq!(
+            Caps::detect(&win(Some("xterm"), None, None), Auto).color,
+            Ansi16
+        );
+        assert_eq!(
+            Caps::detect(&win(Some("xterm-256color"), None, None), Auto).color,
+            Ansi256
+        );
     }
 }

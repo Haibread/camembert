@@ -208,8 +208,13 @@ pub(crate) struct ScanArgs {
     ///
     /// auto detects the terminal's capabilities (truecolor via COLORTERM,
     /// 256 colors via TERM, 16 colors otherwise) and honors NO_COLOR (set
-    /// to any value, even empty, disables color). always ignores NO_COLOR
-    /// but is still capped by what the terminal advertises. never renders
+    /// to any value, even empty, disables color). On Windows, where no
+    /// console sets TERM or COLORTERM, auto assumes truecolor rather than
+    /// reading that silence as a monochrome terminal — the console has
+    /// accepted 24-bit color since Windows 10 1511. A TERM you set
+    /// yourself (MSYS, Git Bash, Cygwin) still wins over that assumption.
+    /// always ignores NO_COLOR but is still capped by what the terminal
+    /// advertises. never renders
     /// monochrome with ASCII bars (the wheel needs color and is hidden).
     /// Defaults to auto when neither this, COLOR, nor camembert.toml's
     /// `color` key set anything; see the README's Configuration section
