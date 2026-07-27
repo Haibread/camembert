@@ -55,6 +55,22 @@ Set-Location $repo
 $toolsBin = Join-Path $repo 'target\bench-tools\bin'
 $env:PATH = "$toolsBin;$env:PATH"
 
+# --- native calls ---------------------------------------------------
+# Windows PowerShell 5.1 turns a native command's stderr into ErrorRecords
+# whenever that stderr is captured rather than attached to a console, so
+# `$ErrorActionPreference = 'Stop'` lets a mere *warning* terminate the script:
+# one hyperfine "first run significantly slower" notice, or one rustc warning
+# out of `cargo build`, and the run dies before a single measurement is
+# written. Relax the preference for the duration of the call -- the assignment
+# is function-local, so it covers the invocation and nothing else -- and judge
+# success by the exit code, which is the only signal that actually means it.
+function Invoke-Native {
+    param([string]$What, [string]$Exe, [string[]]$Arguments)
+    $ErrorActionPreference = 'Continue'
+    & $Exe @Arguments
+    if ($LASTEXITCODE -ne 0) { throw "$What failed (exit code $LASTEXITCODE)" }
+}
+
 # --- synthetic tree -------------------------------------------------
 # Identical layout to the bash script's: WIDTH top dirs, each with a src/
 # fan-out and a node_modules/ subtree, $Files empty files total. Scans are
@@ -90,8 +106,7 @@ while made < files:
     d += 1
 open(os.path.join(root, ".complete"), "w").close()
 '@ | Out-File -Encoding utf8 $gen
-        & $python $gen $Tree $Files
-        if ($LASTEXITCODE -ne 0) { throw "tree generation failed" }
+        Invoke-Native 'tree generation' $python @($gen, $Tree, $Files)
     }
     Write-Host "tree: $Tree ($Files files, cached)" -ForegroundColor DarkGray
 }
@@ -148,8 +163,7 @@ if ($rc -ne 0) { Write-Error ('standby purge failed: 0x{0:X8}' -f $rc); exit 1 }
 
 # --- build ----------------------------------------------------------
 Write-Host "building camembert --release ..." -ForegroundColor DarkGray
-cargo build --release --quiet
-if ($LASTEXITCODE -ne 0) { throw "cargo build failed" }
+Invoke-Native 'cargo build' 'cargo' @('build', '--release', '--quiet')
 $camembert = Join-Path $repo 'target\release\camembert.exe'
 
 # --- competitors ----------------------------------------------------
@@ -184,16 +198,7 @@ if (Have 'hyperfine') {
     $hfArgs = @('--warmup', '2', '--min-runs', '5', '-i') + $prepare +
               @('--export-markdown', $md, '--export-json', $json)
     foreach ($b in $bench) { $hfArgs += @('--command-name', $b.Name, $b.Cmd) }
-    # Windows PowerShell 5.1 wraps a native command's stderr in ErrorRecords,
-    # so `$ErrorActionPreference = 'Stop'` aborts the run the moment hyperfine
-    # emits one of its warnings ("first run significantly slower", ...) — an
-    # intermittent failure that silently costs you the whole comparison.
-    # Relax the preference across the call only, and check the exit code
-    # explicitly instead.
-    $previous = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try { hyperfine @hfArgs } finally { $ErrorActionPreference = $previous }
-    if ($LASTEXITCODE -ne 0) { throw "hyperfine exited with $LASTEXITCODE" }
+    Invoke-Native 'hyperfine' 'hyperfine' $hfArgs
     if (Test-Path $md) {
         $header = @("<!-- $ts | tree: $Tree ($Files files) -->") +
                   ($notes | ForEach-Object { "<!-- $_ -->" }) + ''
