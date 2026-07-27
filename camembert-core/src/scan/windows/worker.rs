@@ -44,7 +44,7 @@
 //! preview) breaks that invariant and must re-check it.
 
 use std::os::windows::ffi::OsStringExt;
-use std::os::windows::io::{AsRawHandle, OwnedHandle};
+use std::os::windows::io::{AsHandle, AsRawHandle, OwnedHandle};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -52,21 +52,14 @@ use std::time::Duration;
 use crossbeam_channel::Sender;
 use crossbeam_deque::{Injector, Stealer, Worker as WorkerQueue};
 use tracing::{debug, trace, warn};
-use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    FILE_STAT_INFORMATION, FileStatInformation, IO_REPARSE_TAG_LX_BLK, IO_REPARSE_TAG_LX_CHR,
-    IO_REPARSE_TAG_LX_FIFO, IO_REPARSE_TAG_LX_SYMLINK, NtQueryInformationByName,
+    IO_REPARSE_TAG_LX_BLK, IO_REPARSE_TAG_LX_CHR, IO_REPARSE_TAG_LX_FIFO, IO_REPARSE_TAG_LX_SYMLINK,
 };
-use windows_sys::Win32::Foundation::{
-    ERROR_NO_MORE_FILES, GetLastError, HANDLE, NTSTATUS, OBJ_DONT_REPARSE,
-    STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_INFO_CLASS, STATUS_INVALID_PARAMETER,
-    STATUS_NOT_IMPLEMENTED, STATUS_NOT_SUPPORTED, UNICODE_STRING,
-};
+use windows_sys::Win32::Foundation::{ERROR_NO_MORE_FILES, GetLastError, HANDLE};
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
     FILE_ID_EXTD_DIR_INFO, FileIdExtdDirectoryInfo, GetFileInformationByHandleEx,
 };
-use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 use windows_sys::Win32::System::SystemServices::{
     IO_REPARSE_TAG_AF_UNIX, IO_REPARSE_TAG_APPEXECLINK, IO_REPARSE_TAG_DEDUP,
     IO_REPARSE_TAG_FILE_PLACEHOLDER, IO_REPARSE_TAG_HSM, IO_REPARSE_TAG_HSM2,
@@ -76,6 +69,7 @@ use windows_sys::Win32::System::SystemServices::{
 
 use crate::errno::from_win32;
 use crate::tree::{ExcludedReason, Kind};
+use crate::winlink::{LinkCount, links_at};
 
 use super::{WidePath, entry_size, filetime_to_unix, open_dir};
 use crate::scan::message::{Batch, BatchEntry, SECTION_CAP, SectionSums};
@@ -648,94 +642,41 @@ fn wtf8_name(name_w: &[u16]) -> Vec<u8> {
         .to_vec()
 }
 
-/// `NtQueryInformationByName(FileStatInformation)` against an open
-/// directory handle and a bare relative leaf name.
-///
-/// `OBJECT_ATTRIBUTES.RootDirectory` giving a directory-relative lookup is
-/// documented nowhere on that page; it was measured working. `OBJ_DONT_REPARSE`
-/// is set for explicitness only — the call was measured to report a symlink
-/// and a junction as themselves with *and* without it, so no safety
-/// argument rests on the flag.
+/// The scan's use of [`crate::winlink::links_at`]: the whole scan latches
+/// off on an unsupported status, and a per-file failure costs only that
+/// entry its link count.
 ///
 /// Failure is never an error for the scan: the entry's sizes already came
 /// from the listing, and only the link count is lost. `1` is the honest
 /// fallback (it is what a non-hardlinked file has, and it keeps the entry
 /// out of the hardlink registry rather than fusing it with something).
+///
+/// The call itself lives in [`crate::winlink`] because the TUI issues the
+/// same one at the point of consumption; duplicating the `unsafe` block so
+/// the two could diverge is exactly the bug that module exists to prevent.
 fn query_nlink(dir: &OwnedHandle, name_w: &[u16], supported: &AtomicBool) -> u32 {
     if !supported.load(Ordering::Relaxed) {
         return 1;
     }
-    let Ok(byte_len) = u16::try_from(name_w.len() * 2) else {
-        // A name too long for UNICODE_STRING's u16 length cannot exist
-        // under the 255-character component limit, but the cast has to be
-        // checked rather than assumed.
-        return 1;
-    };
-    let name = UNICODE_STRING {
-        Length: byte_len,
-        MaximumLength: byte_len,
-        Buffer: name_w.as_ptr().cast_mut(),
-    };
-    let attributes = OBJECT_ATTRIBUTES {
-        Length: u32::try_from(size_of::<OBJECT_ATTRIBUTES>()).expect("OBJECT_ATTRIBUTES fits"),
-        RootDirectory: dir.as_raw_handle().cast(),
-        ObjectName: &raw const name,
-        Attributes: OBJ_DONT_REPARSE,
-        SecurityDescriptor: std::ptr::null(),
-        SecurityQualityOfService: std::ptr::null(),
-    };
-    let mut iosb = IO_STATUS_BLOCK::default();
-    let mut stat = FILE_STAT_INFORMATION::default();
-    // SAFETY: `attributes` borrows `name`, which borrows `name_w`; all
-    // three outlive the call, which is synchronous. `RootDirectory` is
-    // borrowed from a live `OwnedHandle`. The output buffer is `stat`'s own
-    // storage and the length passed is exactly its size, so the kernel
-    // writes nothing outside it. The two SECURITY_* pointers are null,
-    // which the structure documents as "none".
-    let status: NTSTATUS = unsafe {
-        NtQueryInformationByName(
-            &raw const attributes,
-            &raw mut iosb,
-            std::ptr::from_mut(&mut stat).cast(),
-            u32::try_from(size_of::<FILE_STAT_INFORMATION>()).expect("FILE_STAT_INFORMATION fits"),
-            FileStatInformation,
-        )
-    };
-    if status < 0 {
-        if is_unsupported_status(status) {
+    match links_at(dir.as_handle(), name_w) {
+        LinkCount::Known { links, .. } => links,
+        LinkCount::Unsupported => {
             // The whole scan gives up on link counts: an information class
             // this build or filesystem does not implement will not start
             // working on the next file, and retrying it per entry would
             // double the syscall count for nothing.
-            if !supported.swap(false, Ordering::Relaxed) {
+            if supported.swap(false, Ordering::Relaxed) {
                 warn!(
-                    status = format!("{status:#010x}"),
                     "NtQueryInformationByName(FileStatInformation) unsupported here; \
                      hardlinks will not be deduplicated for this scan"
                 );
             }
-        } else {
-            trace!(
-                status = format!("{status:#010x}"),
-                "link-count lookup failed"
-            );
+            1
         }
-        return 1;
+        // Already traced inside `links_at`; a denied or vanished entry is
+        // ordinary on a system drive and must not be louder than that.
+        LinkCount::Failed(_) => 1,
     }
-    stat.NumberOfLinks
-}
-
-/// Statuses that mean "this build or filesystem does not implement the
-/// call", as opposed to "this particular file said no".
-fn is_unsupported_status(status: NTSTATUS) -> bool {
-    matches!(
-        status,
-        STATUS_NOT_IMPLEMENTED
-            | STATUS_NOT_SUPPORTED
-            | STATUS_INVALID_PARAMETER
-            | STATUS_INVALID_INFO_CLASS
-            | STATUS_INVALID_DEVICE_REQUEST
-    )
 }
 
 fn error_batch(token: u64, code: u32) -> Batch {
@@ -995,18 +936,5 @@ mod tests {
             error_batch(1, 33).dir_error,
             Some(ScanErrno::SHARING_VIOLATION)
         );
-    }
-
-    /// Only "this build does not implement it" statuses disable the link
-    /// lookup for the rest of the scan; one denied file must not cost every
-    /// later file its link count.
-    #[test]
-    fn only_unsupported_statuses_disable_the_link_lookup() {
-        assert!(is_unsupported_status(STATUS_NOT_IMPLEMENTED));
-        assert!(is_unsupported_status(STATUS_NOT_SUPPORTED));
-        assert!(is_unsupported_status(STATUS_INVALID_INFO_CLASS));
-        // STATUS_ACCESS_DENIED / STATUS_OBJECT_NAME_NOT_FOUND: per-file.
-        assert!(!is_unsupported_status(0xC000_0022_u32 as NTSTATUS));
-        assert!(!is_unsupported_status(0xC000_0034_u32 as NTSTATUS));
     }
 }

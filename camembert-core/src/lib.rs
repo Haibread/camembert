@@ -27,3 +27,8 @@ pub mod scan;
 pub mod size;
 pub mod tree;
 pub mod view;
+// `NtQueryInformationByName(FileStatInformation)` is the Win32 half of the
+// hardlink story: the scan worker's per-file lookup under `--links`, and
+// the TUI's lazy lookup at the point of consumption, share one wrapper.
+#[cfg(windows)]
+pub mod winlink;
