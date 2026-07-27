@@ -1,6 +1,14 @@
 //! End-to-end deletion tests over a real filesystem (tempfile): scan,
 //! delete through the safe executor, and assert both the disk and the
 //! tree's accounting (HANDOFF §5 "Garde-fous de suppression").
+//!
+//! Whole-file `cfg(unix)`: every test here exercises
+//! `camembert_core::delete`, which is itself `#[cfg(unix)]` in the product
+//! (descriptor-relative `openat`/`unlinkat` via `rustix`, see `lib.rs`) — the
+//! module under test does not exist on Windows, so there is nothing narrower
+//! to gate. Deletion is a documented Windows gap (HANDOFF "Windows TUI is
+//! reduced, not absent"), not a test-portability shortcut.
+#![cfg(unix)]
 
 use std::fs;
 use std::path::Path;
