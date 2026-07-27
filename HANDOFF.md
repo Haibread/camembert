@@ -357,21 +357,56 @@ that before touching any of this. This section is only the state.
 
 ### Where it stands
 
-`camembert-core` **compiles and scans on `x86_64-pc-windows-msvc`**: 0
-errors, 0 warnings, 170 lib tests green there, verified on a rented
-Windows Server 2022 box. Linux is untouched throughout — 595 tests green
-at every commit, and the warm 200k-file bench moved 70.8 -> 68.3 ms across
-the seam commit, which is noise.
-
-The `camembert` **binary** does not build on Windows yet. That work is in
-flight: 29 errors, all in the TUI layer, all from `delete`/`freeable`/
-`fiemap`/`confidence` imports plus a handful of `std::os::unix` uses.
+The **whole workspace** compiles on `x86_64-pc-windows-msvc` — 0 errors, 0
+warnings — and the binary scans, browses and dumps for real. 170 lib tests
+green there. Linux is untouched throughout: 596 tests green at every
+commit, and the warm 200k-file bench moved 70.8 -> 68.3 ms across the seam
+commit, which is noise.
 
 Merged, in order: `358e05b` binary's Unix couplings; `b47d898` the
 platform seam under `scan/linux/`; `c2a9ccf` `cfg`-gated modules and deps;
 `dccada7` `ScanErrno` (the actual blocker — see below); `ae8dd04` the
 `OsStr` bridge; `9e837fd` the design doc; `afdc727` the windows-2025 CI
-job; `c656ea2` the Windows scan backend.
+job; `c656ea2` the Windows scan backend; `5dc5928` the reduced TUI;
+`e38c3f3` the Windows bench harness.
+
+### The performance hole, measured 2026-07-27
+
+`scripts/bench-compare.ps1` exists now (see CLAUDE.md "Benchmarks"), and
+its first run says the Windows backend is **14× behind the reference
+scanner**. Warm, 200k-file synthetic tree, Ryzen 9 5950X / NVMe / NTFS,
+Defender real-time protection on:
+
+| tool | mean |
+|---|---|
+| gdu | 145 ms |
+| robocopy `/L /S` | 599 ms |
+| **camembert** | **2080 ms** |
+| diskus | 3515 ms |
+| dust | 3898 ms |
+
+Nearly all of it is one line. `worker.rs::query_nlink` —
+`NtQueryInformationByName(FileStatInformation)`, called once per
+non-directory entry purely to obtain the link count — costs **95 % of the
+scan**: forcing `nlink` to 1 takes the same tree from 2080 ms to **121 ms**,
+which would put camembert ahead of gdu. That is ~10 µs per call, far above
+a syscall, and the suspicion is the object manager's path parse plus the
+antivirus minifilter, not the query itself.
+
+Two things this is *not*. It is not a platform floor: gdu does the
+identical tree on the same box with the same antivirus in 145 ms. And it
+is not a free fix: the call is what buys hardlink dedup, which is one of
+the project's honest-numbers claims, so removing it outright sells
+correctness for speed. A dossier at
+[windows-nlink-dossier.md](docs/design/windows-nlink-dossier.md) works
+the options (probabilistic pre-filter, exact in-scan dedup by `(dev,ino)`,
+deferred second pass) with their honesty costs priced. **Decide it before
+touching the hot path.**
+
+Note also that thread scaling was measured at 1/2/4/8/12/16/24/32 workers
+and 8 came out optimal, with 12+ regressing ~45 %. Do not trust that
+number after the nlink fix — it measured a workload that was 95 % one
+syscall, and the shape will change completely. Re-measure.
 
 ### Decisions taken, not to be relitigated without a new element
 
@@ -423,28 +458,36 @@ is the one that actually pins it; update it deliberately.
 4. **Junctions are refused, not resolved**, so `--one-filesystem` is a
    no-op and junction-heavy trees under-count. Descending them needs cycle
    detection camembert does not have.
-5. **No cross-check partner and no bench on Windows.** The APIs that would
-   serve as an oracle (`MetadataExt::{file_index, number_of_links}`) are
-   the nightly-only ones, and `scripts/bench-compare.sh` is bash plus
-   Linux tools, so CLAUDE.md's before/after mandate is unenforceable
-   there. `fsutil file queryfileid` shelled out from a test is the only
-   oracle available.
+5. **No cross-check partner.** The APIs that would serve as an oracle
+   (`MetadataExt::{file_index, number_of_links}`) are the nightly-only
+   ones; `fsutil file queryfileid` shelled out from a test is the only one
+   available. The *bench* half of this gap is closed —
+   `scripts/bench-compare.ps1` (2026-07-27) makes CLAUDE.md's before/after
+   mandate enforceable on Windows, and immediately found the nlink hole
+   above.
 6. Alternate data streams are invisible; deduplicated volumes report the
    stub. Both out of T1 scope, both worth a README line.
 
-### Working on this without a Windows machine
+### Where the work actually happens
 
-There is no local Windows toolchain (no rustup, no MSVC) and Scaleway
-Windows instances cost ~0.38 EUR/h on the only SKUs that support the
-image — twenty times the DEV1-S validation lab. The `windows-2025` CI job
-is the authoritative check and the thing that lasts. A VM earns its keep
-only for questions no amount of reading settles, which is exactly what it
-was used for on 2026-07-26; if you rent one, note that Scaleway's Windows
-images ship OpenSSH pre-installed and a `with-ssh` creation tag
-provisions the project's IAM keys at first boot, so it is drivable
-headlessly with no RDP and no password. The password-encryption key must
-be RSA. Delete the server WITH its SBS volume and its IP — both survive
-server deletion and keep billing.
+**The user's own machine is Windows 11 with a working MSVC toolchain**
+(`cargo 1.97`, `x86_64-pc-windows-msvc`) — established 2026-07-27. That
+supersedes this section's previous advice to treat CI as the only
+authority and rent a VM for anything else. Build, test, run and benchmark
+locally; `scripts/bench-compare.ps1` and the competitor binaries under
+`target/bench-tools/bin` are set up there.
+
+The `windows-2025` CI job is still the thing that lasts and the check that
+protects the port from bit-rot, so keep it honest — graduating it from
+`cargo check` to `cargo test` is gap #2 below.
+
+Kept for the record, should a second machine ever be needed: Scaleway
+Windows instances cost ~0.38 EUR/h on the only SKUs supporting the image
+(twenty times the DEV1-S validation lab), their images ship OpenSSH
+pre-installed, and a `with-ssh` creation tag provisions the project's IAM
+keys at first boot, so one is drivable headlessly with no RDP and no
+password. The password-encryption key must be RSA. Delete the server WITH
+its SBS volume and its IP — both survive server deletion and keep billing.
 
 ## Suggested next steps, in value order
 
