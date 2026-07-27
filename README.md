@@ -179,7 +179,9 @@ footer never names them:
 
 `--no-proc-sweep`/`NO_PROC_SWEEP` and `--no-fiemap`/`NO_FIEMAP` are
 therefore accepted but inert on Windows: there is nothing left to switch
-off.
+off. `--links`/`LINKS` runs the other way — it is accepted everywhere and
+inert *off* Windows, where link counts arrive inside `statx` for free (see
+[Hardlinks on Windows](#hardlinks-on-windows-and---links)).
 
 **Numbers differ in ways worth knowing before trusting one:**
 
@@ -199,6 +201,56 @@ off.
   128-bit file id between "which directory" and "which file in it", so the
   hardlink key folds the two halves; camembert says so at runtime rather
   than implying NTFS-grade precision.
+- **`⛓` means "reached by more than one path in this scan"**, and
+  `--links` changes it back to what it means on Linux. See below.
+
+### Hardlinks on Windows, and `--links`
+
+camembert deduplicates hardlinks on Windows — it is the only disk-usage
+tool for the platform that does. On a fixture of 64 files plus 64
+`mklink /H` links to them, `gdu`, `dust`, `diskus`, `robocopy` and
+`Get-ChildItem` all report 128 MiB; camembert reports 64. Two of those
+tools document the opposite of what their Windows build does.
+
+What that dedup rests on is the **inode registry**, not the link count. A
+Windows directory listing hands over name, both sizes, attributes, reparse
+tag and the file id for free — everything except `NumberOfLinks`. Getting
+that one field means a per-file `NtQueryInformationByName` call, which
+measured ~46 µs on real hardware because it instantiates a file object and
+every registered filesystem filter (fourteen on a stock Windows 11, one of
+them Defender) inspects the create. It was **95 % of the scan**, and it
+moved no total on any tree measured, because the link count was only ever
+a gate on entering the registry.
+
+So the default does not ask. Every file enters the registry on the id the
+listing already provides, and a second sighting of the same id
+deduplicates. Totals are byte-identical. What changes is the **question
+the `⛓` badge and the `hardlinked inodes:` line answer**:
+
+| | default | `--links` |
+|---|---|---|
+| `⛓` / `hardlinked inodes: N` | inodes this scan reached by **more than one path** | inodes with more than one link **anywhere on the volume** |
+| `C:\Windows\System32\drivers` | `0` (their siblings live in WinSxS, outside the scan) | `728` of 756 files |
+| dump entries | `i`, no `l` | `i` and `l` |
+| 200 000-file tree | ~110 ms | ~2 000 ms |
+
+The default is narrower and exact for what it claims; `--links` (env
+`LINKS`) is the one that answers *"deleting this frees nothing, there are
+links you cannot see"*, which on `C:\Windows` is true of 92 % of files.
+Price it before reaching for it: the cost is per **file** — directories
+and reparse points are never queried — so the factor tracks the
+file:directory ratio, ~19× on a file-dense synthetic tree and ~2× on
+`C:\Windows`. Experimental; expect the whole-scan sweep to become
+unnecessary once the per-file lookup lands at the point of consumption
+(the selection card, the visible viewport) instead.
+
+Dumps never fabricate: without `--links` a Windows dump omits the `l`
+field rather than write a number no filesystem reported. `i` is still
+written, since the inode identity is real and is what groups the links —
+see §8.1 of
+[`docs/format/dump-v1.md`](docs/format/dump-v1.md). The measurement behind
+all of this is
+[`docs/design/windows-nlink-dossier.md`](docs/design/windows-nlink-dossier.md).
 
 The full design, including what it still gets wrong, is in
 [`docs/design/windows-backend-design.md`](docs/design/windows-backend-design.md).
@@ -400,7 +452,9 @@ footer all stay put; only the table (and the donut) change:
 
 - **`t` — flat top files**: the largest regular files across the *whole*
   scan, out of the directory hierarchy — path (abbreviated like the
-  breadcrumb), size, a `⛓` badge on multi-link (hardlinked) files.
+  breadcrumb), size, a `⛓` badge on multi-link (hardlinked) files (on
+  Windows the badge answers a narrower question by default — see
+  [Hardlinks on Windows](#hardlinks-on-windows-and---links)).
   Truncated past `flat_cap` entries (default 1000), which the mode header
   says plainly rather than silently dropping the tail.
 - **`b` — pattern breakdown**: named groups (`node_modules/`, `*.log`, …)
@@ -982,7 +1036,10 @@ truncated dump is refused with exit code 2.
   legitimately disagree.
 - Hardlinked inodes count **once**, attributed to their canonical
   (smallest-path) link — deterministic across scans, so diffs never
-  show phantom growth.
+  show phantom growth. On Windows the dedup is the same and the totals
+  are the same, but the *count* reported alongside them answers a
+  narrower question unless you pass `--links` — see
+  [Hardlinks on Windows](#hardlinks-on-windows-and---links).
 - **On ZFS, freshly written data reads as ~0 real bytes for a few
   seconds.** ZFS accounts `st_blocks` when the transaction group commits,
   not when the write lands — measured on OpenZFS 2.2 / kernel 6.8, a
