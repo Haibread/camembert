@@ -58,14 +58,21 @@ use crate::size::Size;
 /// handed to a delete path is a wrong-file-deleted bug. [`crate::delete`]
 /// is `cfg(unix)`, where this function is exact, and it must stay that way
 /// until someone writes a real WTF-8 decoder.
+///
+/// The TUI's `o`/`y` (reveal-in-file-manager / copy-path, `camembert/src/
+/// ui.rs`) are a lower-stakes second consumer that *does* round-trip to
+/// the filesystem: opening the wrong file in Explorer is a bad experience,
+/// not a data-loss bug, so the pathological lone-surrogate corner this
+/// function already accepts is a tolerable, pre-existing gap there too —
+/// not a new one this function's wider visibility introduces.
 #[cfg(unix)]
-pub(crate) fn os_name_from_bytes(bytes: &[u8]) -> std::borrow::Cow<'_, std::ffi::OsStr> {
+pub fn os_name_from_bytes(bytes: &[u8]) -> std::borrow::Cow<'_, std::ffi::OsStr> {
     use std::os::unix::ffi::OsStrExt;
     std::borrow::Cow::Borrowed(std::ffi::OsStr::from_bytes(bytes))
 }
 
 #[cfg(not(unix))]
-pub(crate) fn os_name_from_bytes(bytes: &[u8]) -> std::borrow::Cow<'_, std::ffi::OsStr> {
+pub fn os_name_from_bytes(bytes: &[u8]) -> std::borrow::Cow<'_, std::ffi::OsStr> {
     match std::str::from_utf8(bytes) {
         Ok(s) => std::borrow::Cow::Borrowed(std::ffi::OsStr::new(s)),
         Err(_) => std::borrow::Cow::Owned(std::ffi::OsString::from(

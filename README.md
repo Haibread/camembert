@@ -161,9 +161,11 @@ interactive UI.
 Identical on both: the directory table, the donut wheel, the disk gauge
 (`GetDiskFreeSpaceExW` in place of `statvfs`), navigation, sorting, the `p`
 apparent-size toggle, zen mode, flat view (`t`), the pattern breakdown
-(`b`), the Ctrl-K/`/` palette and the full query grammar, themes, mouse and
-the `?` cheatsheet — plus `--no-ui`, `--output`, `camembert diff` and
-`camembert import`.
+(`b`), `o` reveal-in-file-manager and `y` copy-path (the one bridge to
+"act on it outside camembert" that Windows needs *more* than Linux does,
+since Windows has no in-app deletion at all — see below), the Ctrl-K/`/`
+palette and the full query grammar, themes, mouse and the `?` cheatsheet —
+plus `--no-ui`, `--output`, `camembert diff` and `camembert import`.
 
 **Absent on Windows, compiled out rather than disabled** — the keys do not
 exist, `?` does not list them, the palette does not offer them and the
@@ -405,6 +407,7 @@ has proven itself.
 | `d` `a` `n` `m` `c` `e` | sort: disk (default) · apparent · name · mtime · items · **errors** (again = reverse) — keys with no meaning in the active mode flash instead of applying (see [Flat view & pattern breakdown](#flat-view--pattern-breakdown)) |
 | `p` | toggle the apparent-size column |
 | `t` `b` | flat top files across the whole scan · pattern breakdown (press again to return to the tree) |
+| `o` `y` | reveal the entry under the cursor in the system file manager · copy its full path to the clipboard via OSC 52 (works over SSH; camembert cannot confirm the terminal actually accepted it, so the toast says "attempted") — tree and flat rows, flat only once the scan completes. Inside the delete-confirmation dialog, `y` instead confirms the deletion (below) |
 | `Space` `u` `D` | mark for deletion (tree/flat rows; not breakdown) · clear marks · delete (confirm with `y`) |
 | `v` | review marked entries: a scrollable list, `Space` unmarks a row, `D` deletes from there too |
 | `f` | freeable files: deleted-but-open files still holding disk space (`f`/`Esc` closes) |

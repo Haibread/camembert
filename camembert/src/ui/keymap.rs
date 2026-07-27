@@ -12,8 +12,12 @@
 //! A handful of keys need context `dispatch_simple` doesn't have (the
 //! scan phase, the flash/toast queues, the confirm/review modal state, the
 //! freeable-2 selection oracle runtime): descend/ascend, mark, delete,
-//! review, clear marks, quit. Those stay hand-written in `ui::handle_key`,
-//! and are documented here as [`EXTRA`] purely for the cheatsheet/footer —
+//! review, clear marks, quit, reveal-in-file-manager (`o`) and copy-path
+//! (`y`) — the latter two need the row's resolved path, which (unlike
+//! everything in [`SIMPLE`]) depends on the scan phase and the active
+//! mode, not just `UiState` alone. Those stay hand-written in
+//! `ui::handle_key`, and are documented here as [`EXTRA`] purely for the
+//! cheatsheet/footer —
 //! kept honest by `ui::tests`' `handle_key` routing tests
 //! (`v_opens_review_and_d_from_within_it_opens_confirm` and neighbors),
 //! which drive each one through the real key handler and check it does
@@ -164,6 +168,14 @@ const EXTRA_BEFORE_RECLAIM: &[ExtraKey] = &[
     ExtraKey {
         keys: "⌫/h/←",
         action: "go back up to the parent [tree only]",
+    },
+    ExtraKey {
+        keys: "o",
+        action: "reveal the entry under the cursor in the system file manager [tree/flat]",
+    },
+    ExtraKey {
+        keys: "y",
+        action: "copy the entry's full path to the clipboard (OSC 52) [tree/flat]",
     },
 ];
 

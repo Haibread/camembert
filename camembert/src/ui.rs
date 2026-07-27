@@ -47,6 +47,9 @@
 // cheatsheet entries for them (`keymap::EXTRA_RECLAIM`).
 mod anim;
 pub mod caps;
+// `o`'s companion: copy-path via OSC 52 (module docs on why not a
+// clipboard crate). Cross-platform like `reveal` — no cfg seam at all.
+mod clipboard;
 mod filterview;
 mod flatview;
 #[cfg(unix)]
@@ -65,6 +68,11 @@ mod nlink_rt;
 mod oracle;
 mod osc11;
 mod palette;
+// `o`: reveal the selected entry in the system file manager. Unlike the
+// reclaim subsystem this is cross-platform — Windows gets it too, and
+// needs it more, since Windows has no delete path at all (see the
+// reclaim-subsystem note above).
+mod reveal;
 mod state;
 pub mod theme;
 mod toast;
@@ -108,7 +116,7 @@ use camembert_core::size::HumanSize;
 // module builds synthetic snapshots out of them on every platform.
 #[cfg(any(unix, test))]
 use camembert_core::tree::NodeId;
-use camembert_core::tree::{DirId, NodeFlags, Tree};
+use camembert_core::tree::{DirId, NodeFlags, Tree, os_name_from_bytes};
 use camembert_core::view::{self, RowState};
 
 use caps::{Caps, GlyphLevel};
@@ -139,6 +147,10 @@ const BREAKDOWN_DRILLDOWN_LOCKED: &str = "group drill-down comes with the query 
 /// Flash for a sort key the active mode has no meaningful column for (D3
 /// — e.g. `m`/`e` in a flat/breakdown mode, or `c` in flat mode).
 const SORT_NOT_APPLICABLE: &str = "not available in this view";
+
+/// Toast for `o`/`y` on a breakdown row: a group is many entries folded
+/// together, never a single path to reveal or copy.
+const BREAKDOWN_NO_SINGLE_PATH: &str = "a breakdown group has no single path to reveal or copy";
 
 /// Frame budget: poll timeout of the render loop (~30 fps, D5) while
 /// something needs a timely redraw without new input — a running scan,
@@ -1476,6 +1488,13 @@ fn handle_key(
                 try_ascend(ui, phase);
             }
         }
+        // `o`/`y`: unlike the reclaim block below, these run identically on
+        // every platform — Windows has no delete path at all, which is
+        // exactly why the bridge to "act on it outside camembert" matters
+        // more there, not less (see `reveal`'s and `clipboard`'s module
+        // docs).
+        KeyCode::Char('o') => try_reveal(ui, phase, toasts),
+        KeyCode::Char('y') => try_copy_path(ui, phase, toasts),
         // The five reclaim bindings. Absent where the subsystem is: these
         // keys fall through to `keymap::dispatch_simple`, which does not
         // claim them either, so they are inert rather than erroring — and
@@ -1822,6 +1841,97 @@ fn ancestor_chain(tree: &Tree, dir: DirId) -> Vec<DirId> {
     }
     chain.reverse();
     chain
+}
+
+/// What `o`/`y` have to act on for the row under the cursor — see
+/// [`selected_path`].
+#[derive(Debug, PartialEq)]
+enum SelectedPath {
+    /// Nothing under the cursor (an empty view): silent no-op, matching
+    /// the convention `Space`/Enter already use for the same case.
+    None,
+    /// A real filesystem path, ready to hand to `reveal`/`clipboard`.
+    Path(PathBuf),
+    /// The row exists but has no path to give; the message says why.
+    Unavailable(&'static str),
+}
+
+/// Resolve the row under the cursor to a real filesystem path for `o`
+/// (reveal) and `y` (copy path) — cross-platform and, unlike marking,
+/// independent of the reclaim subsystem, so it runs the same way on
+/// Windows and Unix. Mode-aware:
+///
+/// - **Tree**: always resolvable, live *or* post-scan. A
+///   [`state::UiState::snapshot`]'s own `path` is the directory actually
+///   opened on disk (browse-during-scan's whole premise: what is shown is
+///   real, never provisional), and a row is just its child's name — no
+///   frozen arena needed, unlike the flat/breakdown cases below.
+/// - **Flat** (`t`): post-scan only, the same gap `FLAT_ROW_DETAILS_LOCKED`
+///   already names for Enter/mark — the live accumulator has no arena to
+///   walk a parent chain in (see [`flatview`]'s module doc).
+/// - **Breakdown** (`b`): never — a group is many entries, not one path
+///   ([`BREAKDOWN_NO_SINGLE_PATH`]).
+fn selected_path(ui: &UiState, phase: &Phase) -> SelectedPath {
+    match ui.mode() {
+        ViewMode::Tree => match ui.selected() {
+            None => SelectedPath::None,
+            Some(row) => {
+                let mut path = ui.snapshot().path.clone();
+                path.push(&*os_name_from_bytes(&row.name));
+                SelectedPath::Path(path)
+            }
+        },
+        ViewMode::FlatTop => {
+            let Phase::Done(lock) = phase else {
+                return SelectedPath::Unavailable(FLAT_ROW_DETAILS_LOCKED);
+            };
+            let Some(summary) = ui.flat_summary() else {
+                return SelectedPath::None;
+            };
+            let guard = read_outcome(lock);
+            let outcome = &*guard;
+            let rows = flatview::flat_rows(summary, Some(outcome));
+            let order = flatview::sort_flat_rows(&rows, ui.sort());
+            let Some(&index) = order.get(ui.cursor()) else {
+                return SelectedPath::None; // empty view: silent no-op
+            };
+            match rows[index].path.clone() {
+                Some(path) => SelectedPath::Path(path),
+                None => SelectedPath::Unavailable(FLAT_ROW_DETAILS_LOCKED),
+            }
+        }
+        ViewMode::Breakdown => SelectedPath::Unavailable(BREAKDOWN_NO_SINGLE_PATH),
+    }
+}
+
+/// `o`: reveal the row under the cursor in the system file manager
+/// ([`reveal::spawn`]) — detached, never waited on; any failure (a
+/// missing `xdg-open`, a permission error, …) is surfaced as a toast with
+/// the OS error rather than taking the UI down.
+fn try_reveal(ui: &UiState, phase: &Phase, toasts: &mut ToastQueue) {
+    match selected_path(ui, phase) {
+        SelectedPath::None => {}
+        SelectedPath::Unavailable(message) => toasts.push(message),
+        SelectedPath::Path(path) => match reveal::spawn(&path) {
+            Ok(()) => toasts.push(format!("revealed in file manager: {}", path.display())),
+            Err(err) => toasts.push(format!("could not open the file manager: {err}")),
+        },
+    }
+}
+
+/// `y`: copy the row's full path via OSC 52 ([`clipboard::copy`]). The
+/// toast can only say what was *attempted* ([`clipboard`]'s module doc):
+/// OSC 52 has no reply, so a successful write to the terminal is not
+/// proof the clipboard actually changed.
+fn try_copy_path(ui: &UiState, phase: &Phase, toasts: &mut ToastQueue) {
+    match selected_path(ui, phase) {
+        SelectedPath::None => {}
+        SelectedPath::Unavailable(message) => toasts.push(message),
+        SelectedPath::Path(path) => match clipboard::copy(&path) {
+            Ok(()) => toasts.push("path copied (OSC 52)"),
+            Err(err) => toasts.push(format!("could not copy the path: {err}")),
+        },
+    }
 }
 
 /// Sort keypress (`d`/`a`/`n`/`m`/`c`/`e`, D3): refused with a flash when
@@ -6132,6 +6242,198 @@ mod tests {
         );
         let ui = UiState::new(Arc::new(snapshot));
         (ui, Phase::Done(Arc::new(RwLock::new(outcome))), tmp)
+    }
+
+    // ---- `o`/`y`: reveal-in-file-manager and copy-path -------------------
+    //
+    // `reveal::command_for`/`clipboard::sequence` cover the pure, per
+    // -platform argv/encoding logic (see their own module tests). What's
+    // left to cover here is the routing this module owns: which of tree/
+    // flat/breakdown resolves a path at all, and the honest refusal
+    // (`SelectedPath::Unavailable`, surfaced as a toast per the design
+    // doc) when it can't. Neither `try_reveal`'s nor `try_copy_path`'s
+    // success path is exercised here: the former would really launch
+    // `explorer.exe`/`xdg-open` on whatever machine runs the suite
+    // (Windows CI included) — real GUI side effects a unit test must
+    // never have — and the latter writes raw OSC 52 bytes straight to
+    // the process's real `stdout`, which a test run showed genuinely
+    // reaches an attached terminal rather than staying inside cargo's
+    // per-test capture (the same reason `osc11::query_terminal_
+    // background` documents itself as "deliberately untested": there is
+    // no tty in a test process to safely address). Both success paths
+    // are verified by hand against a real TUI instead (see the change's
+    // commit message / report).
+
+    /// Tree mode never needs the frozen post-scan arena: a
+    /// [`state::UiState::snapshot`]'s own `path` is the real directory
+    /// already open on disk, live or not, and a row is just its child's
+    /// name. `Phase::Transitioning` stands in for "scan still running" —
+    /// `selected_path` never even looks at `phase` in tree mode.
+    #[test]
+    fn selected_path_resolves_a_tree_row_even_mid_scan() {
+        let ui = UiState::new(sample_snapshot());
+        assert_eq!(ui.mode(), ViewMode::Tree);
+
+        let mut expected = PathBuf::from("/scan/root");
+        expected.push("big"); // sample_snapshot's first row, cursor starts there
+        assert_eq!(
+            selected_path(&ui, &Phase::Transitioning),
+            SelectedPath::Path(expected)
+        );
+    }
+
+    /// An empty tree view (no rows) is a silent no-op, matching `Space`/
+    /// Enter's existing convention for the same case — never a toast
+    /// about a row that does not exist.
+    #[test]
+    fn selected_path_on_an_empty_tree_view_is_none() {
+        let empty = Arc::new(ViewSnapshot {
+            generation: 1,
+            dir: DirId::from_raw(0),
+            parent: None,
+            path: PathBuf::from("/scan/root"),
+            rows: Vec::new(),
+            totals: DirTotals::default(),
+            stats: ScanStats {
+                entries: 0,
+                dirs: 0,
+                errors: 0,
+                disk_bytes: 0,
+                elapsed: Duration::from_millis(1),
+                root_complete: true,
+            },
+            hardlink_inodes: 0,
+            degraded: false,
+        });
+        let ui = UiState::new(empty);
+        assert_eq!(
+            selected_path(&ui, &Phase::Transitioning),
+            SelectedPath::None
+        );
+    }
+
+    /// Flat view's full path needs the frozen arena's parent chain
+    /// (`flatview`'s module doc): before the scan completes,
+    /// `selected_path` refuses honestly instead of resolving to nothing
+    /// or, worse, a wrong path.
+    #[test]
+    fn selected_path_refuses_a_flat_row_mid_scan() {
+        let mut ui = UiState::new(sample_snapshot());
+        ui.toggle_flat_top();
+        assert_eq!(ui.mode(), ViewMode::FlatTop);
+        assert_eq!(
+            selected_path(&ui, &Phase::Transitioning),
+            SelectedPath::Unavailable(FLAT_ROW_DETAILS_LOCKED)
+        );
+    }
+
+    /// Post-scan, a flat row resolves to the same real path the frozen
+    /// arena would give `outcome.tree().path_of_node`, matching what
+    /// Enter-jump (`try_jump_flat_row`) already relies on.
+    #[test]
+    fn selected_path_resolves_a_flat_row_post_scan() {
+        let (mut ui, phase, tmp) = done_ui_with_two_files();
+        ui.toggle_flat_top();
+        let flat_config = FlatConfig::default();
+        ensure_flat_summary_fresh(&phase, &flat_config, &mut ui);
+        assert!(ui.flat_summary().is_some(), "fold populated the summary");
+
+        // Default sort is disk-desc, so "big" (8192 bytes) leads "small"
+        // (16 bytes) — cursor starts at 0.
+        assert_eq!(
+            selected_path(&ui, &phase),
+            SelectedPath::Path(tmp.path().join("big"))
+        );
+    }
+
+    /// A breakdown group is many entries folded together, never a single
+    /// path — refused the same honest way as the mid-scan flat case,
+    /// just for a structural reason instead of a timing one.
+    #[test]
+    fn selected_path_refuses_a_breakdown_row() {
+        let mut ui = UiState::new(sample_snapshot());
+        ui.toggle_breakdown();
+        assert_eq!(ui.mode(), ViewMode::Breakdown);
+        assert_eq!(
+            selected_path(&ui, &Phase::Transitioning),
+            SelectedPath::Unavailable(BREAKDOWN_NO_SINGLE_PATH)
+        );
+    }
+
+    /// `o`/`y` on a flat row mid-scan: routed through the real key
+    /// handler (not calling `selected_path` directly), confirming the
+    /// refusal actually reaches the toast queue the way the design asks
+    /// ("refuse with a toast rather than revealing the wrong thing") —
+    /// and that neither key panics or tries to spawn/write anything in
+    /// this state.
+    #[test]
+    fn o_and_y_toast_the_flat_mid_scan_refusal_through_the_real_key_handler() {
+        let mut ui = UiState::new(sample_snapshot());
+        ui.toggle_flat_top();
+        let mut phase = Phase::Transitioning;
+        let (mut generation, mut flash, mut toasts) = (1u64, Flash::new(), ToastQueue::new());
+
+        press(
+            KeyCode::Char('o'),
+            &mut ui,
+            &mut phase,
+            &mut generation,
+            &mut flash,
+            &mut toasts,
+        );
+        assert_eq!(
+            toasts.active().last().map(|t| t.message.as_str()),
+            Some(FLAT_ROW_DETAILS_LOCKED)
+        );
+
+        press(
+            KeyCode::Char('y'),
+            &mut ui,
+            &mut phase,
+            &mut generation,
+            &mut flash,
+            &mut toasts,
+        );
+        assert_eq!(
+            toasts.active().last().map(|t| t.message.as_str()),
+            Some(FLAT_ROW_DETAILS_LOCKED)
+        );
+    }
+
+    /// `o`/`y` on a breakdown row: same real-key-handler check as above,
+    /// for the structural (not timing) refusal.
+    #[test]
+    fn o_and_y_toast_the_breakdown_refusal_through_the_real_key_handler() {
+        let mut ui = UiState::new(sample_snapshot());
+        ui.toggle_breakdown();
+        let mut phase = Phase::Transitioning;
+        let (mut generation, mut flash, mut toasts) = (1u64, Flash::new(), ToastQueue::new());
+
+        press(
+            KeyCode::Char('o'),
+            &mut ui,
+            &mut phase,
+            &mut generation,
+            &mut flash,
+            &mut toasts,
+        );
+        assert_eq!(
+            toasts.active().last().map(|t| t.message.as_str()),
+            Some(BREAKDOWN_NO_SINGLE_PATH)
+        );
+
+        press(
+            KeyCode::Char('y'),
+            &mut ui,
+            &mut phase,
+            &mut generation,
+            &mut flash,
+            &mut toasts,
+        );
+        assert_eq!(
+            toasts.active().last().map(|t| t.message.as_str()),
+            Some(BREAKDOWN_NO_SINGLE_PATH)
+        );
     }
 
     /// D4 composition, end-to-end: applying a real filter over a real
