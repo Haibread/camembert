@@ -21,27 +21,39 @@ and no elevated shell was used; the process ran at medium integrity
 > (8.4 GiB) and the 200k tree; A 2 100.8 ms → C 153.7 ms, floor 109.4 ms,
 > peak RSS 17.0 → 39.4 MB.
 >
-> **Two corrections to what follows.**
+> **Three corrections to what follows**, the first two settled by a
+> follow-up measurement of three registry shapes (§4's Option C is the
+> *naive* one; two tuned shapes were built and measured after this dossier
+> was written).
 >
-> 1. **Option C does not overtake gdu.** §4 Option C says "1.13× faster
->    than gdu" and §6 says "overtakes gdu while doing it". Both invert the
->    comparison: C measured 153.7 ms against gdu's 144.6–146.7 ms, so C
->    reaches *parity*, a few percent behind. That is still 13.7× better
->    than today and it clears CLAUDE.md's "do not fall behind gdu-class
->    scanners" bar by a hair rather than by a margin — the 44 ms between C
->    and the floor is the per-singleton allocation §4 already identifies,
->    and closing it is what would make "overtakes" true.
-> 2. **The memory reservation is probably not clearable by tuning in the
->    shape §6.2 proposes.** `FxHashMap<u64, NodeId>` stores `(u64, u32)`,
->    which pads to 16 B, plus hashbrown's control byte, at ~16.8 M slots
->    for 10 M items ≈ 285 MB — on top of a ~320 MB tree that still
->    breaches D4, so §6.2's "≤ 24 B/entry" target may be unreachable *in
->    that shape*. A third shape the dossier does not consider — two
->    parallel flat vectors (`Vec<u64>` + `Vec<u32>`, no padding, no hash
->    overhead, ~120 MB at 10 M) sorted post-scan, which D3 already permits
->    — fits the budget but gives up *live* deduplication, so scan-time
->    totals would over-count hardlinks and snap at scan end. Being
->    measured; the decision waits on it.
+> 1. **§4/§6's gdu comparison is wrong twice over, in both directions.**
+>    Naive C measured 148–154 ms against gdu's 139–146 ms, so it reaches
+>    parity at best — "1.13× faster" inverts it. But the **tuned** shape
+>    (§6.2's, actually built) measured **107.5 ms**, i.e. 1.6 ms above the
+>    no-dedup floor and **1.33× faster than gdu**. So the conclusion
+>    "overtakes gdu" is right while the number supporting it is wrong, and
+>    it only becomes right once the per-singleton allocation §4 identifies
+>    is actually removed.
+> 2. **§6.2's "≤ 24 B/entry" is unreachable in the shape it names, and the
+>    tuning still succeeds.** `FxHashMap<u64, NodeId>` stores `(u64, u32)`,
+>    which pads to 16 B, plus hashbrown's control byte: **285.2 MB** at
+>    10 M measured directly, 28.5 B/entry — and because a scan cannot
+>    pre-size the map, the final doubling holds the old and new tables at
+>    once, so the honest **peak is 429 MB**. Measured on the 200k tree the
+>    same shape costs 23.5 B/entry; the two figures differ because hash
+>    capacity moves in steps, which is why 10 M was measured rather than
+>    extrapolated.
+> 3. **The dossier's framing of the memory reservation is backwards, and
+>    this is the important one.** It presents C as breaching D4 while the
+>    status quo fits. Measured at real Windows link densities, **the status
+>    quo blows D4 harder**: its `(dev,ino)` set plus `hardlink_firsts` come
+>    to ~369 MB at `System32`'s 92 % density versus the tuned map's 285 MB,
+>    putting today's binary at 1382–2308 MB at 10 M — 1.5–2.6× past D4's
+>    documented 900 MB hardlink-heavy ceiling. Nobody had noticed because
+>    nobody had scanned a Windows system drive at that scale. Neither C
+>    shape makes memory worse where it matters; they make it worse only on
+>    link-free trees, where the registry is useless and today it is free.
+>    D4 does not need defending against C — it needs a Windows row.
 
 ---
 

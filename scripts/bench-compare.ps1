@@ -184,7 +184,16 @@ if (Have 'hyperfine') {
     $hfArgs = @('--warmup', '2', '--min-runs', '5', '-i') + $prepare +
               @('--export-markdown', $md, '--export-json', $json)
     foreach ($b in $bench) { $hfArgs += @('--command-name', $b.Name, $b.Cmd) }
-    hyperfine @hfArgs
+    # Windows PowerShell 5.1 wraps a native command's stderr in ErrorRecords,
+    # so `$ErrorActionPreference = 'Stop'` aborts the run the moment hyperfine
+    # emits one of its warnings ("first run significantly slower", ...) — an
+    # intermittent failure that silently costs you the whole comparison.
+    # Relax the preference across the call only, and check the exit code
+    # explicitly instead.
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { hyperfine @hfArgs } finally { $ErrorActionPreference = $previous }
+    if ($LASTEXITCODE -ne 0) { throw "hyperfine exited with $LASTEXITCODE" }
     if (Test-Path $md) {
         $header = @("<!-- $ts | tree: $Tree ($Files files) -->") +
                   ($notes | ForEach-Object { "<!-- $_ -->" }) + ''
