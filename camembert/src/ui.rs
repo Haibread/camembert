@@ -56,6 +56,11 @@ mod fmt;
 mod freeable_panel;
 mod history;
 mod keymap;
+// The Windows selection card's link-count lookup: the one piece of
+// hardlink honesty the scan stopped paying for per file, bought back where
+// a user actually asks for it (`docs/design/windows-nlink-dossier.md`).
+#[cfg(windows)]
+mod nlink_rt;
 #[cfg(unix)]
 mod oracle;
 mod osc11;
@@ -600,6 +605,11 @@ fn event_loop(
     // D7: `--filter`/`FILTER` pre-applies the instant the scan completes,
     // exactly like a palette query the user typed and committed.
     let mut pending_filter_text = filter_text.filter(|text| !text.trim().is_empty());
+    // The Windows selection card's link-count lookup (`nlink_rt`): the same
+    // off-thread-job/pending-state/update-in-place shape as the reclaim
+    // oracle, applied to one row instead of a whole selection.
+    #[cfg(windows)]
+    let mut links = nlink_rt::LinkRuntime::new();
 
     loop {
         // 1. Input (drain everything pending; block at most one frame
@@ -613,6 +623,12 @@ fn event_loop(
             } else {
                 IDLE_POLL
             };
+        // A link-count query is in flight: the card owes the answer within a
+        // frame or two of it landing, so the loop cannot go back to sleep.
+        #[cfg(windows)]
+        if links.has_pending() {
+            deadline = FRAME;
+        }
         while event::poll(deadline)? {
             deadline = Duration::ZERO;
             match event::read()? {
@@ -839,6 +855,25 @@ fn event_loop(
         // from *within* a flat/breakdown mode must never leave a stale,
         // already-deleted row on screen past this very frame.
         ensure_flat_summary_fresh(&phase, &ctx.flat_config, &mut ui);
+
+        // 3.6. The selection card's link count (Windows only): poll whatever
+        // landed, then resolve the row the card is about to describe —
+        // spawning at most one off-thread query for it, memoised, and never
+        // touching the filesystem from this thread. Post-scan only: the
+        // "how many of them did this scan see" half reads the frozen arena's
+        // hardlink registry, which does not exist while the scan runs.
+        #[cfg(windows)]
+        {
+            links.poll(ui.flat_epoch());
+            let target = (ui.mode() == ViewMode::Tree && !ui.zen())
+                .then(|| ui.card_row().map(|row| row.node))
+                .flatten();
+            let state = match (&phase, target) {
+                (Phase::Done(lock), Some(node)) => links.state_for(lock, node, ui.flat_epoch()),
+                _ => None,
+            };
+            ui.set_link_state(state);
+        }
 
         // 4. Render.
         table_state.select((ui.row_count() > 0).then_some(ui.cursor()));
@@ -2544,21 +2579,26 @@ fn draw(
         (main_area, None)
     };
     let show_selection_card = !ui.zen() && ui.mode() == ViewMode::Tree && left_area.height >= 9;
-    // Freeable phase 2 slice 2 (D2): the card's floor figure/caveat lines,
-    // computed once here so the card's own height (below) and its content
-    // (`draw_selection_card`) never disagree about how many there are.
+    // The card's platform-specific extra lines, computed once here so the
+    // card's own height (below) and its content (`draw_selection_card`)
+    // never disagree about how many there are. Freeable phase 2 slice 2
+    // (D2) on Unix — the exclusive-floor figure plus at most one caveat;
+    // the link-count answer on Windows (`nlink_rt`), already resolved by
+    // the event loop into `UiState`.
     #[cfg(unix)]
-    let floor_lines: Vec<String> = match (ui.floor(), ui.card_row()) {
+    let card_extra: Vec<String> = match (ui.floor(), ui.card_row()) {
         (Some((floor, computed_at)), Some(row)) => {
             floor_rt::card_lines(floor, row, Instant::now(), computed_at)
         }
         _ => Vec::new(),
     };
-    // No FIEMAP, no exclusive floor, so the card keeps its base height.
-    #[cfg(not(unix))]
-    let floor_lines: Vec<String> = Vec::new();
+    #[cfg(windows)]
+    let card_extra: Vec<String> = nlink_rt::card_lines(ui.link_state(), spinner);
+    // Neither feature exists, so the card keeps its base height.
+    #[cfg(not(any(unix, windows)))]
+    let card_extra: Vec<String> = Vec::new();
     let (table_area, card_area) = if show_selection_card {
-        let card_height = 4 + floor_lines.len() as u16;
+        let card_height = 4 + card_extra.len() as u16;
         let [table, card] = Layout::vertical([Constraint::Min(1), Constraint::Length(card_height)])
             .areas(left_area);
         (table, Some(card))
@@ -2631,7 +2671,7 @@ fn draw(
         }
     };
     if let Some(card_area) = card_area {
-        draw_selection_card(frame, card_area, ui, &floor_lines, ctx);
+        draw_selection_card(frame, card_area, ui, &card_extra, ctx);
     }
     if layout == WheelLayout::Mini {
         draw_mini_donut(frame, header_area, &wheel_source, motion, ctx);
@@ -3559,7 +3599,7 @@ fn draw_selection_card(
     frame: &mut Frame<'_>,
     area: Rect,
     ui: &UiState,
-    floor_lines: &[String],
+    extra_lines: &[String],
     ctx: &RenderCtx,
 ) {
     let theme = &ctx.theme;
@@ -3637,11 +3677,12 @@ fn draw_selection_card(
         ]),
         Line::from(line2),
     ];
-    // Freeable phase 2 slice 2 (D2): the ambient floor figure, when there
-    // is one — `excl ≥ …`/"fully shared" in accent, at most one caveat
-    // beneath it dimmed, same styling split the confirm modal's oracle
-    // wording already uses.
-    if let Some((figure, caveat)) = floor_lines.split_first() {
+    // The platform's extra card lines, when there are any: the figure in
+    // accent, at most one caveat beneath it dimmed — the same styling split
+    // the confirm modal's oracle wording already uses. Unix fills these
+    // with the ambient exclusive floor (freeable phase 2 slice 2, D2),
+    // Windows with the row's link count (`nlink_rt`).
+    if let Some((figure, caveat)) = extra_lines.split_first() {
         lines.push(Line::from(
             Span::from(figure.clone()).fg(theme.color(theme::ACCENT)),
         ));
@@ -5218,6 +5259,254 @@ mod tests {
             text.contains("subtree"),
             "consequence for an unreadable dir: {text}"
         );
+    }
+
+    /// The Windows selection card's link count, driven end to end: a real
+    /// scan, a real `NtQueryInformationByName` through `nlink_rt`'s job
+    /// thread, and the real dashboard rendered into a `TestBackend`.
+    ///
+    /// The three cases are the ones the feature exists to tell apart, and
+    /// the first is the whole point: a file whose other link lives
+    /// **outside the scan root** is exactly the `C:\Windows\System32\
+    /// drivers` situation (728 of 756 files there have a WinSxS twin), and
+    /// it is the answer the scan gave up when it stopped paying a syscall
+    /// per file (`docs/design/windows-nlink-dossier.md`).
+    #[cfg(windows)]
+    mod windows_links {
+        use super::*;
+        use crate::ui::nlink_rt::{LinkRuntime, LinkState};
+
+        /// Scan `dir` and hand back a UI over it plus the frozen arena,
+        /// exactly as the event loop's `Phase::Done` transition does.
+        fn done_ui(dir: &Path) -> (UiState, Arc<RwLock<ScanOutcome>>) {
+            let outcome = scan_dir(dir);
+            let stats = view::scan_stats(outcome.tree(), outcome.root(), outcome.elapsed);
+            let snapshot = view::build_snapshot(
+                outcome.tree(),
+                outcome.root(),
+                1,
+                stats,
+                outcome.hardlink_inodes,
+                false,
+            );
+            (
+                UiState::new(Arc::new(snapshot)),
+                Arc::new(RwLock::new(outcome)),
+            )
+        }
+
+        /// Put the cursor on the row named `name`.
+        fn focus(ui: &mut UiState, name: &[u8]) {
+            for _ in 0..=ui.row_count() {
+                if ui.card_row().map(|row| &*row.name) == Some(name) {
+                    return;
+                }
+                ui.move_down();
+            }
+            panic!("no row named {}", String::from_utf8_lossy(name));
+        }
+
+        /// Drive the runtime the way step 3.6 of the event loop does, until
+        /// the query lands. Never a bare sleep as the only synchronization.
+        fn resolve(
+            rt: &mut LinkRuntime,
+            lock: &Arc<RwLock<ScanOutcome>>,
+            node: NodeId,
+        ) -> Option<LinkState> {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                rt.poll(0);
+                let state = rt.state_for(lock, node, 0);
+                if state != Some(LinkState::Pending) {
+                    return state;
+                }
+                assert!(Instant::now() < deadline, "the link query never landed");
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        /// The rendered dashboard, one `String` per terminal row, trailing
+        /// blanks trimmed — printed under `--nocapture` so the card's exact
+        /// wording is inspectable rather than only asserted about.
+        fn render_lines(ui: &UiState, phase: &Phase) -> Vec<String> {
+            let ctx = ctx(GlyphLevel::HalfBlock, ColorLevel::Truecolor);
+            let mut table_state = TableState::default();
+            let mut motion = no_motion();
+            let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw(
+                        frame,
+                        ui,
+                        phase,
+                        &mut table_state,
+                        '⠋',
+                        None,
+                        &[],
+                        &mut motion,
+                        &ctx,
+                        false,
+                        &[],
+                        None,
+                    );
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer().clone();
+            let area = buffer.area;
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .filter_map(|x| buffer.cell((x, y)).map(ratatui::buffer::Cell::symbol))
+                        .collect::<String>()
+                        .trim_end()
+                        .to_owned()
+                })
+                .collect()
+        }
+
+        /// The card's own three lines (the block under the table), located
+        /// by its border rather than by a fixed row index.
+        fn card_block(lines: &[String]) -> String {
+            let start = lines
+                .iter()
+                .rposition(|line| line.trim_start().starts_with('╭'))
+                .expect("the selection card's top border");
+            lines[start..]
+                .iter()
+                .take_while(|line| !line.trim_start().is_empty())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        #[test]
+        fn the_card_tells_the_three_link_stories_apart() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let root = tmp.path().join("root");
+            let elsewhere = tmp.path().join("elsewhere");
+            std::fs::create_dir_all(&root).expect("mkdir root");
+            std::fs::create_dir_all(&elsewhere).expect("mkdir elsewhere");
+            // Distinct sizes: the default sort is disk-descending, so the
+            // row order is deterministic and `focus` is unambiguous.
+            std::fs::write(root.join("twinned.bin"), vec![b'a'; 40_960]).expect("write");
+            std::fs::write(root.join("solo.bin"), vec![b'b'; 20_480]).expect("write");
+            std::fs::write(root.join("ghost.bin"), vec![b'c'; 4_096]).expect("write");
+            // The second link lives *outside* the scan root, so the scan
+            // cannot see it and only the query can.
+            if std::fs::hard_link(root.join("twinned.bin"), elsewhere.join("twin.bin")).is_err() {
+                eprintln!("skipping: this filesystem has no hardlinks");
+                return;
+            }
+
+            let (mut ui, lock) = done_ui(&root);
+            // Raced away between the scan and the query — the failure the
+            // card must report as *unknown* rather than as "no links".
+            std::fs::remove_file(root.join("ghost.bin")).expect("unlink the ghost");
+
+            let phase = Phase::Done(Arc::clone(&lock));
+            let mut rt = LinkRuntime::new();
+
+            for (name, expected) in [
+                (
+                    &b"twinned.bin"[..],
+                    "2 links · 1 outside this scan — deleting this frees nothing",
+                ),
+                (
+                    &b"solo.bin"[..],
+                    "1 link · nothing else points at this file",
+                ),
+                (&b"ghost.bin"[..], "links unknown · the entry is gone"),
+            ] {
+                focus(&mut ui, name);
+                let node = ui.card_row().expect("a focused row").node;
+                let state = resolve(&mut rt, &lock, node);
+                ui.set_link_state(state);
+                let lines = render_lines(&ui, &phase);
+                let card = card_block(&lines);
+                println!("--- {} ---\n{card}\n", String::from_utf8_lossy(name));
+                assert!(
+                    card.contains(expected),
+                    "expected {expected:?} on the card, got:\n{card}"
+                );
+            }
+        }
+
+        /// A row whose query is *refused* says so, with the reason. The
+        /// realistic shape of that on Windows is a denied **directory**: a
+        /// per-file ACL does not refuse `FileStatInformation`, which is a
+        /// traverse-only metadata query (measured on this box — a
+        /// `/deny (F)` ACE on the file itself still answers).
+        ///
+        /// The point of the assertion is the honesty contract, not the
+        /// wording: an unknown count must never render as an absence, which
+        /// a reader would take for "no other links".
+        #[test]
+        fn an_unreadable_directory_makes_the_links_unknown_never_absent() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let vault = tmp.path().join("vault");
+            std::fs::create_dir_all(&vault).expect("mkdir");
+            std::fs::write(vault.join("locked.bin"), vec![b'z'; 8192]).expect("write");
+            let (mut ui, lock) = done_ui(&vault);
+
+            // std exposes no ACL API; `icacls` is what the core crate's own
+            // test support uses for the same job.
+            let user = format!(
+                "{}\\{}",
+                std::env::var("USERDOMAIN").unwrap_or_default(),
+                std::env::var("USERNAME").unwrap_or_default()
+            );
+            let icacls = |args: &[&std::ffi::OsStr]| {
+                std::process::Command::new("icacls")
+                    .arg(&vault)
+                    .args(args)
+                    .output()
+                    .map(|out| out.status.success())
+                    .unwrap_or(false)
+            };
+            let deny = std::ffi::OsString::from(format!("{user}:(F)"));
+            icacls(&[std::ffi::OsStr::new("/inheritance:r")]);
+            icacls(&[std::ffi::OsStr::new("/deny"), &deny]);
+            if std::fs::read_dir(&vault).is_ok() {
+                eprintln!("skipping: icacls did not actually deny the directory");
+                icacls(&[std::ffi::OsStr::new("/reset")]);
+                return;
+            }
+
+            focus(&mut ui, b"locked.bin");
+            let node = ui.card_row().expect("a focused row").node;
+            let state = resolve(&mut LinkRuntime::new(), &lock, node);
+            // Restore before asserting, so a failure still leaves a
+            // removable tempdir behind.
+            icacls(&[std::ffi::OsStr::new("/reset")]);
+
+            ui.set_link_state(state);
+            let card = card_block(&render_lines(&ui, &Phase::Done(Arc::clone(&lock))));
+            println!("--- locked.bin (unreadable directory) ---\n{card}\n");
+            assert!(
+                card.contains("links unknown · "),
+                "a refused query must read as unknown, got:\n{card}"
+            );
+            assert!(
+                !card.contains("1 link"),
+                "an unknown count must never be rendered as an absence:\n{card}"
+            );
+        }
+
+        /// A directory gets no link line at all — not an unknown one. NTFS
+        /// reports 1 for every directory and the scan never asks either, so
+        /// a line here would be noise rather than honesty.
+        #[test]
+        fn a_directory_row_gets_no_link_line() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(tmp.path().join("sub")).expect("mkdir");
+            std::fs::write(tmp.path().join("sub/x"), b"x").expect("write");
+            let (mut ui, lock) = done_ui(tmp.path());
+            focus(&mut ui, b"sub");
+            let node = ui.card_row().expect("a focused row").node;
+            let mut rt = LinkRuntime::new();
+            assert_eq!(rt.state_for(&lock, node, 0), None);
+            assert!(nlink_rt::card_lines(None, '⠋').is_empty());
+        }
     }
 
     #[cfg(unix)]

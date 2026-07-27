@@ -26,6 +26,8 @@ use camembert_core::view::{Row, ViewSnapshot};
 
 #[cfg(unix)]
 use super::freeable_panel::{FreeableGroup, OpenWarning};
+#[cfg(windows)]
+use super::nlink_rt::LinkState;
 #[cfg(unix)]
 use super::oracle::OracleSlot;
 use super::palette::PaletteState;
@@ -464,6 +466,14 @@ pub struct UiState {
     /// longer describes — [`Self::clear_floor`]).
     #[cfg(unix)]
     floor: Option<(Arc<FloorMap>, Instant)>,
+    /// Windows only: the link-count answer for the row the selection card
+    /// is currently describing, resolved by `ui::nlink_rt`'s runtime in the
+    /// event loop and stamped here once per frame. `None` for a row that is
+    /// never queried at all (a directory, a link, a scan that already holds
+    /// true counts) — the card then shows no link line, which is different
+    /// from showing an unknown one.
+    #[cfg(windows)]
+    link_state: Option<LinkState>,
 }
 
 impl UiState {
@@ -509,6 +519,8 @@ impl UiState {
             filter: None,
             #[cfg(unix)]
             floor: None,
+            #[cfg(windows)]
+            link_state: None,
         };
         state.ensure_sorted();
         state
@@ -1125,6 +1137,24 @@ impl UiState {
     /// figure" in the meantime, same as before the first pass ever landed.
     pub fn clear_floor(&mut self) {
         self.floor = None;
+    }
+}
+
+/// Windows: the selection card's link count (`ui::nlink_rt`) — the
+/// platform counterpart of the ambient exclusive floor just above, and
+/// stored the same way: the runtime that owns the IO lives in the event
+/// loop, this state holds only the already-resolved answer.
+#[cfg(windows)]
+impl UiState {
+    /// Adopt the link-count answer for the row the card is about to
+    /// describe (`ui::nlink_rt::LinkRuntime::state_for`, once per frame).
+    pub fn set_link_state(&mut self, state: Option<LinkState>) {
+        self.link_state = state;
+    }
+
+    /// The current row's link-count answer, if it is a row that gets one.
+    pub fn link_state(&self) -> Option<LinkState> {
+        self.link_state
     }
 }
 
