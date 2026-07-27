@@ -294,6 +294,18 @@ fn hardlinks_are_counted_once_not_twice() {
         }
     });
 
+    // `walk_arena` deliberately skips the root's own node, and the root
+    // directory inode *is* part of `totals.apparent` — that is the whole
+    // reason camembert and `du -sb` disagree (README, "Honest numbers").
+    // Add it back, exactly as `dir_bytes` does. A directory is never a
+    // hardlink extra, so this is unconditional. Windows hid the omission:
+    // a scan root's apparent size reads 0 there, so the two sides matched
+    // at zero while Linux reported a real 4 KiB directory.
+    counted += outcome
+        .node(outcome.dir(outcome.root()).node)
+        .size()
+        .apparent;
+
     let payload = (N * FILE_BYTES) as u64;
     assert_eq!(files, 2 * N as u64, "every link is still its own entry");
     assert_eq!(
