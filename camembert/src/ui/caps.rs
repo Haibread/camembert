@@ -40,10 +40,13 @@
 //! higher than the Unix one. An explicitly set `TERM` still wins — under
 //! MSYS/Git Bash/Cygwin it is set, and it is then the better source.
 //!
-//! Glyphs deliberately stop at half-blocks there: those live in the base
-//! console fonts, whereas U+1FB00 sextant coverage depends on the font the
-//! user picked. A wheel drawn at 1×2 subpixels is what most Linux
-//! terminals get too.
+//! Glyphs key on the terminal rather than the platform. Windows Terminal
+//! announces itself through `WT_SESSION` (it has no `TERM` to match on)
+//! and its default Cascadia font covers U+1FB00.., verified on Windows 11
+//! by rendering the range rather than inferred — so it gets sextants. Any
+//! other Windows console stops at half-blocks: a legacy `conhost` can
+//! still be running a raster font, and empty boxes are worse than a
+//! coarser wheel.
 
 use clap::ValueEnum;
 use serde::Deserialize;
@@ -96,6 +99,11 @@ pub struct TermEnv {
     /// detection, so the whole Windows matrix stays unit-testable from a
     /// Linux CI runner and vice versa.
     pub windows_console: bool,
+    /// `WT_SESSION`, which only Windows Terminal sets. Present means the
+    /// renderer is its DirectWrite one with Cascadia as the default font,
+    /// which is the difference between a legacy console (raster fonts, no
+    /// U+1FB00 coverage) and one that draws sextants.
+    pub wt_session: Option<String>,
 }
 
 impl TermEnv {
@@ -107,6 +115,7 @@ impl TermEnv {
             term_program: var("TERM_PROGRAM"),
             no_color: var("NO_COLOR"),
             windows_console: cfg!(windows),
+            wt_session: var("WT_SESSION"),
         }
     }
 }
@@ -179,6 +188,14 @@ fn detect_glyphs(env: &TermEnv, color: ColorLevel) -> GlyphLevel {
 }
 
 fn is_modern_terminal(env: &TermEnv) -> bool {
+    // Windows Terminal advertises itself only through `WT_SESSION`; it has
+    // no TERM to match on. Verified on Windows 11 by rendering
+    // U+1FB00..U+1FB1F, which its default Cascadia font covers — a legacy
+    // `conhost` with a raster font does not, which is why this keys on the
+    // terminal and not on the platform.
+    if env.wt_session.is_some() {
+        return true;
+    }
     [&env.term, &env.term_program]
         .into_iter()
         .flatten()
@@ -202,6 +219,7 @@ mod tests {
             term_program: term_program.map(str::to_owned),
             no_color: no_color.map(str::to_owned),
             windows_console: false,
+            wt_session: None,
         }
     }
 
@@ -210,6 +228,14 @@ mod tests {
         TermEnv {
             windows_console: true,
             ..env(term, colorterm, None, no_color)
+        }
+    }
+
+    /// A Windows console that is Windows Terminal.
+    fn wt() -> TermEnv {
+        TermEnv {
+            wt_session: Some("d1c2…".to_owned()),
+            ..win(None, None, None)
         }
     }
 
@@ -343,7 +369,24 @@ mod tests {
         assert_eq!(
             Caps::detect(&bare, Auto).glyphs,
             HalfBlock,
-            "the wheel draws; sextants need font coverage we cannot assume"
+            "a legacy console may have a raster font: no sextants assumed"
+        );
+
+        // Windows Terminal identifies itself only via WT_SESSION, and its
+        // font does cover U+1FB00.. — verified by rendering the range on
+        // Windows 11 rather than inferred.
+        assert_eq!(Caps::detect(&wt(), Auto).glyphs, Sextant);
+        // Still subordinate to colour: no colour, no wheel at all.
+        assert_eq!(
+            Caps::detect(
+                &TermEnv {
+                    no_color: Some(String::new()),
+                    ..wt()
+                },
+                Auto
+            )
+            .glyphs,
+            Ascii
         );
 
         // The same silence on Unix still means mono — this is a platform

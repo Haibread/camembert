@@ -66,9 +66,10 @@ the same color paints its table row, its proportion bar, and its slice,
 so your eye links them instantly. The palette is Tokyo-Night-family
 truecolor with a full fallback ladder (256 → 16 → mono/ASCII) and
 [`NO_COLOR`](https://no-color.org) support. On Windows the ladder starts
-at truecolor with half-block glyphs: no console there sets `TERM` or
-`COLORTERM`, so those variables say nothing about the terminal rather
-than saying it is a poor one.
+at truecolor — no console there sets `TERM` or `COLORTERM`, so those
+variables say nothing about the terminal rather than saying it is a poor
+one — with sextants under Windows Terminal and half-blocks on a legacy
+console, whose font may not cover them.
 
 Everything you see is also clickable: table rows, wheel slices, the
 breadcrumb, the errors card (see [Mouse](#mouse-interactive-mode) below)
