@@ -860,6 +860,27 @@ impl Accumulator {
         self.add(cov, size);
     }
 
+    /// Add bytes to an already-recorded directory's own inode, without
+    /// counting it a second time.
+    ///
+    /// Windows only, and for one caller: a directory's size is not in the
+    /// listing that discovered it, so [`Accumulator::on_dir`] necessarily
+    /// accounted it at zero and the owner corrects it when the directory's
+    /// own handle answers (`scan::owner::Owner::correct_dir_own_size`). The
+    /// frozen-arena [`fold`] reads the corrected node, so without this the
+    /// two engines would disagree — the same D2 agreement invariant that
+    /// [`Accumulator::mark_hardlink`] exists for. The entry count is
+    /// deliberately untouched: the inode was counted by `on_dir`.
+    #[cfg(windows)]
+    pub(crate) fn add_dir_bytes(&mut self, dir: DirId, extra: Size) {
+        let bucket = match self.coverage_of(dir) {
+            Some(g) => &mut self.groups[g as usize],
+            None => &mut self.rest,
+        };
+        bucket.apparent += extra.apparent;
+        bucket.disk += extra.real;
+    }
+
     /// Record a non-directory entry, or a directory without a `DirMeta` (an
     /// excluded mount point). `is_extra` is the registry's
     /// `HARDLINK_EXTRA` verdict (extras contribute 0 and never rank);

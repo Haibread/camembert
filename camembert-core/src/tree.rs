@@ -804,6 +804,23 @@ impl Tree {
             (n.name_kind & !(0b111 << FLAGS_SHIFT)) | (u32::from(flags.bits()) << FLAGS_SHIFT);
     }
 
+    /// Overwrite a node's own size.
+    ///
+    /// Windows only, and deliberately narrow: the one caller is the owner
+    /// applying [`crate::scan::message::Batch::dir_own_size`], the by-handle
+    /// figure that corrects the zero a Windows directory listing reports for
+    /// every subdirectory. It must be paired with the matching
+    /// [`Tree::apply_delta`], or the node and the aggregates that were built
+    /// from it disagree — which is why it is not a general-purpose setter
+    /// and why nothing else may call it. On Unix a directory's size is
+    /// final the moment `statx` returns it, so this does not exist there.
+    #[cfg(windows)]
+    pub(crate) fn set_node_size(&mut self, id: NodeId, size: Size) {
+        let node = &mut self.nodes[id.index()];
+        node.apparent = size.apparent;
+        node.disk = size.real;
+    }
+
     pub(crate) fn mark_error(&mut self, dir: DirId) {
         self.dirs[dir.index()].state = DirState::Error;
     }

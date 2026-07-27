@@ -275,6 +275,8 @@ mod tests {
             is_last_section: true,
             child_dirs,
             dir_error: None,
+            #[cfg(windows)]
+            dir_own_size: None,
         }
     }
 

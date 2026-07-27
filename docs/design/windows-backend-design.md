@@ -263,11 +263,32 @@ because they are the load-bearing facts of this design.
 Two incidental findings worth writing down, because both are divergences
 from Linux that will otherwise surface as "bugs":
 
-- **Directories and reparse points report `EndOfFile = AllocationSize = 0`.**
-  On Linux a directory has a genuine `st_size`/`st_blocks` and a symlink's
-  `st_size` is its target's path length. On Windows both are zero, so
-  camembert's directory *self*-size is 0 there. Totals are unaffected;
-  per-directory "own size" is.
+- **Directories and reparse points report `EndOfFile = AllocationSize = 0`
+  *in a listing*.** On Linux a directory has a genuine `st_size`/`st_blocks`
+  and a symlink's `st_size` is its target's path length.
+  `FILE_ID_EXTD_DIR_INFO` gives neither. For a symlink that is probably
+  correct (the link text lives in the reparse buffer, not in file data — gap
+  3 in HANDOFF, still unconfirmed); for a **directory it is simply not what
+  the filesystem says**, and the same handle answers properly:
+  `FileStandardInfo` on a directory returns its real index allocation, which
+  is why the scan root — the one directory `open_root` sized by handle — was
+  right while every subdirectory read 0.
+
+  **Corrected 2026-07-27** (`Batch::dir_own_size`): the worker already opens
+  every directory to enumerate it, so it asks that handle for the size and
+  the owner applies it as a delta on the node its parent created. Measured
+  on a `sub/` of 400 files with 38-character names: 0 B as a child, 196 608 B
+  (48 INDX blocks) as a root; now 196 608 B either way. Verified byte-exact
+  against an independent oracle — opening the directory's own
+  `:$I30:$INDEX_ALLOCATION` stream by name and calling `GetFileSizeEx`,
+  a different object through a different call — at 0/1/10/50/100/200/400/800
+  entries: 0, 0, 4 096, 24 576, 49 152, 98 304, 196 608, 524 288 bytes, and
+  camembert reports each of them exactly. The zeros are real: NTFS keeps a
+  small index resident in the MFT record.
+
+  Directories that are never opened — junctions, volume mount points,
+  unknown reparse tags, and anything whose open failed — keep the listing's
+  0, which is the honest answer when there is no handle to ask.
 - **A 1-byte file reports `AllocationSize = 8`, not 0 and not one cluster.**
   MFT-resident files are accounted in bytes, not clusters. The earlier
   guess of "likely 0" was wrong. Report what the API says; do not invent an

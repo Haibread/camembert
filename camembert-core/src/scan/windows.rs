@@ -289,6 +289,30 @@ pub(crate) fn entry_size(end_of_file: i64, allocation_size: i64) -> Size {
     }
 }
 
+/// A directory's own size, asked of the handle instead of of its parent.
+///
+/// The listing that discovered this directory reported
+/// `AllocationSize = EndOfFile = 0` for it, as a Windows listing does for
+/// every subdirectory entry — but NTFS does charge a directory for its index
+/// (a `sub/` of 400 long-named files occupies ~192 KiB of INDX blocks), and
+/// `FileStandardInfo` on an open handle reports it. That asymmetry is why
+/// the scan root, opened by handle in [`open_root`], was the only directory
+/// whose self-size was ever right.
+///
+/// The worker opens every directory anyway in order to enumerate it, so this
+/// costs no extra open — only the information query, which the nlink dossier
+/// (§2.1) measured at ~1.13 µs against ~46 µs for a by-name open. The
+/// opposite regime from the `nlink` trap.
+///
+/// Errors are the caller's to swallow: the directory's *entries* are already
+/// being enumerated successfully, so a refused metadata query costs the
+/// directory its own index bytes and nothing else.
+pub(crate) fn dir_own_size(handle: &OwnedHandle) -> Result<Size, u32> {
+    let raw: HANDLE = handle.as_raw_handle().cast();
+    let standard: FILE_STANDARD_INFO = info_by_handle(raw, FileStandardInfo)?;
+    Ok(entry_size(standard.EndOfFile, standard.AllocationSize))
+}
+
 /// Resolve `threads` into a worker count.
 ///
 /// An explicit (non-zero) `threads` wins unchanged, as on Linux. `0` gets

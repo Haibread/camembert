@@ -194,9 +194,16 @@ inert *off* Windows, where link counts arrive inside `statx` for free (see
 - **Alternate data streams are invisible.** Every size is the unnamed
   `$DATA` stream, so a file with a 2 GiB ADS reports as small. Explorer has
   counted ADS since 8.1; camembert does not yet.
-- **Directories have no self-size.** Windows reports `AllocationSize = 0`
-  for a directory, where Linux reports real bytes. Subtree totals are
-  unaffected; a directory's own size is always 0.
+- **Directories carry their index bytes, like on Linux.** NTFS charges a
+  directory for its B-tree once it outgrows the MFT record — 400 files with
+  38-character names cost 192 KiB of index — and camembert counts it. A
+  Windows *directory listing* reports `AllocationSize = 0` for every
+  subdirectory in it, so the figure comes from the directory's own handle
+  instead, which the scan opens anyway. A directory small enough to keep a
+  resident index genuinely reports 0. The exceptions are directories
+  camembert never opens: a junction, a volume mount point or an unknown
+  reparse tag is recorded at the listing's 0, because there is no handle to
+  ask.
 - **Junctions and volume mount points are refused, never descended**, with
   or without `--one-filesystem`: a junction can point at its own ancestor
   and there is no cycle detection yet. A junction-heavy tree under-counts.
