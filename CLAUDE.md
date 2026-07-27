@@ -56,6 +56,25 @@ camembert slowdown against its own previous local run, or falling
 behind `gdu`/`dust`-class scanners on the same tree, is a regression:
 fix it or explain it in the change that introduces it.
 
+On Windows the same mandate holds through `scripts/bench-compare.ps1`:
+
+```powershell
+scripts\bench-compare.ps1              # warm cache, same 200k-file tree
+scripts\bench-compare.ps1 -Cold        # standby list purged (elevated shell)
+```
+
+It generates the identical tree layout and exports to the same place.
+Three things genuinely differ, and the script records each in the export
+rather than letting a number pass for something it is not: there is no
+`drop_caches`, so `-Cold` purges the standby list (the `RAMMap -Ew`
+call) and pages held in an active working set survive it; a real-time
+antivirus sits in the filter stack and taxes every scanner, so
+Defender's state and any exclusion covering the tree are stamped into
+the report; and the competitor set is `robocopy` (native, always
+present) plus whatever of `dust`/`diskus`/`gdu` is installed, since
+`du`/`dua`/`pdu`/`ncdu` are not packaged for Windows. **Never change the
+antivirus setting to make a number look better** — report it.
+
 ## Agents and model selection
 
 Delegate work to subagents (Agent tool) whenever it helps, and pick the model
