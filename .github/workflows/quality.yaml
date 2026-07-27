@@ -28,9 +28,10 @@ jobs:
       - name: run the test suite
         run: cargo test --workspace
 
-  # Windows is a second target, not a second CI story: there is no local
-  # Windows toolchain on any developer machine here, so this job is the
-  # authoritative check for the `cfg(windows)` arms.
+  # Windows is a second target, not a second CI story. Development does
+  # happen on a real Windows box now, but a developer machine is not a
+  # guarantee: this job is what keeps the `cfg(windows)` arms from
+  # bit-rotting the first time someone works only on Linux.
   #
   # `cargo test --workspace`, now that the integration test fixtures no
   # longer assume Unix at module level (they either gate the Unix-only ones
