@@ -176,6 +176,7 @@ fn run_scan(cli: &Cli) -> ExitCode {
         threads: args.threads,
         cross_filesystems: !args.one_filesystem,
         statx_engine: args.statx_engine.into(),
+        link_counts: args.links,
     });
 
     if interactive {
@@ -261,6 +262,24 @@ fn unix_now() -> i64 {
 /// about to rely on must be entirely valid or loudly rejected — every
 /// parse error is printed and the scan itself is skipped (exit 2), rather
 /// than silently running over a smaller-than-intended query.
+/// What the summary's `hardlinked inodes: N` line actually counted.
+///
+/// The number answers two different questions depending on whether the
+/// scan holds a real link count, and the difference is large enough to
+/// read as a regression if the line does not say so: on
+/// `C:\Windows\System32\drivers` the same tree reports 728 with `--links`
+/// and 0 without, while every byte of every total is identical. 728 is
+/// "inodes with siblings somewhere on the volume"; 0 is "inodes this scan
+/// actually reached twice", and only the second is knowable for free on
+/// Windows. See `docs/design/windows-nlink-dossier.md`.
+fn hardlink_line_qualifier(outcome: &camembert_core::scan::ScanOutcome) -> &'static str {
+    if outcome.link_counts_known {
+        "each counted once"
+    } else {
+        "reached by more than one path in this scan; each counted once"
+    }
+}
+
 fn summary(args: &ScanArgs, scanner: &Scanner, flat_config: &flat::FlatConfig) -> ExitCode {
     let filter_query = match &args.filter {
         Some(text) if !text.trim().is_empty() => {
@@ -399,8 +418,9 @@ fn summary(args: &ScanArgs, scanner: &Scanner, flat_config: &flat::FlatConfig) -
         );
         if outcome.hardlink_inodes > 0 {
             print!(
-                "  hardlinked inodes: {} (each counted once)",
-                outcome.hardlink_inodes
+                "  hardlinked inodes: {} ({})",
+                outcome.hardlink_inodes,
+                hardlink_line_qualifier(&outcome)
             );
         }
         println!();

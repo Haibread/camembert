@@ -331,6 +331,12 @@ pub(crate) fn probe_uring() -> Result<(), String> {
 /// detection. Refusing is the only setting that cannot loop; a
 /// junction-heavy tree under-counts, and that is a documented T1
 /// divergence.
+///
+/// [`Shared::query_link_counts`] is deliberately **not** a parameter here:
+/// the signature is shared with the Linux backend, which has no such knob
+/// (its link counts ride inside `statx` for free), so `scan.rs` sets the
+/// field on the returned struct in a `cfg(windows)` block instead of
+/// growing a parameter every non-Windows caller would ignore.
 pub(crate) fn start(
     threads: usize,
     root: Root,
@@ -344,6 +350,7 @@ pub(crate) fn start(
         stealers: queues.iter().map(WorkerQueue::stealer).collect(),
         pending_jobs: AtomicUsize::new(1),
         next_token: AtomicU64::new(ROOT_TOKEN + 1),
+        query_link_counts: false,
         nt_stat_supported: AtomicBool::new(true),
         id_folded: AtomicBool::new(false),
         vol: root_dev,

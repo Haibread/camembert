@@ -201,7 +201,18 @@ fn dump_of_a_real_scan_holds_the_spec_invariants() {
     assert_eq!(link_entries.len(), 2, "both links keep full metadata");
     for e in &link_entries {
         assert!(e["i"].is_string(), "ino is a JSON string: {e}");
-        assert_eq!(e["l"], 2);
+        // `l` only when the scan actually obtained a link count. A Windows
+        // scan without `--links` never asks (the call is a per-file
+        // syscall, spec §8.1), and the honest encoding of "we did not ask"
+        // is an absent field, not a plausible number.
+        if outcome.link_counts_known {
+            assert_eq!(e["l"], 2);
+        } else {
+            assert!(
+                e.get("l").is_none(),
+                "a scan with no link count must not write one: {e}"
+            );
+        }
     }
     let link_size = fs::metadata(root_path.join("link1")).unwrap().len();
     let root_d = d_lines[0];

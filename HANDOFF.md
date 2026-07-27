@@ -358,55 +358,96 @@ that before touching any of this. This section is only the state.
 ### Where it stands
 
 The **whole workspace** compiles on `x86_64-pc-windows-msvc` — 0 errors, 0
-warnings — and the binary scans, browses and dumps for real. 170 lib tests
-green there. Linux is untouched throughout: 596 tests green at every
-commit, and the warm 200k-file bench moved 70.8 -> 68.3 ms across the seam
-commit, which is noise.
+warnings, clippy clean at `-D warnings` — and the binary scans, browses and
+dumps for real. `cargo test --workspace` there: **375 passing, 0 failing**.
+Linux is untouched throughout: 596 tests green at every commit, and the
+warm 200k-file bench moved 70.8 -> 68.3 ms across the seam commit, which
+is noise.
 
 Merged, in order: `358e05b` binary's Unix couplings; `b47d898` the
 platform seam under `scan/linux/`; `c2a9ccf` `cfg`-gated modules and deps;
 `dccada7` `ScanErrno` (the actual blocker — see below); `ae8dd04` the
 `OsStr` bridge; `9e837fd` the design doc; `afdc727` the windows-2025 CI
 job; `c656ea2` the Windows scan backend; `5dc5928` the reduced TUI;
-`e38c3f3` the Windows bench harness.
+`e38c3f3` the Windows bench harness; `f433a85` the integration tests
+running there; `271390c` the nlink dossier; then the four commits that
+close the performance hole below.
 
-### The performance hole, measured 2026-07-27
+### The performance hole — closed 2026-07-27, landing 1 of 2
 
-`scripts/bench-compare.ps1` exists now (see CLAUDE.md "Benchmarks"), and
-its first run says the Windows backend is **14× behind the reference
-scanner**. Warm, 200k-file synthetic tree, Ryzen 9 5950X / NVMe / NTFS,
-Defender real-time protection on:
+`scripts/bench-compare.ps1`'s first run said the Windows backend was 14×
+behind gdu, and 95 % of the scan was one line: `worker.rs::query_nlink`,
+`NtQueryInformationByName(FileStatInformation)` once per non-directory
+entry purely to obtain a link count. The dossier
+([windows-nlink-dossier.md](docs/design/windows-nlink-dossier.md), read
+its orchestrator's review note first — it corrects three things the body
+gets wrong) measured why and what it bought. Short version: the call is an
+**open** (97.6 % of its 46 µs is the create path through fourteen
+minifilters), and it **changed no total on any tree**. What deduplicates
+hardlinks is the owner's inode registry; `nlink > 1` was only ever a gate
+on entering it, and on Windows that gate admits 92 % of `C:\Windows\
+System32` anyway.
 
-| tool | mean |
-|---|---|
-| gdu | 145 ms |
-| robocopy `/L /S` | 599 ms |
-| **camembert** | **2080 ms** |
-| diskus | 3515 ms |
-| dust | 3898 ms |
+**Shipped: the registry keys on the listing's own file id, and a repeat
+sighting deduplicates.** Zero per-entry calls. Warm, 200k-file synthetic
+tree, Ryzen 9 5950X / NVMe / NTFS, Defender real-time protection **on and
+unmodified** throughout:
 
-Nearly all of it is one line. `worker.rs::query_nlink` —
-`NtQueryInformationByName(FileStatInformation)`, called once per
-non-directory entry purely to obtain the link count — costs **95 % of the
-scan**: forcing `nlink` to 1 takes the same tree from 2080 ms to **121 ms**,
-which would put camembert ahead of gdu. That is ~10 µs per call, far above
-a syscall, and the suspicion is the object manager's path parse plus the
-antivirus minifilter, not the query itself.
+| tool | before | after |
+|---|---|---|
+| **camembert** | **2044 ms** | **107.0 ms** |
+| gdu | 138 ms | 138 ms |
+| robocopy `/L /S` | 582 ms | 573 ms |
+| diskus | 3167 ms | 3067 ms |
+| dust | 3890 ms | 3666 ms |
 
-Two things this is *not*. It is not a platform floor: gdu does the
-identical tree on the same box with the same antivirus in 145 ms. And it
-is not a free fix: the call is what buys hardlink dedup, which is one of
-the project's honest-numbers claims, so removing it outright sells
-correctness for speed. A dossier at
-[windows-nlink-dossier.md](docs/design/windows-nlink-dossier.md) works
-the options (probabilistic pre-filter, exact in-scan dedup by `(dev,ino)`,
-deferred second pass) with their honesty costs priced. **Decide it before
-touching the hot path.**
+19.1× faster than it was, 1.29× faster than gdu. `C:\Windows`: 5845 →
+2643 ms. Peak RSS is the price and it is workload-shaped: 16.99 → 21.46 MB
+on the 200k tree (23.4 B/entry, exactly where the registry is useless
+because the tree has no hardlinks), 84.95 → 87.43 MB on `C:\Windows`.
 
-Note also that thread scaling was measured at 1/2/4/8/12/16/24/32 workers
-and 8 came out optimal, with 12+ regressing ~45 %. Do not trust that
-number after the nlink fix — it measured a workload that was 95 % one
-syscall, and the shape will change completely. Re-measure.
+**Totals are unchanged, verified per entry, not at the root**: dumps from
+the shipped binary and the new one, run through `camembert diff`, on the
+`mklink /H` fixture, `System32\drivers`, `System32` (8.4 GiB) and the 200k
+tree — `diskDelta 0, apparentDelta 0, entryDelta 0` on all four. The 25
+`touched` entries on `System32` are Windows' own event logs churning
+between runs; the shipped binary diffed against *itself* twenty minutes
+apart shows the same 25, all with zero size deltas.
+
+What changed besides the speed, and why each is not a regression:
+
+- **`hardlinked inodes: N` counts something narrower** — inodes reached by
+  more than one path *in this scan*, not inodes with `nlink > 1`
+  somewhere on the volume. 728 → 0 on `System32\drivers`, whose 728
+  linked files all have their siblings in WinSxS, outside the scan. The
+  line says which one it is, in those words, because otherwise the drop
+  reads as a regression. Linux wording is untouched.
+- **Dumps omit `l`** rather than write the registry's admission marker.
+  `i` is still written for genuine groups, so `drivers` goes 14 617 →
+  10 713 bytes and the 200k tree stays at ~122 KB (121 757 → 121 759,
+  which is the elapsed-time field). Spec §8.1 is the platform note.
+- **`--links`/`LINKS`** restores all of it — the call, the true count, `l`,
+  and the "links you cannot see" reading of `⛓`. Measured at 5693 ms on
+  `C:\Windows` against the shipped binary's 5845 and 1.965 s on the 200k
+  tree, i.e. it *is* the old behaviour. Documented as experimental with
+  the cost on the label, in per-*file* terms (~19× on a file-dense tree,
+  ~2× on `C:\Windows`) since directories are never queried.
+- **`camembert-core/tests/scan.rs::hardlinks_are_counted_once_not_twice`**
+  is the guard that should have existed all along: 64 files + 64 hard
+  links, portable, running in the `windows-2025` job.
+
+**Landing 2 is not done and is the obvious next step**: the lazy per-file
+link query *at the point of consumption* — the selection card (1 file,
+~40 µs, invisible) and the visible viewport's `⛓` column (~50 rows,
+1.4-2.4 ms, memoisable per inode, off the 33 ms cadence). That is what
+buys back the at-a-glance "deleting this frees nothing" answer for the
+rows a user is actually looking at, without a whole-tree sweep. Dossier
+§4 Option D describes it.
+
+Note that thread scaling was measured at 1/2/4/8/12/16/24/32 workers
+before this change and 8 came out optimal, with 12+ regressing ~45 %. **Do
+not trust that number now** — it measured a workload that was 95 % one
+syscall, and the shape has changed completely. Re-measure.
 
 ### Decisions taken, not to be relitigated without a new element
 
@@ -420,6 +461,14 @@ syscall, and the shape will change completely. Re-measure.
   prefix, numbered from 2^24 so the decimal fallback can never collide
   with an errno, and unconditional so a Windows-written dump decodes on
   Linux.
+- **The Windows scan does not ask for link counts** (2026-07-27, user
+  decision on the dossier's recommendation). Hardlink dedup keys on the
+  directory listing's file id and a repeat sighting, not on `nlink > 1`;
+  `--links` opts back in. The load-bearing fact is that totals are
+  byte-identical — reopening this needs a tree where they are not, not a
+  preference. What is *not* settled and stays open: whether the summary
+  counter's two meanings should ever be reconciled (they answer different
+  questions and both are true), and landing 2's consumption-point lookup.
 - **The Windows TUI is reduced, not absent** (2026-07-26). Table, wheel,
   gauge, navigation, sorting, filtering, flat view, diff, dump and themes
   survive; deletion, the freeable panel, the confidence verdict and the
@@ -440,13 +489,17 @@ is the one that actually pins it; update it deliberately.
 
 ### Known gaps, in rough value order
 
-1. **Reparse points get no link count**, because the guard skips the stat
-   call for anything the listing flagged. WinSxS is both heavily
-   hardlinked *and* heavily WOF-compressed, so on a Compact-OS system
-   those hardlinks will not dedup and `C:\Windows` over-reports. The §7.3
-   measurement says the call is already lstat-shaped with or without
-   `OBJ_DONT_REPARSE`, so relaxing the guard for ordinary tags looks safe.
-   This is the obvious next fix.
+1. **Reparse points never enter the hardlink registry.** The guard that
+   used to skip the *stat call* for anything the listing flagged now skips
+   *registry admission* for it, so the consequence is unchanged and the
+   fix is now cheaper: WinSxS is both heavily hardlinked *and* heavily
+   WOF-compressed, so on a Compact-OS system those hardlinks do not dedup
+   and `C:\Windows` over-reports. Under the old shape relaxing the guard
+   meant paying 46 µs for every WOF file; under the new one it costs a
+   hash insert. Deliberately **not** done in the same change as the
+   registry rework — it moves totals, which that change is specifically
+   claiming it does not, and it deserves its own before/after. Obvious
+   next fix, and now a cheap one.
 2. ~~The integration tests do not compile on Windows.~~ **Closed
    2026-07-27.** `cargo test --workspace` runs there: **374 tests pass, 0
    fail**, and the `windows-2025` CI job is now `cargo test` rather than
@@ -499,8 +552,9 @@ locally; `scripts/bench-compare.ps1` and the competitor binaries under
 `target/bench-tools/bin` are set up there.
 
 The `windows-2025` CI job is still the thing that lasts and the check that
-protects the port from bit-rot, so keep it honest — graduating it from
-`cargo check` to `cargo test` is gap #2 below.
+protects the port from bit-rot, so keep it honest. It runs `cargo test
+--workspace --locked` as of 2026-07-27 (gap #2 below), which is what makes
+a hardlink-accounting change on this platform reviewable at all.
 
 Kept for the record, should a second machine ever be needed: Scaleway
 Windows instances cost ~0.38 EUR/h on the only SKUs supporting the image

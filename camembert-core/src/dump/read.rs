@@ -753,6 +753,7 @@ mod tests {
             &tree,
             root,
             &links,
+            true,
             &stats,
             1_753_142_400,
             Vec::new(),
@@ -828,9 +829,17 @@ mod tests {
             elapsed_secs: 1.25,
         };
         // Tiny frames so cutting the file leaves several intact ones.
-        let bytes =
-            crate::dump::write_records(&tree, root, &links, &stats, 1_753_142_400, Vec::new(), 64)
-                .expect("write");
+        let bytes = crate::dump::write_records(
+            &tree,
+            root,
+            &links,
+            true,
+            &stats,
+            1_753_142_400,
+            Vec::new(),
+            64,
+        )
+        .expect("write");
 
         // Cut inside the byte stream: everything decodable before the torn
         // frame must come back; completeness must be false.

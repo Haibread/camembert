@@ -34,15 +34,39 @@ use tracing::debug;
 
 use crate::tree::{DirId, NodeFlags, NodeId, Tree};
 
-/// Side record for one `nlink > 1` non-directory link. The packed 32-byte
+/// [`HardlinkLink::nlink`] when the scan never asked the filesystem for a
+/// link count — the Windows default, where obtaining one costs a per-file
+/// syscall and buys no total (`docs/design/windows-nlink-dossier.md`).
+///
+/// Zero, not one and not two: no live file has zero links, so it can never
+/// be mistaken for a real count, and every "did the scan see every link?"
+/// test of the shape `nodes.len() == nlink` (freeable-2 D4) therefore
+/// fails **closed** by construction rather than by remembering to check a
+/// flag. The scan-wide fact is [`crate::scan::ScanOutcome::link_counts_known`],
+/// which is what gates the dump's `l` field.
+pub const NLINK_UNDETERMINED: u32 = 0;
+
+/// Side record for one registered non-directory link. The packed 32-byte
 /// [`crate::tree::Node`] has no room for `ino`/`dev`/`nlink`, so the owner
 /// keeps them here (also consumed by the dump writer for the `i`/`l`
 /// entry fields).
 ///
-/// The registry records **only `nlink > 1` inodes**: a file with a single
-/// link never appears here. Callers applying the freeable-2 D4 hardlink
-/// rule ("all links inside the selection, and the scan saw every link")
-/// therefore treat absence from the registry as `nlink == 1`.
+/// What lands here depends on how the scan learned about links
+/// ([`crate::scan::ScanOutcome::link_counts_known`]):
+///
+/// - link counts known (every Unix scan; Windows under `--links`): only
+///   `nlink > 1` inodes, and **every** link of them, first and extras. A
+///   file with a single link never appears.
+/// - link counts not obtained (the Windows default): only inodes the scan
+///   reached by **more than one path**, and `nlink` is
+///   [`NLINK_UNDETERMINED`]. An inode with links outside the scan root is
+///   indistinguishable from one with none, which is exactly what "we did
+///   not ask" means.
+///
+/// Callers applying the freeable-2 D4 hardlink rule ("all links inside the
+/// selection, and the scan saw every link") treat absence from the
+/// registry as `nlink == 1`; under the second shape they must also fail
+/// closed on the count, which [`NLINK_UNDETERMINED`] makes automatic.
 #[derive(Debug, Clone, Copy)]
 pub struct HardlinkLink {
     /// The tree node of this link (one entry per *link*, so an inode with
@@ -53,11 +77,12 @@ pub struct HardlinkLink {
     /// `st_ino` of the inode.
     pub ino: u64,
     /// `st_nlink` as stat reported it: the number of links that *exist*
-    /// on the filesystem, scanned or not.
+    /// on the filesystem, scanned or not — or [`NLINK_UNDETERMINED`] when
+    /// the scan never asked.
     pub nlink: u32,
 }
 
-/// All scanned links of one `nlink > 1` inode, grouped by `(dev, ino)` —
+/// All scanned links of one registered inode, grouped by `(dev, ino)` —
 /// the freeable-2 D4 rule inputs: an inode's bytes are freeable only when
 /// the selection contains every scanned link (`nodes`) **and** the scan
 /// saw every link that exists (`nodes.len() as u32 == nlink`).
@@ -65,7 +90,10 @@ pub struct HardlinkLink {
 pub struct HardlinkGroup {
     /// Every scanned link of the inode (at least one).
     pub nodes: Vec<NodeId>,
-    /// `st_nlink` — total links existing on the filesystem.
+    /// `st_nlink` — total links existing on the filesystem, or
+    /// [`NLINK_UNDETERMINED`] when the scan never asked (the Windows
+    /// default). Zero makes the D4 equality above false, so a group whose
+    /// count is unknown is never treated as wholly seen.
     pub nlink: u32,
 }
 

@@ -16,11 +16,22 @@
 //!   for zero per-entry syscalls. The rejected alternative
 //!   (`CreateFileW` + `GetFileInformationByHandle` + `CloseHandle` per
 //!   entry) is 20-200× more expensive per published measurements.
-//! - **Only the link count still costs a call**, and only for plain files:
-//!   [`query_nlink`] via `NtQueryInformationByName(FileStatInformation)`,
-//!   which its own Remarks describe as working "without opening the actual
-//!   file". So the per-directory shape stays `openat`-like: 1 open,
-//!   ⌈n/~1000⌉ listing calls, n_files link lookups.
+//! - **The link count is not asked for at all**, by default. It is the one
+//!   field the listing does not carry, and obtaining it means
+//!   [`query_nlink`] — `NtQueryInformationByName(FileStatInformation)` —
+//!   once per plain file. Its Remarks say it works "without opening the
+//!   actual file"; measured, that means *without handing you a handle*.
+//!   The file object is still created and all fourteen registered
+//!   minifilters still see the `IRP_MJ_CREATE`, so the call costs ~46 µs —
+//!   97.6 % of it the create path — and it was **95 % of the whole scan**.
+//!   It bought no total on any tree measured, because what deduplicates
+//!   hardlinks is the owner's `(dev, ino)` registry and `nlink > 1` was
+//!   only ever a gate on entering it. So the default admits every plain
+//!   file to the registry on the listing's own file id and deduplicates on
+//!   a repeat sighting, for zero syscalls; `--links` restores the call for
+//!   users who want the true count. The whole measurement is
+//!   `docs/design/windows-nlink-dossier.md`. Per-directory shape by
+//!   default: 1 open, ⌈n/~1000⌉ listing calls, **0** per-entry calls.
 //! - **Paths, not descriptors.** There is no `openat`, so a child is opened
 //!   by its full `\\?\` path. That loses the Linux backend's immunity to
 //!   hostile symlink swaps mid-walk; the compensating guard is that no
@@ -77,6 +88,18 @@ const LISTING_BUF_BYTES: usize = 64 * 1024;
 
 /// Backoff while the queues are empty but jobs are still in flight.
 const IDLE_BACKOFF: Duration = Duration::from_micros(200);
+
+/// The `nlink` a listing entry carries when no link count was asked for
+/// (the default, [`WorkerShared::query_link_counts`] unset): a bare
+/// **registry-admission marker**, not a count.
+///
+/// The owner's admission test is `entry.nlink > 1`, and it is deliberately
+/// left as the one place that decides. This value means "this entry has a
+/// usable file id and is worth registering"; under
+/// `scan::owner::LinkPolicy::FileIdRepeat` the owner then deduplicates on
+/// a repeat sighting and never reads the number again. It must never reach
+/// a dump — `ScanOutcome::link_counts_known` is what stops it.
+const REGISTRY_ADMIT: u32 = 2;
 
 /// Byte offset of the variable-length name inside a listing entry.
 const NAME_OFFSET: usize = std::mem::offset_of!(FILE_ID_EXTD_DIR_INFO, FileName);
@@ -154,7 +177,15 @@ pub(crate) struct WorkerShared {
     pub pending_jobs: AtomicUsize,
     /// Flat unique directory tokens; one `fetch_add` per *directory*.
     pub next_token: AtomicU64,
+    /// Ask the filesystem for every plain file's true link count
+    /// (`--links`). Unset by default: see the module docs and
+    /// `docs/design/windows-nlink-dossier.md` for the ~46 µs-per-file
+    /// price and the reason it buys no total.
+    pub query_link_counts: bool,
     /// `NtQueryInformationByName(FileStatInformation)` availability.
+    ///
+    /// Only consulted when [`WorkerShared::query_link_counts`] is set;
+    /// the default path issues no such call and never touches it.
     ///
     /// Measured working against a directory handle with a bare relative
     /// name on Windows Server 2022 / NTFS, which proves it works on *that*
@@ -548,16 +579,20 @@ fn handle_entry(
     } else {
         fold_file_id(info.FileId.Identifier, &ctx.shared.id_folded)
     };
-    // The link count is the one field the listing does not carry, and the
-    // only per-entry call in this backend. Skipped for directories (the
-    // owner never reads a directory's nlink), for reparse points (belt and
-    // braces: the call is already lstat-shaped, but an entry we will never
-    // descend into does not need one), and for volumes that issue no ids,
-    // where a link count without an inode to key it on is unusable.
+    // Registry admission, and — under `--links` only — the one per-entry
+    // call in this backend. Both are skipped for directories (the owner
+    // never reads a directory's nlink), for reparse points (an entry we
+    // will never descend into needs no link count, and admitting one on
+    // its file id would change what the WOF-compressed slice of
+    // `C:\Windows` deduplicates to — a separate question, deliberately not
+    // reopened here), and for volumes that issue no ids, where an inode
+    // identity does not exist to key anything on.
     let nlink = if class.kind == Kind::Dir || is_reparse || sentinel {
         1
-    } else {
+    } else if ctx.shared.query_link_counts {
         query_nlink(&ctx.handle, name_w, &ctx.shared.nt_stat_supported)
+    } else {
+        REGISTRY_ADMIT
     };
 
     let name = wtf8_name(name_w);

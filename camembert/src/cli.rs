@@ -124,6 +124,41 @@ pub(crate) struct ScanArgs {
     #[arg(long, env = "ONE_FILESYSTEM")]
     pub(crate) one_filesystem: bool,
 
+    /// Windows: look up every file's true link count — ~19x slower on a
+    /// file-dense tree, experimental (env: LINKS)
+    ///
+    /// Accepted but inert off Windows, where `st_nlink` arrives inside the
+    /// `statx` result the scan already asks for: link counts there are
+    /// always exact and always free.
+    ///
+    /// On Windows the directory listing carries everything about an entry
+    /// *except* its link count, and obtaining one costs a per-file
+    /// `NtQueryInformationByName` call. That call was measured at ~46us —
+    /// 95% of a whole scan — because it instantiates a file object and
+    /// every registered minifilter (fourteen on a stock Windows 11, one of
+    /// them Defender) inspects the create. It also changed no total on any
+    /// tree measured: what deduplicates hardlinks is the inode registry,
+    /// and the link count was only ever a gate on entering it. So the
+    /// default registers every file on the id the listing already provides
+    /// and deduplicates on a repeat sighting, for zero extra syscalls.
+    ///
+    /// What this flag buys back, and what it costs: with it, `hardlinked
+    /// inodes: N` counts inodes with more than one link *on the volume*
+    /// (WinSxS links most of `C:\Windows`, so `⛓` again means "deleting
+    /// this frees nothing, there are links you cannot see"), and dumps
+    /// carry the `l` field. Without it, that line counts inodes reached by
+    /// more than one path *in this scan*, and dumps omit `l` rather than
+    /// invent one. The price is per *file* — directories and reparse
+    /// points are never queried — so the factor tracks the file:directory
+    /// ratio: ~19x on a 200k-file synthetic tree, ~2x on `C:\Windows`.
+    /// Totals are identical either way.
+    ///
+    /// Experimental: the surface may change as the lazy per-file lookup at
+    /// the point of consumption lands, which is expected to make the
+    /// whole-scan sweep unnecessary for most users.
+    #[arg(long, env = "LINKS")]
+    pub(crate) links: bool,
+
     /// Stat engine for the scan: auto, sync, io_uring — experimental (env: STATX_ENGINE)
     ///
     /// Per-entry metadata (statx) is fetched either with plain syscalls
