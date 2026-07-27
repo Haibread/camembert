@@ -149,8 +149,8 @@ style).
 | `m` | mtime, unix seconds | always |
 | `k` | kind: `l` symlink, `b`/`c` block/char dev, `f` fifo, `s` socket | non-regular files only |
 | `u` `g` `p` | uid, gid, mode bits | ext mode; elided when equal to block default |
-| `i` | inode (string) | when `nlink>1`, or always if `allino` |
-| `l` | nlink | when `nlink>1` |
+| `i` | inode (string) | when the entry is a link of a multi-link inode, or always if `allino` |
+| `l` | nlink | when `nlink>1` **and** the writer obtained a link count (§8) |
 | `dev` | device (string) | when ≠ block default |
 | `err` | `true`: stat/read failed | on error |
 | `er` | errno name (`"EACCES"`, `"EIO"`, …) or decimal string; the reason behind `err` | minor 1; when the reason is known |
@@ -192,6 +192,38 @@ link whose full path is smallest under the §4 comparator, among the links
 seen by this scan. Subtree totals (`ta`/`td`/`tn`) count the inode's sizes
 at the owner only; other links contribute 0 to aggregates but keep full
 per-entry metadata. Writers and differs must apply the same rule.
+
+### 8.1 Platform note: writers with no link count
+
+The rule above is phrased on `nlink > 1` because that is what a `statx`
+result hands a Unix scanner for free. On **Windows** it is not free: no
+directory information class carries `NumberOfLinks`, and every class that
+does is per-file and costs a file-object create (~46 µs, measured at 95 %
+of a whole scan). A Windows scan therefore does not ask by default, and
+the rule it applies instead is:
+
+> For each `(dev, ino)` **reached by more than one path in this scan**,
+> the canonical owner is the link whose full path is smallest under the §4
+> comparator, among the links seen by this scan.
+
+The two rules select **the same canonical owner for every genuine group**:
+an inode with several links inside the scan qualifies under both, and the
+minimum is taken over the same set of paths either way. What differs is
+which inodes are in the registry at all — an inode with exactly one link
+inside the scan and more outside is a group of one under the first rule
+and not a group under the second — and a group of one attributes its bytes
+to its only link under both. Subtree totals are consequently identical;
+this is measured, not argued (`docs/design/windows-nlink-dossier.md`).
+
+Such a writer **must omit `l`**. It has no link count to report, and an
+absent `l` already means "single link, or not emitted" to every reader,
+while a fabricated one would assert a number no filesystem reported. `i`
+is still written for every registry member: the inode identity is real,
+and it is what a reader groups links by. Readers must therefore accept an
+entry carrying `i` without `l`.
+
+`camembert --links` (Windows) restores the per-file lookup and with it the
+first rule, `l`, and the usual meaning of both.
 
 ## 9. Crash tolerance and degraded states
 

@@ -26,10 +26,17 @@
 //! - Consequently the number of `d` lines is `dirs` (scanned, including
 //!   unreadable-but-statted ones — what the `e` line reports) **plus**
 //!   those synthetic excluded/stat-failed directory lines.
-//! - **Entry `dev`** is emitted only for `nlink > 1` entries whose device
-//!   differs from the containing directory's (the packed node stores no
-//!   per-entry device; a regular entry's device equals its directory's on
-//!   every path the scanner takes, since mount points are dir-kind).
+//! - **Entry `dev`** is emitted only for registered multi-link entries
+//!   whose device differs from the containing directory's (the packed node
+//!   stores no per-entry device; a regular entry's device equals its
+//!   directory's on every path the scanner takes, since mount points are
+//!   dir-kind).
+//! - **Entry `l` is omitted when the scan never obtained a link count**
+//!   ([`ScanOutcome::link_counts_known`] false — a Windows scan without
+//!   `--links`). `i` is still written, because the inode identity is real
+//!   and is what groups the links; the count is not, and the spec's own
+//!   "present when `nlink>1`" wording makes absence the honest encoding.
+//!   See §8's platform note in `docs/format/dump-v1.md`.
 //! - `sem:"blocks"`, `ext:false`, `allino:false` — extended metadata and
 //!   all-inode emission are later increments.
 //!
@@ -89,6 +96,7 @@ pub fn write_dump<W: Write>(outcome: &ScanOutcome, writer: W, meta: &DumpMeta) -
         outcome.tree(),
         outcome.root(),
         outcome.hardlink_links(),
+        outcome.link_counts_known,
         &stats,
         ts,
         writer,
@@ -140,10 +148,12 @@ enum Work {
     Stub(NodeId, String),
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_records<W: Write>(
     tree: &Tree,
     root: DirId,
     links: &[HardlinkLink],
+    link_counts_known: bool,
     stats: &EndStats,
     ts: u64,
     out: W,
@@ -217,7 +227,7 @@ fn write_records<W: Write>(
 
                 for &child in &children {
                     if !tree.node(child).kind().is_dir() {
-                        let line = entry_line(tree, child, meta.dev, &hardlinks);
+                        let line = entry_line(tree, child, meta.dev, &hardlinks, link_counts_known);
                         fw.write_line(line.as_bytes())?;
                     }
                 }
@@ -283,11 +293,22 @@ fn write_records<W: Write>(
 }
 
 /// One §6.4 entry line for a non-directory child.
+///
+/// `link_counts_known` gates `l` and nothing else. A Windows scan without
+/// `--links` registers an inode because it was **reached by more than one
+/// path**, never having asked how many links exist: `i` is then true and
+/// useful (it is what a reader groups the links by), and `l` has no value
+/// to write. Omitting it is spec-legal — §6.4 marks `l` present only "when
+/// `nlink>1`", and `dump::read` types it `Option<u64>` — whereas writing
+/// the registry's admission marker would put a number on the wire that no
+/// filesystem ever reported. Dumps outlive the decisions that produced
+/// them; absent is recoverable, fabricated is not.
 fn entry_line(
     tree: &Tree,
     id: NodeId,
     dir_dev: u64,
     hardlinks: &FxHashMap<NodeId, HardlinkLink>,
+    link_counts_known: bool,
 ) -> String {
     let node = tree.node(id);
     let mut line = JsonLine::new();
@@ -299,8 +320,10 @@ fn entry_line(
         line.str("k", k);
     }
     if let Some(link) = hardlinks.get(&id) {
-        line.u64_string("i", link.ino)
-            .u64("l", u64::from(link.nlink));
+        line.u64_string("i", link.ino);
+        if link_counts_known {
+            line.u64("l", u64::from(link.nlink));
+        }
         if link.dev != dir_dev {
             line.u64_string("dev", link.dev);
         }
@@ -460,10 +483,24 @@ mod tests {
     }
 
     fn dump_lines(tree: &Tree, root: DirId, links: &[HardlinkLink], target: usize) -> Vec<Value> {
+        dump_lines_with(tree, root, links, true, target)
+    }
+
+    /// [`dump_lines`] with the writer's "did the scan obtain link counts?"
+    /// fact under test control (Windows scans without `--links` set it
+    /// false, and then no entry may carry `l`).
+    fn dump_lines_with(
+        tree: &Tree,
+        root: DirId,
+        links: &[HardlinkLink],
+        link_counts_known: bool,
+        target: usize,
+    ) -> Vec<Value> {
         let bytes = write_records(
             tree,
             root,
             links,
+            link_counts_known,
             &stats(),
             1_753_142_400,
             Vec::new(),
