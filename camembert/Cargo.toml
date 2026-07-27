@@ -5,6 +5,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+# `camembert-mangen` only regenerates the man page, so it has no business
+# competing for the default. Without this, a bare `cargo run` refuses to
+# pick and asks for `--bin`.
+default-run = "camembert"
 
 [[bin]]
 name = "camembert-mangen"
