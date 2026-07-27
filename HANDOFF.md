@@ -447,25 +447,46 @@ is the one that actually pins it; update it deliberately.
    measurement says the call is already lstat-shaped with or without
    `OBJ_DONT_REPARSE`, so relaxing the guard for ordinary tags looks safe.
    This is the obvious next fix.
-2. **The integration tests do not compile on Windows** — the fixtures
-   import `symlink`/`PermissionsExt` at module level, so every test file
-   fails regardless of which test runs. That is why the CI job is `cargo
-   check` and not `cargo test`; gating them is what graduates it.
-3. **Subdirectories contribute 0 to directory-index bytes** while the root
+2. ~~The integration tests do not compile on Windows.~~ **Closed
+   2026-07-27.** `cargo test --workspace` runs there: **374 tests pass, 0
+   fail**, and the `windows-2025` CI job is now `cargo test` rather than
+   `cargo check`. What was intrinsically Unix is gated at test-fn or
+   module granularity, never whole-file where a portable test could
+   survive: `delete`/`fiemap` (the modules they test are `cfg(unix)`), the
+   io_uring parity pair, the `RLIMIT_NOFILE` exhaustion test, and
+   `scan_a_known_tree` (it cross-checks against `nlink`/`dev`/`ino`, i.e.
+   gap 5's missing oracle). The rest ports through a new
+   `camembert-core/tests/support/mod.rs` picking a per-platform mechanism
+   for the three fixtures that need one — non-UTF-8 name (raw invalid byte
+   vs unpaired UTF-16 surrogate), symlink (skips cleanly without Developer
+   Mode), unreadable directory (`chmod 000` vs an `icacls` deny ACE), each
+   returning whether it *actually* worked so a test skips instead of
+   silently passing. Three new portable tests recover the ground
+   `scan_a_known_tree` used to cover alone. `tui_smoke.rs` stays Unix-only
+   — ConPTY harness limitation, not a product one.
+3. **A symlink's reported size differs from Unix** (noticed 2026-07-27,
+   unverified): Unix reports the target string's byte length, while the
+   Windows backend takes a reparse point's own `EndOfFile`/`AllocationSize`,
+   which is likely 0. Probably *correct* rather than a bug — NTFS keeps the
+   link text in the reparse buffer, not in file data — but nobody has
+   confirmed the actual value, because creating a symlink needs Developer
+   Mode or elevation and the dev box has neither. Confirm, then either
+   document it as a platform difference or fix it; do not guess.
+4. **Subdirectories contribute 0 to directory-index bytes** while the root
    contributes its real size, because listing entries report
    `AllocationSize = 0` for directories but a by-handle query does not.
    Root size then appears to come from nowhere.
-4. **Junctions are refused, not resolved**, so `--one-filesystem` is a
+5. **Junctions are refused, not resolved**, so `--one-filesystem` is a
    no-op and junction-heavy trees under-count. Descending them needs cycle
    detection camembert does not have.
-5. **No cross-check partner.** The APIs that would serve as an oracle
+6. **No cross-check partner.** The APIs that would serve as an oracle
    (`MetadataExt::{file_index, number_of_links}`) are the nightly-only
    ones; `fsutil file queryfileid` shelled out from a test is the only one
    available. The *bench* half of this gap is closed —
    `scripts/bench-compare.ps1` (2026-07-27) makes CLAUDE.md's before/after
    mandate enforceable on Windows, and immediately found the nlink hole
    above.
-6. Alternate data streams are invisible; deduplicated volumes report the
+7. Alternate data streams are invisible; deduplicated volumes report the
    stub. Both out of T1 scope, both worth a README line.
 
 ### Where the work actually happens
