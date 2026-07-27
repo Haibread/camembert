@@ -4,7 +4,6 @@
 
 use std::fs;
 use std::io::Write as _;
-use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, SystemTime};
@@ -65,7 +64,9 @@ fn write_file(path: &Path, len: usize) {
 /// — which reports what `stat` reports, exactly as `du` does, and never
 /// syncs a filesystem it is measuring (the caveat is in the README's
 /// "Honest numbers").
+#[cfg(unix)]
 fn skip_unless_blocks_are_accounted(dir: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
     let probe = dir.join(".block-accounting-probe");
     write_file(&probe, 512 * 1024);
     let blocks = fs::metadata(&probe).map(|m| m.blocks() * 512).unwrap_or(0);
@@ -78,6 +79,15 @@ fn skip_unless_blocks_are_accounted(dir: &Path) -> bool {
         );
         return true;
     }
+    false
+}
+
+/// Windows counterpart of the guard above: NTFS accounts allocation
+/// synchronously on write (no ZFS-style deferred transaction-group
+/// commit), so there is nothing here to catch — never skip. Revisit if a
+/// Windows filesystem with the same deferred-accounting behavior turns up.
+#[cfg(windows)]
+fn skip_unless_blocks_are_accounted(_dir: &Path) -> bool {
     false
 }
 
