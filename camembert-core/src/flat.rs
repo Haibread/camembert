@@ -780,6 +780,20 @@ pub struct Accumulator {
     groups: Vec<Bucket>,
     rest: Bucket,
     top: TopHeap,
+    /// Nodes that turned out to be links of a multi-link inode *after*
+    /// they were offered to the top-N heap.
+    ///
+    /// Windows only, and only under `scan::owner::LinkPolicy::FileIdRepeat`:
+    /// there, an inode is known to have several paths only when the
+    /// *second* one is enumerated, so the first link's `⛓` was already
+    /// recorded as false. The frozen-arena [`fold`] reads
+    /// [`Tree::is_hardlink`] and therefore always sees the promotion; this
+    /// set is what keeps the live accumulator's answer equal to it, which
+    /// is the D2 agreement invariant `tests/flat_agreement.rs` pins. One
+    /// `NodeId` per genuinely repeated inode — the same order as the
+    /// tree's own counted-first set, which the scan already pays for.
+    #[cfg(windows)]
+    late_hardlinks: rustc_hash::FxHashSet<NodeId>,
 }
 
 impl Accumulator {
@@ -793,7 +807,17 @@ impl Accumulator {
             groups,
             rest: Bucket::default(),
             top: TopHeap::new(cap),
+            #[cfg(windows)]
+            late_hardlinks: rustc_hash::FxHashSet::default(),
         }
+    }
+
+    /// Record that `node` is, after all, a counted link of a multi-link
+    /// inode (see [`Accumulator::late_hardlinks`]). Cheap and rare: once
+    /// per inode the scan reaches by a second path.
+    #[cfg(windows)]
+    pub(crate) fn mark_hardlink(&mut self, node: NodeId) {
+        self.late_hardlinks.insert(node);
     }
 
     fn set_coverage(&mut self, dir: DirId, cov: Coverage) {
@@ -876,14 +900,25 @@ impl Accumulator {
     /// `<= cap`-entry heap — so it is cheap enough to call on every
     /// publication tick.
     pub(crate) fn snapshot(&self, epoch: u64) -> FlatSummary {
-        finish(
+        #[allow(unused_mut)]
+        let mut summary = finish(
             &self.patterns,
             &self.groups,
             &self.rest,
             &self.top,
             true,
             epoch,
-        )
+        );
+        // Groups proved after the fact carry no badge on the row that was
+        // already offered; apply them here so the live view agrees with
+        // the frozen-arena fold (see `late_hardlinks`).
+        #[cfg(windows)]
+        for file in &mut summary.top_files {
+            if self.late_hardlinks.contains(&file.node) {
+                file.hardlink = true;
+            }
+        }
+        summary
     }
 }
 

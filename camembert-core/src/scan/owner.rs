@@ -29,6 +29,52 @@ use super::message::Batch;
 /// Token of the scan root (workers allocate from 1 upward).
 pub(crate) const ROOT_TOKEN: u64 = 0;
 
+/// How the owner admits entries into the hardlink registry.
+///
+/// [`LinkPolicy::StatNlink`] is the rule every Unix scan runs and the
+/// **only** variant that exists off Windows: the alternative is
+/// `#[cfg(windows)]`, so on Unix this is a single-variant fieldless enum,
+/// every `match` on it below is single-armed, and the other rule is not
+/// merely unreachable — it is not compiled.
+///
+/// See `docs/design/windows-nlink-dossier.md` for why Windows needs a
+/// second rule: there, `nlink` is not a field of the directory listing but
+/// a per-file `NtQueryInformationByName` call that costs ~46 µs, 95 % of
+/// the scan, and changes no total on any tree measured.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(crate) enum LinkPolicy {
+    /// The platform supplies a true `st_nlink` for free (Linux: it rides
+    /// inside the `statx` result the scan already asks for). `nlink > 1`
+    /// gates a `(dev, ino)` set, every gated link gets a [`HardlinkLink`]
+    /// record, and `hardlink_inodes` means "inodes with more than one link
+    /// on the filesystem, scanned or not".
+    #[default]
+    StatNlink,
+    /// No link count was obtained: deduplicate by **repeat sighting of the
+    /// file id** instead. An `FxHashMap<ino, first NodeId>` (the volume
+    /// serial is scan-constant under Windows T1, which refuses every mount
+    /// point, so the `dev` half of the key is pure waste) admits every
+    /// plain file; link records — and the tree's counted-first marker —
+    /// materialise only when an inode is actually seen a second time, at
+    /// which point the map's stored first `NodeId` is what lets the
+    /// *first* link's record be emitted retroactively.
+    ///
+    /// Totals are byte-identical to [`LinkPolicy::StatNlink`]'s: what
+    /// deduplicates is the registry, and `nlink > 1` was only ever a gate
+    /// on entering it. What changes is `hardlink_inodes`, which here means
+    /// "inodes reached by more than one path **in this scan**" — a
+    /// narrower but still honest statement, blind to links outside the
+    /// scan root.
+    #[cfg(windows)]
+    FileIdRepeat,
+}
+
+/// Off Windows there is exactly one policy, so it costs nothing to carry
+/// and every `match` on it is single-armed. Pinned rather than assumed:
+/// the day a second variant becomes unconditional, this is what says so.
+#[cfg(not(windows))]
+const _: () = assert!(std::mem::size_of::<LinkPolicy>() == 0);
+
 /// Cap (in buffered *entries*) of the out-of-order holding map.
 ///
 /// Policy (binding amendment "bounded holding map", implemented simply):
@@ -61,7 +107,20 @@ pub(crate) struct Owner {
     /// (smallest path, D2) runs post-scan off the critical path (D3) — see
     /// [`super::hardlink`].
     hardlinks: FxHashSet<(u64, u64)>,
-    /// Every `nlink > 1` link seen (first and extras): input of the
+    /// [`LinkPolicy::FileIdRepeat`] only: file id → the node of the
+    /// inode's **first** link. Replaces `hardlinks` on that path; the
+    /// stored node is what makes "emit the first link's record only once
+    /// the inode turns out to repeat" possible.
+    #[cfg(windows)]
+    first_by_ino: FxHashMap<u64, crate::tree::NodeId>,
+    /// [`LinkPolicy::FileIdRepeat`] only: inodes actually reached by more
+    /// than one path in this scan, which is what `hardlink_inodes` reports
+    /// there (`hardlinks.len()` no longer means anything on that path).
+    #[cfg(windows)]
+    repeat_inodes: u64,
+    /// Which registry-admission rule this owner runs.
+    policy: LinkPolicy,
+    /// Every registered link seen (first and extras): input of the
     /// post-scan re-attribution and of the dump writer's `i`/`l` fields.
     hardlink_links: Vec<HardlinkLink>,
     /// Later links to an already-seen inode (nodes flagged
@@ -101,6 +160,11 @@ impl Owner {
             holding_entries: 0,
             spill: Vec::new(),
             hardlinks: FxHashSet::default(),
+            #[cfg(windows)]
+            first_by_ino: FxHashMap::default(),
+            #[cfg(windows)]
+            repeat_inodes: 0,
+            policy: LinkPolicy::default(),
             hardlink_links: Vec::new(),
             hardlink_extra_links: 0,
             excluded_dirs: 0,
@@ -122,6 +186,14 @@ impl Owner {
         let mut accum = Accumulator::new(config.patterns, config.cap);
         accum.on_dir(self.root, None, &name, name_id, size);
         self.flat = Some(accum);
+    }
+
+    /// Choose the hardlink-registry rule (Windows only: off Windows
+    /// [`LinkPolicy`] has one variant and there is nothing to choose).
+    /// Must run before any batch is integrated, like [`Owner::enable_flat`].
+    #[cfg(windows)]
+    pub(crate) fn set_link_policy(&mut self, policy: LinkPolicy) {
+        self.policy = policy;
     }
 
     /// The live flat accumulator, if enabled (for the publisher's tick).
@@ -155,8 +227,15 @@ impl Owner {
         self.excluded_kernfs
     }
 
+    /// What the summary line and the UI's hardlink metric report. The
+    /// statement differs per policy and both are honest — see
+    /// [`LinkPolicy`], and say which one in any wording built on this.
     pub(crate) fn hardlink_inodes(&self) -> u64 {
-        self.hardlinks.len() as u64
+        match self.policy {
+            LinkPolicy::StatNlink => self.hardlinks.len() as u64,
+            #[cfg(windows)]
+            LinkPolicy::FileIdRepeat => self.repeat_inodes,
+        }
     }
 
     pub(crate) fn hardlink_extra_links(&self) -> u64 {
@@ -271,8 +350,30 @@ impl Owner {
                 apparent: entry.apparent,
                 real: entry.disk,
             };
+            // Registry admission. Under both policies the worker sets
+            // `nlink > 1` on exactly the entries that should enter: a true
+            // link count on Unix, a bare admission marker under
+            // [`LinkPolicy::FileIdRepeat`] (see the Windows worker's
+            // `REGISTRY_ADMIT`).
             let is_hardlink = entry.kind != Kind::Dir && entry.nlink > 1;
-            let is_extra_link = is_hardlink && self.hardlinks.contains(&(entry.dev, entry.ino));
+            // Under `FileIdRepeat` the probe returns the inode's first
+            // node rather than a bare "seen it" boolean — that is what
+            // lets the first link's record be emitted late, only for
+            // inodes that turn out to repeat.
+            #[cfg(windows)]
+            let first_link = match self.policy {
+                LinkPolicy::FileIdRepeat if is_hardlink => {
+                    self.first_by_ino.get(&entry.ino).copied()
+                }
+                _ => None,
+            };
+            let is_extra_link = match self.policy {
+                LinkPolicy::StatNlink => {
+                    is_hardlink && self.hardlinks.contains(&(entry.dev, entry.ino))
+                }
+                #[cfg(windows)]
+                LinkPolicy::FileIdRepeat => first_link.is_some(),
+            };
             if is_extra_link {
                 flags.insert(NodeFlags::HARDLINK_EXTRA);
                 dup.add(size);
@@ -292,20 +393,66 @@ impl Owner {
                 self.tree.set_error_reason(node, errno);
             }
 
-            if is_hardlink {
-                if !is_extra_link {
-                    self.hardlinks.insert((entry.dev, entry.ino));
-                    // Queryable post-scan (deletion dialog warning): the
-                    // counted link has no free flag bit, so it lives in a
-                    // side set on the tree.
-                    self.tree.mark_hardlink_first(node);
+            match self.policy {
+                LinkPolicy::StatNlink => {
+                    if is_hardlink {
+                        if !is_extra_link {
+                            self.hardlinks.insert((entry.dev, entry.ino));
+                            // Queryable post-scan (deletion dialog warning): the
+                            // counted link has no free flag bit, so it lives in a
+                            // side set on the tree.
+                            self.tree.mark_hardlink_first(node);
+                        }
+                        self.hardlink_links.push(HardlinkLink {
+                            node,
+                            dev: entry.dev,
+                            ino: entry.ino,
+                            nlink: entry.nlink,
+                        });
+                    }
                 }
-                self.hardlink_links.push(HardlinkLink {
-                    node,
-                    dev: entry.dev,
-                    ino: entry.ino,
-                    nlink: entry.nlink,
-                });
+                #[cfg(windows)]
+                LinkPolicy::FileIdRepeat => {
+                    if is_hardlink {
+                        match first_link {
+                            // First sighting: one map slot, nothing else.
+                            // No link record and no `hardlink_firsts`
+                            // entry — this is where the per-singleton cost
+                            // the dossier priced is simply not paid.
+                            None => {
+                                self.first_by_ino.insert(entry.ino, node);
+                            }
+                            Some(first) => {
+                                // A repeat proves the group. Promote it
+                                // once: the tree's counted-first set
+                                // doubles as the "already promoted"
+                                // marker, so the first link's record is
+                                // emitted here, late.
+                                if !self.tree.is_hardlink_first(first) {
+                                    self.tree.mark_hardlink_first(first);
+                                    self.repeat_inodes += 1;
+                                    // The live flat view already offered
+                                    // that node with no `⛓`; tell it.
+                                    if let Some(flat) = &mut self.flat {
+                                        flat.mark_hardlink(first);
+                                    }
+                                    self.hardlink_links.push(HardlinkLink {
+                                        node: first,
+                                        dev: entry.dev,
+                                        ino: entry.ino,
+                                        nlink: super::hardlink::NLINK_UNDETERMINED,
+                                    });
+                                }
+                                self.hardlink_links.push(HardlinkLink {
+                                    node,
+                                    dev: entry.dev,
+                                    ino: entry.ino,
+                                    nlink: super::hardlink::NLINK_UNDETERMINED,
+                                });
+                            }
+                        }
+                    }
+                }
             }
 
             if let Some(token) = entry.child_token {
@@ -325,6 +472,21 @@ impl Owner {
                 // Flat view (D2): files, symlinks, and excluded mount points
                 // (dir-kind, no DirMeta). Extras contribute 0 (first-seen).
                 let name_id = self.tree.node(node).name_ref().0;
+                // Under `FileIdRepeat` every plain file arrives
+                // "hardlink-admitted", so `is_hardlink` would badge the
+                // whole listing `⛓`. The honest badge there is "reached
+                // by more than one path", which at insertion time is
+                // exactly `is_extra_link`. The *first* link of a group
+                // gets no badge in this live row — it is promoted after
+                // the fact, and only the post-scan authoritative fold
+                // (`crate::flat::fold`, which reads `Tree::is_hardlink`)
+                // sees the promotion. Provisional-only, and it self-heals
+                // at scan end.
+                let flat_hardlink = match self.policy {
+                    LinkPolicy::StatNlink => is_hardlink,
+                    #[cfg(windows)]
+                    LinkPolicy::FileIdRepeat => is_extra_link,
+                };
                 flat.on_leaf(
                     node,
                     dir,
@@ -332,7 +494,7 @@ impl Owner {
                     name_id,
                     entry.kind,
                     is_extra_link,
-                    is_hardlink,
+                    flat_hardlink,
                     size,
                 );
             }

@@ -2514,6 +2514,7 @@ mod tests {
             statx_engine: Default::default(),
             threads: 1,
             cross_filesystems: false,
+            ..ScanOptions::default()
         })
         .scan(tmp.path())
         .expect("scan");
@@ -2551,6 +2552,7 @@ mod tests {
             statx_engine: Default::default(),
             threads: 1,
             cross_filesystems: false,
+            ..ScanOptions::default()
         })
         .scan(tmp.path())
         .expect("scan");
@@ -2630,6 +2632,7 @@ mod tests {
             statx_engine: Default::default(),
             threads: 1,
             cross_filesystems: false,
+            ..ScanOptions::default()
         })
         .scan(tmp.path())
         .expect("scan");

@@ -55,7 +55,7 @@ use crate::tree::{DirId, DirMeta, Node, NodeId, Tree};
 use crate::view::{ViewBus, ViewPublisher};
 
 pub use backend::path_on_compressed_mount;
-pub use hardlink::{HardlinkGroup, HardlinkLink};
+pub use hardlink::{HardlinkGroup, HardlinkLink, NLINK_UNDETERMINED};
 use owner::Owner;
 
 /// Bound of the worker → owner channel (sections). Backpressure: workers
@@ -114,6 +114,24 @@ pub struct ScanOptions {
     pub cross_filesystems: bool,
     /// Stat engine selection (experimental, see [`StatxEngine`]).
     pub statx_engine: StatxEngine,
+    /// Obtain every file's true link count.
+    ///
+    /// **Ignored off Windows**, where `st_nlink` rides inside the `statx`
+    /// result the scan already asks for: link counts are always exact
+    /// there and cost nothing.
+    ///
+    /// On Windows the directory listing carries name, both sizes,
+    /// attributes, reparse tag and the file id — everything except the
+    /// link count — so obtaining one means a per-file
+    /// `NtQueryInformationByName` call that measured ~46 µs and 95 % of
+    /// the whole scan. Off by default: hardlinks are then deduplicated by
+    /// repeat sighting of the file id, which is byte-identical on totals
+    /// and blind only to links that live *outside* the scan root. Turning
+    /// this on restores the true count (and with it the dump's `l` field
+    /// and the "has links you cannot see" reading of the `⛓` badge) at
+    /// ~19× the scan time on a file-dense tree. See
+    /// `docs/design/windows-nlink-dossier.md`.
+    pub link_counts: bool,
 }
 
 /// Cheap shared progress counters, updated by the owner per integrated
@@ -354,13 +372,32 @@ impl Scanner {
         };
 
         let (tx, rx) = crossbeam_channel::bounded::<message::Batch>(CHANNEL_CAP);
-        let (shared, queues) = backend::start(
+        // `mut` only matters on Windows, where the link-count knob is set
+        // on the returned struct rather than passed through a parameter
+        // the Linux backend would have to accept and ignore.
+        #[allow(unused_mut)]
+        let (mut shared, queues) = backend::start(
             threads,
             root_fd,
             root_dev,
             statx_backend == StatxBackend::IoUring,
             self.options.cross_filesystems,
         );
+        // Whether the scan ends up holding a true `st_nlink` per inode.
+        // Free and always true where the platform puts it inside the stat
+        // the scan already does; a per-file syscall, and therefore opt-in,
+        // on Windows (see [`ScanOptions::link_counts`]).
+        #[cfg(not(windows))]
+        let link_counts_known = true;
+        #[cfg(windows)]
+        let link_counts_known = {
+            shared.query_link_counts = self.options.link_counts;
+            info!(
+                links = self.options.link_counts,
+                "per-file link-count lookup"
+            );
+            self.options.link_counts
+        };
 
         // The root node's interned name is deliberately the FULL scan path
         // (not its final component): the dump header's `root` field is
@@ -377,6 +414,14 @@ impl Scanner {
             root_dev,
             Arc::clone(&self.progress),
         );
+        // Without a link count the registry cannot be gated on `nlink > 1`
+        // and deduplicates on a repeat sighting of the file id instead
+        // (owner::LinkPolicy). Off Windows there is one policy and nothing
+        // to select.
+        #[cfg(windows)]
+        if !link_counts_known {
+            owner.set_link_policy(owner::LinkPolicy::FileIdRepeat);
+        }
         if let Some(flat) = self.flat.clone() {
             owner.enable_flat(flat);
         }
@@ -486,6 +531,7 @@ impl Scanner {
             excluded_kernfs,
             hardlink_inodes,
             hardlink_extra_links,
+            link_counts_known,
             elapsed,
             cancelled,
             statx_backend: Some(statx_backend),
@@ -591,10 +637,34 @@ pub struct ScanOutcome {
     /// (`/proc`, `/sys`, …) — excluded even when `cross_filesystems` is on
     /// (CLI: crossing is the default; `--one-filesystem` opts out).
     pub excluded_kernfs: u64,
-    /// Distinct `(dev, ino)` with `nlink > 1` seen.
+    /// Multi-link inodes seen — and **which** statement that is depends on
+    /// [`ScanOutcome::link_counts_known`]:
+    ///
+    /// - `true` (every Unix scan, Windows under `ScanOptions::link_counts`):
+    ///   distinct `(dev, ino)` with `nlink > 1`, whether or not this scan
+    ///   saw a second link. That answers "deleting this frees nothing,
+    ///   because links exist you cannot see".
+    /// - `false` (the Windows default): inodes **reached by more than one
+    ///   path in this scan**. Narrower, still exact for what it claims,
+    ///   and a lower bound on the first: an inode whose siblings live
+    ///   outside the scan root is not counted. Any wording built on this
+    ///   must say which one it is — the number legitimately drops (728 →
+    ///   0 on `C:\Windows\System32\drivers`) without a single byte of
+    ///   total moving.
     pub hardlink_inodes: u64,
     /// Later links that contributed 0 to aggregates.
     pub hardlink_extra_links: u64,
+    /// The scan holds each registered inode's true `st_nlink`.
+    ///
+    /// Always `true` off Windows (`statx` carries it) and for imports (the
+    /// source file does). `false` for a Windows scan without
+    /// [`ScanOptions::link_counts`], where obtaining it is a per-file
+    /// syscall the scan deliberately does not make: `hardlink_inodes`
+    /// then means something narrower (see above),
+    /// [`crate::scan::HardlinkLink::nlink`] is
+    /// [`crate::scan::NLINK_UNDETERMINED`], and the dump writer omits the
+    /// `l` field rather than inventing one.
+    pub link_counts_known: bool,
     pub elapsed: Duration,
     /// The scan was cancelled ([`ViewBus::cancel`]): the tree and every
     /// counter above are partial (whatever integrated before the stop).
@@ -636,6 +706,9 @@ impl ScanOutcome {
             excluded_kernfs,
             hardlink_inodes,
             hardlink_extra_links,
+            // An ncdu export carries `nlink` per entry, so an import knows
+            // the real counts whatever platform it runs on.
+            link_counts_known: true,
             elapsed,
             cancelled: false,
             // Imported trees never ran a stat engine.

@@ -530,10 +530,15 @@ impl Tree {
         self.tombstones.contains(&id)
     }
 
-    /// Whether a node is a link of an `nlink > 1` inode — either the
-    /// counted first-seen link or a [`NodeFlags::HARDLINK_EXTRA`] later
-    /// link. Deleting such an entry frees its space only when the last
-    /// link to the inode goes.
+    /// Whether a node is a link of a registered multi-link inode — either
+    /// the counted first-seen link or a [`NodeFlags::HARDLINK_EXTRA`]
+    /// later link. Deleting such an entry frees its space only when the
+    /// last link to the inode goes.
+    ///
+    /// Which inodes are registered is the scan's business (see
+    /// `scan::owner::LinkPolicy`): every `nlink > 1` inode where the
+    /// platform hands a link count over for free, only inodes reached by
+    /// more than one path in this scan where it does not.
     pub fn is_hardlink(&self, id: NodeId) -> bool {
         self.node(id).flags().contains(NodeFlags::HARDLINK_EXTRA)
             || self.hardlink_firsts.contains(&id)
@@ -659,10 +664,22 @@ impl Tree {
 
     // ---- owner-only mutation (crate-private, D1) ----
 
-    /// Record a counted first-seen link of an `nlink > 1` inode (see
-    /// [`Tree::is_hardlink`]).
+    /// Record a counted first-seen link of a registered multi-link inode
+    /// (see [`Tree::is_hardlink`]).
     pub(crate) fn mark_hardlink_first(&mut self, id: NodeId) {
         self.hardlink_firsts.insert(id);
+    }
+
+    /// Whether `id` is already a recorded counted first link.
+    ///
+    /// Windows only: `scan::owner::LinkPolicy::FileIdRepeat` learns that an
+    /// inode has more than one path only when the *second* path arrives,
+    /// and uses this set as its "group already promoted" marker. It cannot
+    /// ask [`Tree::is_hardlink`], which also answers true for
+    /// `HARDLINK_EXTRA` nodes.
+    #[cfg(windows)]
+    pub(crate) fn is_hardlink_first(&self, id: NodeId) -> bool {
+        self.hardlink_firsts.contains(&id)
     }
 
     /// Move the "counted link" marker from `from` to `to`, keeping
