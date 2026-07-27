@@ -4,8 +4,6 @@
 //! encoding, seek-table/`x` consistency.
 
 use std::fs;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15,15 +13,20 @@ use camembert_core::dump::read::DumpReader;
 use camembert_core::dump::{DumpMeta, decode_name, write_dump, write_dump_to_path};
 use camembert_core::scan::{ScanOptions, Scanner};
 
+#[path = "support/mod.rs"]
+mod support;
+
 /// Build the fixture tree:
 ///
 /// ```text
 /// root/
-///   caf<0xE9>          (non-UTF-8 name, 5 B)
+///   caf<0xE9>          (non-UTF-8 name, 5 B on Unix — a WTF-8 unpaired
+///                        surrogate on Windows, see `support::non_utf8_name`)
 ///   empty/
 ///   link1              (hardlink pair with sub/link0; canonical: root/link1)
-///   locked/            (chmod 000: unreadable — skipped when running as root)
-///   sl -> sub          (symlink)
+///   locked/            (unreadable — skipped when it can't be made so, e.g. root)
+///   sl -> sub          (symlink — skipped when the platform refuses, e.g. no
+///                        Developer Mode / privilege on Windows)
 ///   sub/
 ///     data.bin         (3 KiB)
 ///     link0
@@ -32,6 +35,12 @@ struct Fixture {
     dir: tempfile::TempDir,
     /// The unreadable dir exists (non-root only).
     locked: bool,
+    /// The `sl` symlink was actually created.
+    symlinked: bool,
+    /// The exact bytes of the non-UTF-8 name as interned by the scanner
+    /// (`OsStr::as_encoded_bytes`) — platform-dependent encoding, same
+    /// "not valid UTF-8" property either way.
+    non_utf8_name: Vec<u8>,
 }
 
 fn build_fixture() -> Fixture {
@@ -43,28 +52,31 @@ fn build_fixture() -> Fixture {
     fs::write(root.join("sub/data.bin"), vec![0xA5u8; 3072]).unwrap();
     fs::write(root.join("link1"), b"hardlinked twice").unwrap();
     fs::hard_link(root.join("link1"), root.join("sub/link0")).unwrap();
-    std::os::unix::fs::symlink("sub", root.join("sl")).unwrap();
-    let non_utf8 = std::ffi::OsStr::from_bytes(b"caf\xe9");
-    fs::write(root.join(non_utf8), b"bytes").unwrap();
+    let symlinked = support::symlink_dir("sub", root.join("sl"));
+    let non_utf8 = support::non_utf8_name();
+    let non_utf8_name = non_utf8.as_encoded_bytes().to_vec();
+    fs::write(root.join(&non_utf8), b"bytes").unwrap();
 
     // Unreadable directory — meaningless under root, which reads anything,
     // so probe instead of assuming.
-    fs::create_dir(root.join("locked")).unwrap();
-    fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
-    let locked = fs::read_dir(root.join("locked")).is_err();
+    let locked_dir = root.join("locked");
+    fs::create_dir(&locked_dir).unwrap();
+    let locked = support::make_unreadable(&locked_dir);
     if !locked {
-        fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
-        fs::remove_dir(root.join("locked")).unwrap();
+        support::restore_readable(&locked_dir);
+        fs::remove_dir(&locked_dir).unwrap();
     }
-    Fixture { dir, locked }
+    Fixture {
+        dir,
+        locked,
+        symlinked,
+        non_utf8_name,
+    }
 }
 
 fn restore_locked(fixture: &Fixture) {
     if fixture.locked {
-        let _ = fs::set_permissions(
-            fixture.dir.path().join("locked"),
-            fs::Permissions::from_mode(0o755),
-        );
+        support::restore_readable(&fixture.dir.path().join("locked"));
     }
 }
 
@@ -133,7 +145,7 @@ fn dump_of_a_real_scan_holds_the_spec_invariants() {
     assert_eq!(h["ts"], 1_753_142_400u64);
     assert_eq!(
         decode_name(h["root"].as_str().unwrap()),
-        root_path.as_os_str().as_bytes()
+        root_path.as_os_str().as_encoded_bytes()
     );
     assert!(h["dev"].is_string(), "dev is a JSON string");
     assert_eq!(h["ordered"], true);
@@ -161,7 +173,7 @@ fn dump_of_a_real_scan_holds_the_spec_invariants() {
         .map(|l| decode_name(l["n"].as_str().unwrap()))
         .collect();
     assert!(
-        entry_names.contains(&b"caf\xe9".to_vec()),
+        entry_names.contains(&fixture.non_utf8_name),
         "non-UTF-8 name survives: {entry_names:?}"
     );
 
@@ -230,12 +242,16 @@ fn dump_of_a_real_scan_holds_the_spec_invariants() {
         assert!(outcome.errors >= 1);
     }
 
-    // Symlink entry has k:"l"; the empty dir has a d line with no entries.
-    let sl = lines
-        .iter()
-        .find(|l| l.get("t").is_none() && l["n"] == "sl")
-        .expect("symlink entry");
-    assert_eq!(sl["k"], "l");
+    // Symlink entry has k:"l" (only when the fixture managed to create one —
+    // on Windows that needs Developer Mode or an elevated process).
+    if fixture.symlinked {
+        let sl = lines
+            .iter()
+            .find(|l| l.get("t").is_none() && l["n"] == "sl")
+            .expect("symlink entry");
+        assert_eq!(sl["k"], "l");
+    }
+    // The empty dir has a d line with no entries.
     let empty_d = d_lines
         .iter()
         .find(|l| l["path"].as_str().unwrap().ends_with("/empty"))

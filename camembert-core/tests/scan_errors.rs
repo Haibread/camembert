@@ -4,16 +4,15 @@
 //! descriptor exhaustion (the HANDOFF "known limitation": RLIMIT_NOFILE
 //! pressure must record errors, never hang or panic).
 
-use std::env;
 use std::fs;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::path::Path;
-use std::process::Command;
-use std::time::{Duration, Instant};
 
 use camembert_core::errno::ScanErrno;
 use camembert_core::scan::{ScanOptions, ScanOutcome, Scanner, StatxBackend, StatxEngine};
+
+#[path = "support/mod.rs"]
+mod support;
 
 fn child_by_name(outcome: &ScanOutcome, name: &[u8]) -> camembert_core::tree::NodeId {
     outcome
@@ -32,14 +31,16 @@ fn child_by_name(outcome: &ScanOutcome, name: &[u8]) -> camembert_core::tree::No
 fn unreadable_dir_preserves_eacces_end_to_end() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    fs::create_dir(root.join("locked")).unwrap();
-    fs::write(root.join("locked/hidden"), b"secret").unwrap();
-    fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+    let locked = root.join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::write(locked.join("hidden"), b"secret").unwrap();
 
-    // chmod 000 does not block root: skip where the dir stays readable.
-    if fs::read_dir(root.join("locked")).is_ok() {
-        fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
-        eprintln!("skipping: running as root, cannot make a directory unreadable");
+    // chmod 000 does not block root (and the Windows deny-ACE mechanism can
+    // likewise fail to bite, e.g. running as an account with SeBackupPrivilege):
+    // skip where the dir stays readable.
+    if !support::make_unreadable(&locked) {
+        support::restore_readable(&locked);
+        eprintln!("skipping: cannot make a directory unreadable in this environment");
         return;
     }
 
@@ -65,17 +66,37 @@ fn unreadable_dir_preserves_eacces_end_to_end() {
         );
     }
 
-    fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+    support::restore_readable(&locked);
 }
 
 // --- fd-exhaustion degradation (self-spawned child) ---------------------
+//
+// `RLIMIT_NOFILE` is a POSIX rlimit with no Windows equivalent (Windows has
+// no small-integer per-process file-descriptor ceiling to lower the same
+// way — handle exhaustion there is a different mechanism entirely, gated by
+// system-wide handle/desktop-heap limits rather than a `setrlimit` knob).
+// This pair of tests, and the `rustix::process` calls they need, stay
+// Unix-only; the scan engine's *response* to fd exhaustion (never hang,
+// never panic, record the error) is a POSIX-only scenario in the first
+// place, not a portability gap.
 
+#[cfg(unix)]
+use std::env;
+#[cfg(unix)]
+use std::process::Command;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
 const CHILD_ROOT_ENV: &str = "CAMEMBERT_FD_CHILD_ROOT";
+#[cfg(unix)]
 const CHILD_RESULT_ENV: &str = "CAMEMBERT_FD_CHILD_RESULT";
+#[cfg(unix)]
 const CHILD_LIMIT_ENV: &str = "CAMEMBERT_FD_CHILD_LIMIT";
 
 /// A wide-and-deep tree: enough concurrently-open directories that eight
 /// workers sharing a tiny fd budget must hit `EMFILE` mid-scan.
+#[cfg(unix)]
 fn build_pressure_tree(root: &Path) {
     for a in 0..20 {
         let da = root.join(format!("d{a:02}"));
@@ -100,6 +121,7 @@ fn build_pressure_tree(root: &Path) {
 /// `fd_exhaustion_child` below. The parent watches for a hang with a
 /// deadline and reads the child's verdict from a result file (avoiding any
 /// stdout pipe-buffer deadlock).
+#[cfg(unix)]
 #[test]
 fn fd_exhaustion_degrades_without_hanging() {
     let tmp = tempfile::tempdir().unwrap();
@@ -171,6 +193,7 @@ fn fd_exhaustion_degrades_without_hanging() {
 /// lowers `RLIMIT_NOFILE`, then starves itself down to a handful of free
 /// descriptors so the scan is guaranteed to meet `EMFILE`, and records
 /// whether the scan degraded gracefully.
+#[cfg(unix)]
 #[test]
 #[ignore = "spawned as a subprocess by fd_exhaustion_degrades_without_hanging"]
 fn fd_exhaustion_child() {
@@ -233,14 +256,13 @@ fn fd_exhaustion_child() {
 fn unreadable_dir_with_non_utf8_name() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let raw_name = std::ffi::OsStr::from_bytes(b"lock\xffed");
-    let locked = root.join(raw_name);
+    let raw_name = support::non_utf8_name();
+    let locked = root.join(&raw_name);
     fs::create_dir(&locked).unwrap();
     fs::write(locked.join("hidden"), b"x").unwrap();
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
-    if fs::read_dir(&locked).is_ok() {
-        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
-        eprintln!("skipping: running as root, cannot make a directory unreadable");
+    if !support::make_unreadable(&locked) {
+        support::restore_readable(&locked);
+        eprintln!("skipping: cannot make a directory unreadable in this environment");
         return;
     }
 
@@ -250,8 +272,8 @@ fn unreadable_dir_with_non_utf8_name() {
     })
     .scan(root)
     .unwrap();
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    support::restore_readable(&locked);
 
-    let node = child_by_name(&outcome, b"lock\xffed");
+    let node = child_by_name(&outcome, raw_name.as_encoded_bytes());
     assert_eq!(outcome.tree().error_reason(node), Some(ScanErrno::ACCESS));
 }

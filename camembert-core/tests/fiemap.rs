@@ -4,6 +4,13 @@
 //! which has no extents) — and every extent-dependent test guard-skips
 //! unless that filesystem is extent-capable (btrfs/XFS), the same
 //! runtime-probe style as `tests/scan.rs`.
+//!
+//! Whole-file `cfg(target_os = "linux")`: every test exercises
+//! `camembert_core::fiemap`, itself `#[cfg(target_os = "linux")]` in the
+//! product — `FS_IOC_FIEMAP` is a Linux-only ioctl with no Windows (or even
+//! other-Unix) equivalent, so the module under test does not exist anywhere
+//! else. Nothing narrower to gate.
+#![cfg(target_os = "linux")]
 
 use std::fs;
 use std::io::Write;

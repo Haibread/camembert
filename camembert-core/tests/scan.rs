@@ -1,40 +1,13 @@
 //! Integration tests for the scan engine, against a real temp tree.
 
 use std::fs;
-use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
 use camembert_core::scan::{ScanOptions, Scanner};
-use camembert_core::tree::{DirId, DirState, Kind, NodeFlags, NodeId};
+use camembert_core::tree::{DirId, DirState, Kind, NodeId};
 
-/// Independently compute (apparent_total, inode_count) with std::fs,
-/// counting each `(dev, ino)` with nlink > 1 once and skipping unreadable
-/// directories' contents — the same semantics the engine promises.
-fn walk_expected(path: &Path, seen: &mut std::collections::HashSet<(u64, u64)>) -> (u64, u64) {
-    let meta = fs::symlink_metadata(path).unwrap();
-    let mut apparent = meta.len();
-    let mut inodes = 1;
-    if meta.is_dir() {
-        let Ok(entries) = fs::read_dir(path) else {
-            return (apparent, inodes);
-        };
-        for entry in entries {
-            let entry = entry.unwrap();
-            let child_meta = fs::symlink_metadata(entry.path()).unwrap();
-            if !child_meta.is_dir()
-                && child_meta.nlink() > 1
-                && !seen.insert((child_meta.dev(), child_meta.ino()))
-            {
-                continue; // later hardlink: counted once already
-            }
-            let (a, n) = walk_expected(&entry.path(), seen);
-            apparent += a;
-            inodes += n;
-        }
-    }
-    (apparent, inodes)
-}
+#[path = "support/mod.rs"]
+mod support;
 
 fn child_by_name(
     outcome: &camembert_core::scan::ScanOutcome,
@@ -44,118 +17,6 @@ fn child_by_name(
     outcome
         .children_of(dir)
         .find(|&id| outcome.name_of(id) == name)
-}
-
-#[test]
-fn scan_a_known_tree() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path();
-
-    // root/
-    //   a/
-    //     f1 (1000 B)
-    //     f2 (10 B)
-    //     sub/           (empty)
-    //   b/
-    //     big (100000 B)
-    //     link -> ../a/f1
-    //     hard1 (500 B), hard2 (hardlink to hard1)
-    //   locked/          (chmod 000)
-    //     hidden (100 B) (unreachable content)
-    fs::create_dir(root.join("a")).unwrap();
-    fs::write(root.join("a/f1"), vec![b'x'; 1000]).unwrap();
-    fs::write(root.join("a/f2"), vec![b'y'; 10]).unwrap();
-    fs::create_dir(root.join("a/sub")).unwrap();
-    fs::create_dir(root.join("b")).unwrap();
-    fs::write(root.join("b/big"), vec![b'z'; 100_000]).unwrap();
-    std::os::unix::fs::symlink("../a/f1", root.join("b/link")).unwrap();
-    fs::write(root.join("b/hard1"), vec![b'h'; 500]).unwrap();
-    fs::hard_link(root.join("b/hard1"), root.join("b/hard2")).unwrap();
-    fs::create_dir(root.join("locked")).unwrap();
-    fs::write(root.join("locked/hidden"), vec![b'!'; 100]).unwrap();
-    fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
-
-    // Running as root, chmod 000 does not block reads: the unreadable-dir
-    // assertions are skipped in that case.
-    let runs_as_root = fs::read_dir(root.join("locked")).is_ok();
-
-    let mut seen = std::collections::HashSet::new();
-    let (expected_apparent, expected_inodes) = walk_expected(root, &mut seen);
-
-    let scanner = Scanner::new(ScanOptions::default());
-    let outcome = scanner.scan(root).unwrap();
-
-    // Restore permissions so TempDir can clean up.
-    fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
-
-    // Apparent totals exact, verified against an independent walk.
-    assert_eq!(outcome.totals.apparent, expected_apparent);
-    assert_eq!(outcome.entries, expected_inodes);
-    // 11 nodes: root, a, f1, f2, sub, b, big, link, hard1, hard2, locked
-    // — plus `locked/hidden` when the suite runs as root, since chmod 000
-    // does not stop root from descending (a containerized CI runs as root
-    // by default; this assertion used to fail there).
-    let expected_nodes = if runs_as_root { 12 } else { 11 };
-    assert_eq!(outcome.tree().node_count(), expected_nodes);
-    // 5 directories carry metadata: root, a, sub, b, locked.
-    assert_eq!(outcome.dirs, 5);
-
-    // Hardlink pair: one inode, one extra link, counted once.
-    assert_eq!(outcome.hardlink_inodes, 1);
-    assert_eq!(outcome.hardlink_extra_links, 1);
-    let b_node = child_by_name(&outcome, outcome.root(), b"b").unwrap();
-    let b_dir = outcome.tree().dir_of(b_node).unwrap();
-    let hard1 = child_by_name(&outcome, b_dir, b"hard1").unwrap();
-    let hard2 = child_by_name(&outcome, b_dir, b"hard2").unwrap();
-    let extra_flags = [hard1, hard2]
-        .iter()
-        .filter(|&&id| outcome.node(id).flags().contains(NodeFlags::HARDLINK_EXTRA))
-        .count();
-    assert_eq!(extra_flags, 1, "exactly one link flagged as extra");
-
-    // Symlink: stored as a symlink with its own size, never followed.
-    let link = child_by_name(&outcome, b_dir, b"link").unwrap();
-    assert_eq!(outcome.node(link).kind(), Kind::Symlink);
-    assert_eq!(outcome.node(link).size().apparent, "../a/f1".len() as u64);
-    assert!(
-        outcome.tree().dir_of(link).is_none(),
-        "symlink to a file must not become a directory"
-    );
-
-    // Unreadable dir: state Error, counted in te, contents uncounted.
-    let locked_node = child_by_name(&outcome, outcome.root(), b"locked").unwrap();
-    if runs_as_root {
-        eprintln!("running as root: skipping unreadable-dir assertions");
-    } else {
-        assert_eq!(outcome.errors, 1);
-        let locked_dir = outcome.tree().dir_of(locked_node).unwrap();
-        assert_eq!(outcome.dir(locked_dir).state, DirState::Error);
-        assert_eq!(outcome.dir(locked_dir).te, 1);
-        assert_eq!(outcome.children_of(locked_dir).count(), 0);
-    }
-
-    // Everything reachable is Complete.
-    assert_eq!(outcome.dir(outcome.root()).state, DirState::Complete);
-
-    // Directory totals: b's subtree = b itself + big + link + one hardlink.
-    let b_meta = outcome.dir(b_dir);
-    let b_own = fs::symlink_metadata(root.join("b")).unwrap().len();
-    assert_eq!(b_meta.ta, b_own + 100_000 + "../a/f1".len() as u64 + 500);
-    // b, big, link, and the hardlinked inode once: 4 (the extra link
-    // contributes 0 to tn).
-    assert_eq!(b_meta.tn, 4);
-
-    // path_of reconstructs full paths.
-    assert_eq!(outcome.path_of(b_dir), root.join("b"));
-
-    // Non-UTF-8 names survive end to end (create after the fact scan? no —
-    // separate mini-scan below).
-    drop(outcome);
-    let raw = tmp.path().join(std::ffi::OsStr::from_bytes(b"caf\xe9"));
-    fs::write(&raw, b"1").unwrap();
-    let outcome = Scanner::new(ScanOptions::default()).scan(root).unwrap();
-    let a_node = child_by_name(&outcome, outcome.root(), b"caf\xe9");
-    assert!(a_node.is_some(), "non-UTF-8 name must be preserved");
 }
 
 #[test]
@@ -235,7 +96,8 @@ fn stress_scan_is_deterministic_across_runs() {
 
 /// Kernel pseudo-filesystems are never descended into, even when crossing
 /// filesystem boundaries (their numbers are not disk usage). Gated on a
-/// mounted kernfs being visible under /sys; skipped elsewhere.
+/// mounted kernfs being visible under /sys; skipped elsewhere (including
+/// every non-Linux platform, which has no /sys at all).
 #[test]
 fn kernfs_mounts_are_excluded_even_when_crossing() {
     // /sys/kernel/debug (debugfs) and /sys/kernel/tracing (tracefs) are
@@ -267,9 +129,9 @@ fn error_report_uses_direct_counts() {
     fs::create_dir_all(root.join("outer/inner/locked")).unwrap();
     fs::write(root.join("outer/file"), b"x").unwrap();
     let locked = root.join("outer/inner/locked");
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
-    if fs::read_dir(&locked).is_ok() {
-        eprintln!("skipping: running as root, cannot make a dir unreadable");
+    if !support::make_unreadable(&locked) {
+        support::restore_readable(&locked);
+        eprintln!("skipping: cannot make a directory unreadable in this environment");
         return;
     }
 
@@ -279,7 +141,7 @@ fn error_report_uses_direct_counts() {
         ..ScanOptions::default()
     });
     let outcome = scanner.scan(root).unwrap();
-    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    support::restore_readable(&locked);
 
     assert_eq!(outcome.errors, 1);
     let top = outcome.top_dirs_by_errors(10);
@@ -289,4 +151,243 @@ fn error_report_uses_direct_counts() {
     let (dir, direct) = top[0];
     assert_eq!(direct, 1);
     assert!(outcome.path_of(dir).ends_with("outer/inner/locked"));
+}
+
+/// An unreadable directory scans as `DirState::Error`, is charged one `te`,
+/// and its (unreachable) contents are never counted as children — the
+/// counterpart of `error_report_uses_direct_counts` at the per-directory
+/// metadata level rather than the top-level error report.
+#[test]
+fn unreadable_dir_is_state_error_with_uncounted_contents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let locked = root.join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::write(locked.join("hidden"), vec![b'!'; 100]).unwrap();
+    if !support::make_unreadable(&locked) {
+        support::restore_readable(&locked);
+        eprintln!("skipping: cannot make a directory unreadable in this environment");
+        return;
+    }
+
+    let outcome = Scanner::new(ScanOptions::default()).scan(root).unwrap();
+    support::restore_readable(&locked);
+
+    assert_eq!(outcome.errors, 1);
+    let locked_node = child_by_name(&outcome, outcome.root(), b"locked").unwrap();
+    let locked_dir = outcome.tree().dir_of(locked_node).unwrap();
+    assert_eq!(outcome.dir(locked_dir).state, DirState::Error);
+    assert_eq!(outcome.dir(locked_dir).te, 1);
+    assert_eq!(outcome.children_of(locked_dir).count(), 0);
+}
+
+/// A name that is not valid UTF-8 (a raw invalid byte on Unix, an unpaired
+/// UTF-16 surrogate on Windows — see `support::non_utf8_name`) survives a
+/// scan unchanged: the interner stores the platform's own `OsStr` encoding
+/// verbatim, never assuming it decodes as `str`.
+#[test]
+fn non_utf8_name_is_preserved_by_a_scan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let raw_name = support::non_utf8_name();
+    fs::write(root.join(&raw_name), b"1").unwrap();
+
+    let outcome = Scanner::new(ScanOptions::default()).scan(root).unwrap();
+    let node = child_by_name(&outcome, outcome.root(), raw_name.as_encoded_bytes());
+    assert!(node.is_some(), "non-UTF-8 name must be preserved");
+}
+
+/// A symlink is stored as its own node — `Kind::Symlink`, never descended
+/// into as a directory. Skipped where the platform cannot create a symlink
+/// at all (Windows without Developer Mode or an elevated process).
+///
+/// The *size* a symlink reports is deliberately not asserted here: on Unix
+/// it is the byte length of the link's target text, but the Windows backend
+/// reports a reparse point's own `EndOfFile`/`AllocationSize` (see
+/// `scan/windows/worker.rs::entry_size`), which is not the same quantity —
+/// asserting a specific cross-platform value would be guessing without a
+/// Windows box to confirm it against.
+#[test]
+fn symlink_is_stored_without_following() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fs::write(root.join("target.txt"), b"hello").unwrap();
+    if !support::symlink_file("target.txt", root.join("link")) {
+        eprintln!(
+            "skipping: cannot create a symlink in this environment \
+             (needs Developer Mode or an elevated process on Windows)"
+        );
+        return;
+    }
+
+    let outcome = Scanner::new(ScanOptions::default()).scan(root).unwrap();
+    let link = child_by_name(&outcome, outcome.root(), b"link").unwrap();
+    assert_eq!(outcome.node(link).kind(), Kind::Symlink);
+    assert!(
+        outcome.tree().dir_of(link).is_none(),
+        "symlink to a file must not become a directory"
+    );
+}
+
+/// Hardlink identity accounting (`scan_a_known_tree`) is Unix-only: it
+/// cross-checks the engine against an independent walk that dedups by
+/// `(dev, ino)` and `nlink`, none of which `std::os::windows::fs::MetadataExt`
+/// exposes on stable Rust (HANDOFF "Windows port" known gap 5 — the APIs
+/// that would serve as a cross-check, `file_index`/`number_of_links`, are
+/// nightly-only). The chmod-000 unreadable directory in the same fixture
+/// could be ported (see `unreadable_dir_is_state_error_with_uncounted_contents`
+/// above, which already does), but it is entangled with the hardlink
+/// verification in one shared scan outcome here, so the whole test stays
+/// gated rather than being pulled apart for a partial win — the two new
+/// tests above and `non_utf8_name_is_preserved_by_a_scan` /
+/// `symlink_is_stored_without_following` already cover the rest of this
+/// fixture's ground portably.
+#[cfg(unix)]
+mod hardlink_identity {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    use camembert_core::tree::NodeFlags;
+
+    use super::*;
+
+    /// Independently compute (apparent_total, inode_count) with std::fs,
+    /// counting each `(dev, ino)` with nlink > 1 once and skipping unreadable
+    /// directories' contents — the same semantics the engine promises.
+    fn walk_expected(path: &Path, seen: &mut std::collections::HashSet<(u64, u64)>) -> (u64, u64) {
+        let meta = fs::symlink_metadata(path).unwrap();
+        let mut apparent = meta.len();
+        let mut inodes = 1;
+        if meta.is_dir() {
+            let Ok(entries) = fs::read_dir(path) else {
+                return (apparent, inodes);
+            };
+            for entry in entries {
+                let entry = entry.unwrap();
+                let child_meta = fs::symlink_metadata(entry.path()).unwrap();
+                if !child_meta.is_dir()
+                    && child_meta.nlink() > 1
+                    && !seen.insert((child_meta.dev(), child_meta.ino()))
+                {
+                    continue; // later hardlink: counted once already
+                }
+                let (a, n) = walk_expected(&entry.path(), seen);
+                apparent += a;
+                inodes += n;
+            }
+        }
+        (apparent, inodes)
+    }
+
+    #[test]
+    fn scan_a_known_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // root/
+        //   a/
+        //     f1 (1000 B)
+        //     f2 (10 B)
+        //     sub/           (empty)
+        //   b/
+        //     big (100000 B)
+        //     link -> ../a/f1
+        //     hard1 (500 B), hard2 (hardlink to hard1)
+        //   locked/          (chmod 000)
+        //     hidden (100 B) (unreachable content)
+        fs::create_dir(root.join("a")).unwrap();
+        fs::write(root.join("a/f1"), vec![b'x'; 1000]).unwrap();
+        fs::write(root.join("a/f2"), vec![b'y'; 10]).unwrap();
+        fs::create_dir(root.join("a/sub")).unwrap();
+        fs::create_dir(root.join("b")).unwrap();
+        fs::write(root.join("b/big"), vec![b'z'; 100_000]).unwrap();
+        std::os::unix::fs::symlink("../a/f1", root.join("b/link")).unwrap();
+        fs::write(root.join("b/hard1"), vec![b'h'; 500]).unwrap();
+        fs::hard_link(root.join("b/hard1"), root.join("b/hard2")).unwrap();
+        fs::create_dir(root.join("locked")).unwrap();
+        fs::write(root.join("locked/hidden"), vec![b'!'; 100]).unwrap();
+        fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Running as root, chmod 000 does not block reads: the unreadable-dir
+        // assertions are skipped in that case.
+        let runs_as_root = fs::read_dir(root.join("locked")).is_ok();
+
+        let mut seen = std::collections::HashSet::new();
+        let (expected_apparent, expected_inodes) = walk_expected(root, &mut seen);
+
+        let scanner = Scanner::new(ScanOptions::default());
+        let outcome = scanner.scan(root).unwrap();
+
+        // Restore permissions so TempDir can clean up.
+        fs::set_permissions(root.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Apparent totals exact, verified against an independent walk.
+        assert_eq!(outcome.totals.apparent, expected_apparent);
+        assert_eq!(outcome.entries, expected_inodes);
+        // 11 nodes: root, a, f1, f2, sub, b, big, link, hard1, hard2, locked
+        // — plus `locked/hidden` when the suite runs as root, since chmod 000
+        // does not stop root from descending (a containerized CI runs as root
+        // by default; this assertion used to fail there).
+        let expected_nodes = if runs_as_root { 12 } else { 11 };
+        assert_eq!(outcome.tree().node_count(), expected_nodes);
+        // 5 directories carry metadata: root, a, sub, b, locked.
+        assert_eq!(outcome.dirs, 5);
+
+        // Hardlink pair: one inode, one extra link, counted once.
+        assert_eq!(outcome.hardlink_inodes, 1);
+        assert_eq!(outcome.hardlink_extra_links, 1);
+        let b_node = child_by_name(&outcome, outcome.root(), b"b").unwrap();
+        let b_dir = outcome.tree().dir_of(b_node).unwrap();
+        let hard1 = child_by_name(&outcome, b_dir, b"hard1").unwrap();
+        let hard2 = child_by_name(&outcome, b_dir, b"hard2").unwrap();
+        let extra_flags = [hard1, hard2]
+            .iter()
+            .filter(|&&id| outcome.node(id).flags().contains(NodeFlags::HARDLINK_EXTRA))
+            .count();
+        assert_eq!(extra_flags, 1, "exactly one link flagged as extra");
+
+        // Symlink: stored as a symlink with its own size, never followed.
+        let link = child_by_name(&outcome, b_dir, b"link").unwrap();
+        assert_eq!(outcome.node(link).kind(), Kind::Symlink);
+        assert_eq!(outcome.node(link).size().apparent, "../a/f1".len() as u64);
+        assert!(
+            outcome.tree().dir_of(link).is_none(),
+            "symlink to a file must not become a directory"
+        );
+
+        // Unreadable dir: state Error, counted in te, contents uncounted.
+        let locked_node = child_by_name(&outcome, outcome.root(), b"locked").unwrap();
+        if runs_as_root {
+            eprintln!("running as root: skipping unreadable-dir assertions");
+        } else {
+            assert_eq!(outcome.errors, 1);
+            let locked_dir = outcome.tree().dir_of(locked_node).unwrap();
+            assert_eq!(outcome.dir(locked_dir).state, DirState::Error);
+            assert_eq!(outcome.dir(locked_dir).te, 1);
+            assert_eq!(outcome.children_of(locked_dir).count(), 0);
+        }
+
+        // Everything reachable is Complete.
+        assert_eq!(outcome.dir(outcome.root()).state, DirState::Complete);
+
+        // Directory totals: b's subtree = b itself + big + link + one hardlink.
+        let b_meta = outcome.dir(b_dir);
+        let b_own = fs::symlink_metadata(root.join("b")).unwrap().len();
+        assert_eq!(b_meta.ta, b_own + 100_000 + "../a/f1".len() as u64 + 500);
+        // b, big, link, and the hardlinked inode once: 4 (the extra link
+        // contributes 0 to tn).
+        assert_eq!(b_meta.tn, 4);
+
+        // path_of reconstructs full paths.
+        assert_eq!(outcome.path_of(b_dir), root.join("b"));
+
+        // Non-UTF-8 names survive end to end (create after the fact scan? no —
+        // separate mini-scan below).
+        drop(outcome);
+        let raw = tmp.path().join(std::ffi::OsStr::from_bytes(b"caf\xe9"));
+        fs::write(&raw, b"1").unwrap();
+        let outcome = Scanner::new(ScanOptions::default()).scan(root).unwrap();
+        let a_node = child_by_name(&outcome, outcome.root(), b"caf\xe9");
+        assert!(a_node.is_some(), "non-UTF-8 name must be preserved");
+    }
 }

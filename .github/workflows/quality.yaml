@@ -30,13 +30,16 @@ jobs:
 
   # Windows is a second target, not a second CI story: there is no local
   # Windows toolchain on any developer machine here, so this job is the
-  # authoritative check that the `cfg(windows)` arms compile at all.
+  # authoritative check for the `cfg(windows)` arms.
   #
-  # `cargo check`, not `cargo test`, until the integration tests stop
-  # assuming Unix at module level (symlink/hardlink/chmod fixtures in
-  # top-level `use` statements fail to compile on Windows regardless of
-  # which test is being run). Graduate this to `cargo test --workspace`
-  # in the change that gates them.
+  # `cargo test --workspace`, now that the integration test fixtures no
+  # longer assume Unix at module level (they either gate the Unix-only ones
+  # at test-fn/module granularity — `delete`, `fiemap`, the io_uring parity
+  # pair, RLIMIT_NOFILE — or port to a `tests/support` helper that picks a
+  # symlink/unreadable-directory/non-UTF-8-name mechanism per platform).
+  # `tui_smoke.rs` stays Unix-only for a different reason: it drives the TUI
+  # through `portable_pty`/ConPTY, a harness limitation, not a product one
+  # (see `HANDOFF.md`'s Windows section).
   windows:
     runs-on: windows-2025
     steps:
@@ -48,8 +51,8 @@ jobs:
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: windows
-      - name: check the workspace compiles for x86_64-pc-windows-msvc
-        run: cargo check --workspace --locked
+      - name: run the test suite for x86_64-pc-windows-msvc
+        run: cargo test --workspace --locked
 
   msrv:
     runs-on: ubuntu-24.04
