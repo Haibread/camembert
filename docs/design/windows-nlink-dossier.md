@@ -6,6 +6,20 @@ measurement, options, an adversarial attack on those options, and one
 recommendation, for a co-design session. Nothing here is binding until it
 lands in a decisions doc.
 
+> **Status, 2026-07-27: decided and shipped, in part.** The user approved
+> §6's recommendation in its tuned form. Landed: steps 1-5 and 7 —
+> registry on the listing's file id, tuned storage, redefined summary line,
+> gated dump (`i` yes, `l` never without a count), `--links`/`LINKS`, and
+> the `mklink /H` integration test. Measured after landing on the same box:
+> 2044 → **107.0 ms** on the 200k tree (1.29× faster than gdu), 5845 →
+> 2643 ms on `C:\Windows`, peak RSS 16.99 → 21.46 MB and 84.95 → 87.43 MB,
+> totals byte-identical per entry via `camembert diff` on four trees.
+> **Step 6 — the lazy lookup at the point of consumption — is not done**,
+> and is the piece that buys back the at-a-glance "this file has links you
+> cannot see" answer that §5's Attack C.2 is right to call a real loss.
+> See `HANDOFF.md`'s Windows section. The §4/§6 numbers below are the
+> pre-tuning ones and are corrected by the review note that follows.
+
 Every number below was measured on the user's own machine on 2026-07-27:
 Ryzen 9 5950X (16C/32T), NVMe SSD, NTFS, Windows 11 Pro 10.0.26200,
 **Microsoft Defender real-time protection ON and unmodified**. The scan
