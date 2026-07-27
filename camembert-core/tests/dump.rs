@@ -143,9 +143,26 @@ fn dump_of_a_real_scan_holds_the_spec_invariants() {
     assert_eq!(h["format"], "camembert-dump");
     assert_eq!(h["v"], 1);
     assert_eq!(h["ts"], 1_753_142_400u64);
-    assert_eq!(
-        decode_name(h["root"].as_str().unwrap()),
-        root_path.as_os_str().as_encoded_bytes()
+    // §4 defines `/` as *the format's* component separator on every
+    // platform, so a Windows root is rewritten on write — the dump is an
+    // interchange file, not a local path. Comparing against the OS path
+    // verbatim is what let the non-conformant mixed-separator dumps
+    // through.
+    let expected_root = {
+        let bytes = root_path.as_os_str().as_encoded_bytes().to_vec();
+        if cfg!(windows) {
+            bytes
+                .into_iter()
+                .map(|b| if b == b'\\' { b'/' } else { b })
+                .collect()
+        } else {
+            bytes
+        }
+    };
+    assert_eq!(decode_name(h["root"].as_str().unwrap()), expected_root);
+    assert!(
+        !decode_name(h["root"].as_str().unwrap()).contains(&b'\\'),
+        "a conformant dump never carries a backslash separator"
     );
     assert!(h["dev"].is_string(), "dev is a JSON string");
     assert_eq!(h["ordered"], true);

@@ -64,7 +64,7 @@ use crate::scan::{HardlinkLink, ScanOutcome};
 use crate::tree::{DirId, DirState, ExcludedReason, Kind, NodeFlags, NodeId, Tree};
 
 use container::FrameWriter;
-use encode::JsonLine;
+use encode::{JsonLine, to_dump_separator};
 
 /// Caller-provided dump metadata. Core never reads the clock — the
 /// frontend passes the timestamp (e.g. `SystemTime::now()`).
@@ -164,7 +164,7 @@ fn write_records<W: Write>(
     let mut fw = FrameWriter::with_target(out, frame_target)?;
 
     let root_meta = tree.dir(root);
-    let root_path = encode_name(tree.name(root_meta.node));
+    let root_path = to_dump_separator(&encode_name(tree.name(root_meta.node)));
     let mut header = JsonLine::new();
     header.str("t", "h").str("format", "camembert-dump");
     header.u64("v", 1).u64("minor", 1);
@@ -233,6 +233,8 @@ fn write_records<W: Write>(
                 }
                 for &child in children.iter().rev() {
                     if tree.node(child).kind().is_dir() {
+                        // `/` per §4 on every platform: a component
+                        // separator in this format, not the local one.
                         let child_path = format!("{path}/{}", encode_name(tree.name(child)));
                         match tree.dir_of(child) {
                             Some(sub) => stack.push(Work::Dir(sub, child_path)),

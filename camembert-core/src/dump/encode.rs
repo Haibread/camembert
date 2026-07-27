@@ -16,6 +16,31 @@ use std::fmt::Write as _;
 /// values at or above this are emitted as strings (D4).
 const JSON_SAFE_LIMIT: u64 = 1 << 53;
 
+/// Rewrite a scan root's own path to the format's component separator.
+///
+/// Spec §4 defines path comparison as "split on `/`" — `/` is *this
+/// format's* separator on every platform, not the local one. A Windows
+/// root is interned as `C:\Windows\System32`, and writing that verbatim
+/// produced dumps whose `root` and `d` paths mixed both characters
+/// (`C:\Users\me\tree/sub/a.txt`): not what the spec says, and a path
+/// that names no file on any system.
+///
+/// The rewrite is Windows-only *by necessity*, not by convenience: `\` is
+/// a legal character in a Unix filename, so rewriting it there would
+/// corrupt real names into fake components. The platform is a parameter so
+/// both halves stay testable from either OS.
+pub fn to_dump_separator(path: &str) -> String {
+    to_dump_separator_on(path, cfg!(windows))
+}
+
+fn to_dump_separator_on(path: &str, windows: bool) -> String {
+    if windows {
+        path.replace('\\', "/")
+    } else {
+        path.to_owned()
+    }
+}
+
 /// Encode raw filename bytes into a valid JSON-string payload (spec §4):
 /// non-UTF-8 bytes become `%XX` (uppercase), `%` becomes `%25`, everything
 /// else passes through. Injective and reversible ([`decode_name`]).
@@ -250,5 +275,34 @@ mod tests {
         let line = l.finish();
         let parsed: serde_json::Value = serde_json::from_str(line.trim_end()).unwrap();
         assert_eq!(parsed["n"], "with \"quotes\" and \\ backslash");
+    }
+
+    /// §4's separator is the format's, not the host's. A Windows root has
+    /// to be rewritten or the dump mixes both characters; a Unix name
+    /// containing a backslash must survive untouched, because there `\` is
+    /// an ordinary character and rewriting it would invent components.
+    #[test]
+    fn dump_paths_use_the_format_s_separator_not_the_host_s() {
+        assert_eq!(
+            to_dump_separator_on(r"C:\Windows\System32", true),
+            "C:/Windows/System32"
+        );
+        assert_eq!(
+            to_dump_separator_on("/usr/lib", false),
+            "/usr/lib",
+            "a unix root is already conformant"
+        );
+        assert_eq!(
+            to_dump_separator_on(r"/home/back\slash", false),
+            r"/home/back\slash",
+            "a backslash in a unix name is data, not a separator"
+        );
+        // Percent-encoded bytes are unaffected: `\` is 0x5C and never
+        // appears as an escape's own text.
+        assert_eq!(
+            to_dump_separator_on(r"C:\caf%E9", true),
+            "C:/caf%E9",
+            "encoding survives the rewrite"
+        );
     }
 }

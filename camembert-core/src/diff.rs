@@ -714,10 +714,31 @@ impl Differ {
     }
 }
 
+/// Join `name` onto `dir` with the separator `dir` itself uses.
+///
+/// Conformant dumps are all `/` (spec §4, enforced on write by
+/// `dump::encode::to_dump_separator`), so this normally just picks `/`.
+/// It reads the separator from the data anyway because **camembert 0.3.0
+/// wrote non-conformant Windows dumps** — `\` in the root, `/` in every
+/// join, e.g. `C:\Users\me\tree/sub/a.txt` — and those files still exist
+/// on disk. Diffing one should print paths a user can recognise rather
+/// than compounding the original mistake.
+///
+/// The *first* separator decides, not the last: every `dir` starts with
+/// the header's root, so the leading separator is the one the dump was
+/// written with, and a component deeper down whose **name** contains the
+/// other character cannot override it. A Unix file genuinely called
+/// `back\slash` therefore stays joined with `/`, which scanning from the
+/// right got wrong.
 fn join_path(dir: &[u8], name: &[u8]) -> Vec<u8> {
+    let sep = dir
+        .iter()
+        .find(|&&b| b == b'/' || b == b'\\')
+        .copied()
+        .unwrap_or(b'/');
     let mut path = Vec::with_capacity(dir.len() + 1 + name.len());
     path.extend_from_slice(dir);
-    path.push(b'/');
+    path.push(sep);
     path.extend_from_slice(name);
     path
 }
@@ -1215,5 +1236,25 @@ mod tests {
         assert_eq!(report.disk_delta, 0, "extra link adds no disk (d totals)");
         assert_eq!(report.entry_delta, 1, "but one more inode-visible entry");
         assert_eq!(report.counts.added, 1, "the new link is an added entry");
+    }
+
+    /// A dump is portable: the separator belongs to the dump, not to the
+    /// machine reading it. A Windows dump diffed anywhere used to render
+    /// `C:\Users\me\tree/sub/a.txt`, which names no file on either system.
+    #[test]
+    fn joined_paths_keep_the_dump_s_own_separator() {
+        assert_eq!(join_path(b"/usr/lib", b"libc.so"), b"/usr/lib/libc.so");
+        assert_eq!(
+            join_path(br"C:\Windows\System32", b"drivers"),
+            br"C:\Windows\System32\drivers"
+        );
+        // A Unix directory whose *name* contains a backslash: the last
+        // separator is still `/`, so nothing is misread as a Windows path.
+        assert_eq!(
+            join_path(br"/home/back\slash", b"file"),
+            br"/home/back\slash/file"
+        );
+        // A relative root with no separator at all falls back to `/`.
+        assert_eq!(join_path(b"tree", b"a"), b"tree/a");
     }
 }
