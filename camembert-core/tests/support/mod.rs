@@ -63,6 +63,18 @@ pub fn symlink_dir(target: impl AsRef<Path>, link: impl AsRef<Path>) -> bool {
     std::os::windows::fs::symlink_dir(target, link).is_ok()
 }
 
+/// Create a hard link to a file. Returns whether it succeeded, so callers
+/// can skip with a clear message rather than fail.
+///
+/// `std::fs::hard_link` is `link(2)` on Unix and `CreateHardLinkW` on
+/// Windows — the same call `mklink /H` makes, and like it, it needs no
+/// privilege. It does need a filesystem that has the concept: NTFS and
+/// ReFS do, FAT/exFAT (a USB stick as `TMPDIR`) and most network
+/// filesystems do not, and that is a skip, not a failure.
+pub fn hard_link(target: impl AsRef<Path>, link: impl AsRef<Path>) -> bool {
+    std::fs::hard_link(target, link).is_ok()
+}
+
 /// Make a directory unreadable to the current process and return whether
 /// it actually ended up unreadable — chmod 000 does not stop root, and a
 /// missing/broken `icacls` should not silently pass a test.

@@ -242,6 +242,120 @@ fn symlink_is_stored_without_following() {
 /// tests above and `non_utf8_name_is_preserved_by_a_scan` /
 /// `symlink_is_stored_without_following` already cover the rest of this
 /// fixture's ground portably.
+/// Hardlink deduplication, against a fixture whose ground truth is known
+/// by construction: `n` files of `FILE_BYTES` each, plus one hard link to
+/// every one of them. The naive sum is `2 * n * FILE_BYTES`; the right
+/// answer is `n * FILE_BYTES`, and being wrong here is being wrong by a
+/// factor of two.
+///
+/// Portable on purpose. It is the guard on the property camembert is the
+/// **only** Windows disk-usage tool to have (gdu, dust, diskus, robocopy
+/// and `Get-ChildItem` all report the fixture at 2x, two of them while
+/// documenting the opposite), and the Windows scan reaches it by a
+/// completely different mechanism from the Unix one — `nlink > 1` gating a
+/// registry there, a repeat sighting of the listing's file id here
+/// (`docs/design/windows-nlink-dossier.md`). One test, both mechanisms.
+#[test]
+fn hardlinks_are_counted_once_not_twice() {
+    const N: usize = 64;
+    const FILE_BYTES: usize = 4096;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    fs::create_dir(root.join("unique")).unwrap();
+    fs::create_dir(root.join("links")).unwrap();
+    for i in 0..N {
+        let target = root.join(format!("unique/f{i:03}.bin"));
+        fs::write(&target, vec![b'x'; FILE_BYTES]).unwrap();
+        if !support::hard_link(&target, root.join(format!("links/l{i:03}.bin"))) {
+            eprintln!("skipping: this filesystem does not support hard links");
+            return;
+        }
+    }
+
+    let outcome = Scanner::new(ScanOptions::default()).scan(root).unwrap();
+
+    // Walk the arena: what every link *says* it weighs, and what the
+    // engine actually counted (extras contribute 0).
+    let mut naive = 0u64;
+    let mut counted = 0u64;
+    let mut files = 0u64;
+    walk_arena(&outcome, outcome.root(), &mut |outcome, id| {
+        let node = outcome.node(id);
+        if node.kind() == Kind::File {
+            files += 1;
+            naive += node.size().apparent;
+        }
+        if !node
+            .flags()
+            .contains(camembert_core::tree::NodeFlags::HARDLINK_EXTRA)
+        {
+            counted += node.size().apparent;
+        }
+    });
+
+    let payload = (N * FILE_BYTES) as u64;
+    assert_eq!(files, 2 * N as u64, "every link is still its own entry");
+    assert_eq!(
+        naive,
+        2 * payload,
+        "the naive sum double-counts, as it must"
+    );
+    assert_eq!(
+        outcome.totals.apparent, counted,
+        "the root total is the sum of what was actually counted"
+    );
+    assert_eq!(
+        outcome.totals.apparent - dir_bytes(&outcome),
+        payload,
+        "the inode's bytes are counted once, not once per link"
+    );
+    assert_ne!(
+        outcome.totals.apparent - dir_bytes(&outcome),
+        2 * payload,
+        "the naive sum must not be what came out"
+    );
+
+    // Counters: N inodes reached by more than one path, N later links
+    // contributing zero, and `entries` (root's `tn`) counting each inode
+    // once — 1 root + 2 dirs + N files.
+    assert_eq!(outcome.hardlink_inodes, N as u64);
+    assert_eq!(outcome.hardlink_extra_links, N as u64);
+    assert_eq!(outcome.entries, 3 + N as u64);
+}
+
+/// Σ apparent of the directory inodes themselves, which the fixture's
+/// arithmetic has to set aside (their size is a filesystem's business:
+/// 4096-ish on ext4, 0 for a subdirectory in a Windows listing).
+fn dir_bytes(outcome: &camembert_core::scan::ScanOutcome) -> u64 {
+    let mut total = 0;
+    walk_arena(outcome, outcome.root(), &mut |outcome, id| {
+        if outcome.node(id).kind() == Kind::Dir {
+            total += outcome.node(id).size().apparent;
+        }
+    });
+    total
+        + outcome
+            .node(outcome.dir(outcome.root()).node)
+            .size()
+            .apparent
+}
+
+/// Visit every node below `dir` (the root's own node excluded — callers
+/// that want it add it, as [`dir_bytes`] does).
+fn walk_arena(
+    outcome: &camembert_core::scan::ScanOutcome,
+    dir: DirId,
+    visit: &mut impl FnMut(&camembert_core::scan::ScanOutcome, NodeId),
+) {
+    for child in outcome.children_of(dir).collect::<Vec<_>>() {
+        visit(outcome, child);
+        if let Some(sub) = outcome.tree().dir_of(child) {
+            walk_arena(outcome, sub, visit);
+        }
+    }
+}
+
 #[cfg(unix)]
 mod hardlink_identity {
     use std::os::unix::ffi::OsStrExt;
