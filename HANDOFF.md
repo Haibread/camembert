@@ -359,7 +359,8 @@ that before touching any of this. This section is only the state.
 
 The **whole workspace** compiles on `x86_64-pc-windows-msvc` — 0 errors, 0
 warnings, clippy clean at `-D warnings` — and the binary scans, browses and
-dumps for real. `cargo test --workspace` there: **375 passing, 0 failing**.
+dumps for real. `cargo test --workspace` there: **392 passing, 0 failing**
+(2 ignored, both Unix-only guards).
 Linux is untouched throughout: 596 tests green at every commit, and the
 warm 200k-file bench moved 70.8 -> 68.3 ms across the seam commit, which
 is noise.
@@ -436,13 +437,80 @@ What changed besides the speed, and why each is not a regression:
   is the guard that should have existed all along: 64 files + 64 hard
   links, portable, running in the `windows-2025` job.
 
-**Landing 2 is not done and is the obvious next step**: the lazy per-file
-link query *at the point of consumption* — the selection card (1 file,
-~40 µs, invisible) and the visible viewport's `⛓` column (~50 rows,
-1.4-2.4 ms, memoisable per inode, off the 33 ms cadence). That is what
-buys back the at-a-glance "deleting this frees nothing" answer for the
-rows a user is actually looking at, without a whole-tree sweep. Dossier
-§4 Option D describes it.
+### Landing 2 — the selection card asks, 2026-07-27
+
+The lazy per-file link query *at the point of consumption* (dossier §4
+Option D's surviving variant, §6 step 6). **The selection card is done.
+The flat view's `⛓` column is not — deliberately, see below.**
+
+For the row under the cursor, camembert now issues exactly one
+`NtQueryInformationByName` and says what it means:
+
+```
+╭ ntfs.sys ────────────────────────────────────────────────────────────╮
+│  3.4 MiB · 2.1% of parent                                            │
+│modified 12 days ago · 1 items                                        │
+│2 links · 1 outside this scan — deleting this frees nothing           │
+╰──────────────────────────────────────────────────────────────────────╯
+```
+
+Two numbers, kept apart on purpose: **how many links exist** (the
+filesystem's `NumberOfLinks`, fresh) and **how many this scan reached**
+(the hardlink registry, keyed on the scan's own node identity — never a
+file id matched across two APIs). Their difference is the answer the
+`--links`-free scan gave up. A single-link file says `1 link · nothing
+else points at this file` rather than falling silent, and a query that
+fails says `links unknown · <reason>` — never nothing, because nothing
+reads as "no links".
+
+Where it lives, and why:
+
+- **`camembert-core/src/winlink.rs`** (`cfg(windows)`, public) owns the
+  one `unsafe` block. `scan/windows/worker.rs::query_nlink` now calls into
+  it, so the scan path and the card path cannot drift. Its `LinkCount` is
+  three-way — `Known` / `Unsupported` / `Failed(QueryFailure)` — which is
+  the `is_unsupported_status` distinction the scan already made, promoted
+  into the type so a consumer cannot collapse it by accident.
+- **`camembert/src/ui/nlink_rt.rs`** is the UI runtime, copied in shape
+  from `ui/oracle.rs`: off-thread job, `Pending` placeholder, update in
+  place, results memoised per node *and* per inode where the registry
+  knows one, all invalidated on the deletion epoch. The card never blocks
+  a frame — 46 µs is nothing on NTFS, but a UNC scan root is not bounded
+  by that measurement.
+- **Nothing is asked when the answer is already held** (`--links`, i.e.
+  `link_counts_known`), for directories, or for anything that is not a
+  plain file in the tree. A WOF/OneDrive-backed file *is* queried: the
+  scan skips those to avoid changing what `C:\Windows` deduplicates to
+  (gap 1 below), which is a registry question, and there is no registry
+  here.
+- **No CLI or env surface was added.** Nothing to document in `--help` or
+  the README; the card simply says more than it did.
+
+Three rendered cases, from the tests that pin them
+(`ui::tests::windows_links`, real scans, real syscalls, real
+`TestBackend`): links outside the scan (above, and `Netwfw10.dat` in
+`System32\drivers` reads `3 links · 2 outside this scan`), a lone file,
+and a refused query (`links unknown · the entry is gone` for a name that
+raced away; `links unknown · access denied` for an unreadable directory).
+
+**Why the `⛓` column in flat view was not done, with the measurement.**
+It is affordable: 50 queries against one open directory handle cost
+**1.6 ms** on this box (31.8 µs each, warm, Defender on), 4.8 % of a 33 ms
+frame, and memoised it is paid once per viewport rather than per frame.
+Two things make it a decision rather than an extension, and both belong to
+the user:
+
+1. **One thread per row does not scale to a viewport.** The runtime spawns
+   a job per candidate, which is right for one cursor row and wrong for
+   fifty; the column needs a *batched* job grouped by parent directory
+   (the 1.6 ms above is one shared handle — a fresh open per query is
+   3.0 ms), plus the one-frame-late geometry feedback loop
+   `clamp_freeable_cursor` already uses to learn what is visible.
+2. **`⛓` means something different on Windows now.** Landing 1
+   deliberately redefined it to "reached by more than one path in this
+   scan". Filling the column from a live query would make the same glyph
+   mean "has links anywhere" in flat view and "reached twice here" in tree
+   view. Pick one meaning before writing the code.
 
 Note that thread scaling was measured at 1/2/4/8/12/16/24/32 workers
 before this change and 8 came out optimal, with 12+ regressing ~45 %. **Do
@@ -468,7 +536,9 @@ syscall, and the shape has changed completely. Re-measure.
   byte-identical — reopening this needs a tree where they are not, not a
   preference. What is *not* settled and stays open: whether the summary
   counter's two meanings should ever be reconciled (they answer different
-  questions and both are true), and landing 2's consumption-point lookup.
+  questions and both are true), and whether the `⛓` *column* should ever
+  be filled from the consumption-point query (landing 2 answered the
+  selection card only — see above for why the column is a separate call).
 - **The Windows TUI is reduced, not absent** (2026-07-26). Table, wheel,
   gauge, navigation, sorting, filtering, flat view, diff, dump and themes
   survive; deletion, the freeable panel, the confidence verdict and the

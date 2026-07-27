@@ -234,15 +234,33 @@ the `⛓` badge and the `hardlinked inodes:` line answer**:
 | dump entries | `i`, no `l` | `i` and `l` |
 | 200 000-file tree | ~110 ms | ~2 000 ms |
 
-The default is narrower and exact for what it claims; `--links` (env
-`LINKS`) is the one that answers *"deleting this frees nothing, there are
-links you cannot see"*, which on `C:\Windows` is true of 92 % of files.
+The default is narrower and exact for what it claims. For the row you are
+actually looking at, though, **the selection card asks the real question
+anyway** — one query for one file, off the UI thread, no flag needed:
+
+```
+╭ ntfs.sys ────────────────────────────────────────────────────────────╮
+│  3.4 MiB · 2.1% of parent                                            │
+│modified 12 days ago · 1 items                                        │
+│2 links · 1 outside this scan — deleting this frees nothing           │
+╰──────────────────────────────────────────────────────────────────────╯
+```
+
+Two facts, deliberately kept apart: how many links exist on the volume,
+and how many of them this scan reached. A file nothing else points at says
+so (`1 link · nothing else points at this file`) rather than going quiet,
+and a query that cannot be answered says `links unknown · access denied`
+(or `· the entry is gone`, or `· not reported on this volume`) — never a
+blank line, which would read as "no links". Directories, symlinks and
+junctions get no line at all: there is no question to answer there.
+
+`--links` (env `LINKS`) is the whole-scan version of the same answer,
+which on `C:\Windows` is true of 92 % of files — worth it when you want
+the `⛓` badge and the summary line to mean it across every row at once.
 Price it before reaching for it: the cost is per **file** — directories
 and reparse points are never queried — so the factor tracks the
 file:directory ratio, ~19× on a file-dense synthetic tree and ~2× on
-`C:\Windows`. Experimental; expect the whole-scan sweep to become
-unnecessary once the per-file lookup lands at the point of consumption
-(the selection card, the visible viewport) instead.
+`C:\Windows`. Experimental.
 
 Dumps never fabricate: without `--links` a Windows dump omits the `l`
 field rather than write a number no filesystem reported. `i` is still

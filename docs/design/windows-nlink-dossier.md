@@ -14,11 +14,20 @@ lands in a decisions doc.
 > 2044 → **107.0 ms** on the 200k tree (1.29× faster than gdu), 5845 →
 > 2643 ms on `C:\Windows`, peak RSS 16.99 → 21.46 MB and 84.95 → 87.43 MB,
 > totals byte-identical per entry via `camembert diff` on four trees.
-> **Step 6 — the lazy lookup at the point of consumption — is not done**,
-> and is the piece that buys back the at-a-glance "this file has links you
-> cannot see" answer that §5's Attack C.2 is right to call a real loss.
-> See `HANDOFF.md`'s Windows section. The §4/§6 numbers below are the
-> pre-tuning ones and are corrected by the review note that follows.
+> **Step 6 — the lazy lookup at the point of consumption — landed for the
+> selection card on 2026-07-27**, in `camembert-core/src/winlink.rs` (the
+> shared syscall wrapper) and `camembert/src/ui/nlink_rt.rs` (the
+> off-thread runtime). The card now says both numbers apart — "3 links · 2
+> outside this scan" — which is the at-a-glance answer §5's Attack C.2 is
+> right to call a real loss. **The `⛓` column half of step 6 is still
+> open** and is now a decision rather than an omission: a 50-row viewport
+> costs a measured 1.6 ms through one shared directory handle (31.8 µs per
+> query, warm, Defender on), so it is affordable, but it needs a batched
+> job rather than a thread per row, and filling it would give `⛓` two
+> different meanings across tree and flat view — §6.3 deliberately
+> redefined the Windows one. See `HANDOFF.md`'s Windows section.
+> The §4/§6 numbers below are the pre-tuning ones and are corrected by the
+> review note that follows.
 
 Every number below was measured on the user's own machine on 2026-07-27:
 Ryzen 9 5950X (16C/32T), NVMe SSD, NTFS, Windows 11 Pro 10.0.26200,
