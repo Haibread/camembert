@@ -517,6 +517,85 @@ before this change and 8 came out optimal, with 12+ regressing ~45 %. **Do
 not trust that number now** — it measured a workload that was 95 % one
 syscall, and the shape has changed completely. Re-measure.
 
+### Landing 3 — directories get their index bytes back, 2026-07-27
+
+Known gap 4 (below), closed. A Windows directory listing reports
+`AllocationSize = EndOfFile = 0` for every **subdirectory** entry in it, so
+every directory below the scan root contributed nothing to its own size —
+while the root, which `windows.rs::open_root` opens by handle and asks with
+`FileStandardInfo`, reported the real figure. On a `sub/` of 400 files with
+38-character names: **0 B as a child, 195.1 KiB as a root**. `camembert sub`
+and `camembert parent-of-sub` disagreed about `sub` by two orders of
+magnitude, and counting directory inodes is exactly what the README says
+separates camembert from `du -sb`.
+
+The worker already opens every directory in order to enumerate it, so the
+correction needs no extra open — only the information query on a handle it
+holds. `Batch::dir_own_size` (`cfg(windows)`, beside `dir_error`) carries
+it, exactly one batch per job; `Owner::correct_dir_own_size` applies it as a
+**delta against what the node already holds**, which makes it idempotent and
+lets one walk up the ancestor chain repair the directory, its parent's total
+and every ancestor at once. The node is rewritten in the same breath, so the
+invariant everything else reads — a directory's aggregate is the sum of its
+own entry lines — survives. The live flat accumulator learns the same delta
+(`Accumulator::add_dir_bytes`) or it would drift from the frozen-arena fold,
+which is the D2 agreement invariant `tests/flat_agreement.rs` pins.
+
+**The `.` entry is not a shortcut** — checked, because it would have been
+free: a directory's *own* listing reports `eof = alloc = 0` for `.` and `..`
+exactly as its parent's does for it. The by-handle query is the only route.
+
+**Totals moved, and the move is exactly accounted for.** On each tree the
+root-total delta equals the summed own-sizes of the non-root directories, to
+the byte, with `tn` and `te` unchanged — nothing else shifted, nothing was
+double-counted:
+
+| tree | dirs | before (real) | after (real) | Δ = Σ dir own sizes | dirs with a real index |
+|---|---|---|---|---|---|
+| 200k synthetic | 8 301 | 16 384 | 34 013 184 | 33 996 800 | 4 200 / 8 300 |
+| `C:\Windows\System32` | 1 591 | 8 986 968 432 | 8 995 070 320 | 8 101 888 | 329 / 1 590 |
+| `C:\Windows` | 170 391 | 35 512 619 064 | 35 813 441 592 | 300 822 528 | 35 057 / 170 390 |
+
+**How truth was established, without asking the API under test.** NTFS
+exposes a directory's B-tree as a named stream: opening
+`\\?\<dir>:$I30:$INDEX_ALLOCATION` **by name** and calling `GetFileSizeEx` is
+a different object reached through a different call, and it agrees byte for
+byte. At 0/1/10/50/100/200/400/800 long-named entries the oracle reports 0,
+0, 4 096, 24 576, 49 152, 98 304, 196 608, 524 288 and camembert reports each
+exactly — a step function in whole 4 KiB INDX blocks, with the two zeros
+real (NTFS keeps a small index resident in the MFT record). Sampled across
+the three trees above: **4 080 directories checked, 0 disagreements**
+(System32 every 3rd, `C:\Windows` every 61st, bench tree every 11th).
+`fsutil file layout` needs elevation and a free-space differential is
+~MB-noisy on a live system drive; both were tried and are not the oracle
+this is.
+
+**Cost: at or below the noise floor**, which is the ~25 ms estimate holding.
+The clean measurement is the same binary A/B (the query short-circuited by a
+throwaway env var, both arms behind the same `cmd /c` wrapper so neither
+pays for the other's shell): 200k tree 139.7 ms off vs **137.5 ms on**;
+`C:\Windows` 4.184 s ± 1.073 off vs **3.189 s ± 0.189 on**. Both read as
+"on is faster", which is not a claim — it is the measurement saying the
+per-directory query is smaller than the run-to-run variance of a live
+Windows box. Cross-binary runs bracket it the other way at +3 ms on the
+200k tree, so the honest figure is **0–4 ms per 8 300 directories** and
+**not distinguishable from zero on 170 391**. Beware: an early cross-binary
+reading of +559 ms on `C:\Windows` was pure ambient interference and did not
+reproduce (a repeat gave 3.213 s before vs 3.196 s after).
+
+`scripts\bench-compare.ps1`, 200k tree, warm, Defender on and unmodified:
+camembert **116.2 ms → 123.0 ms**, still 1.15× faster than gdu. Read that
+pair with the noise in mind — gdu moved 152.0 → 141.7 ms between the same
+two runs, i.e. the script's run-to-run spread is wider than the difference
+it is being asked to show, which is why the controlled A/B above is the
+number to trust.
+
+`cargo test --workspace` on Windows: **396 pass, 0 fail** (2 ignored),
+clippy clean at `-D warnings`, `cargo fmt --check` clean. The property is
+pinned portably by
+`camembert-core/tests/scan.rs::directory_size_does_not_depend_on_being_the_scan_root`
+— Unix passed it already, Windows did not.
+
 ### Decisions taken, not to be relitigated without a new element
 
 - **`windows-sys` is a T1 dependency** (2026-07-26). A `std`-only walker
@@ -614,10 +693,11 @@ is the one that actually pins it; update it deliberately.
    confirmed the actual value, because creating a symlink needs Developer
    Mode or elevation and the dev box has neither. Confirm, then either
    document it as a platform difference or fix it; do not guess.
-4. **Subdirectories contribute 0 to directory-index bytes** while the root
-   contributes its real size, because listing entries report
-   `AllocationSize = 0` for directories but a by-handle query does not.
-   Root size then appears to come from nowhere.
+4. ~~**Subdirectories contribute 0 to directory-index bytes.**~~ **Closed
+   2026-07-27** — see "Landing 3" above. Every directory the scan opens is
+   now asked for its own size; the ones it never opens (junction, mount
+   point, unknown reparse tag, failed open) keep the listing's 0, which is
+   the honest answer with no handle to ask.
 5. **Junctions are refused, not resolved**, so `--one-filesystem` is a
    no-op and junction-heavy trees under-count. Descending them needs cycle
    detection camembert does not have.

@@ -462,9 +462,14 @@ Platform:
   freeable panel (f) and the gauge's freeable suffix, and the reclaim
   oracle's verdict plus the ambient exclusive floor. --no-proc-sweep and
   --no-fiemap are accepted but inert on Windows. Windows sizes come from
-  AllocationSize, alternate data streams are not counted, directories
-  have no self-size, and junctions are refused rather than descended --
-  see the README's Platform support section.
+  AllocationSize, alternate data streams are not counted, and junctions
+  are refused rather than descended. A directory counts its NTFS index
+  bytes like a Linux one counts st_blocks, read from the directory's own
+  handle because a listing reports 0 for its subdirectories; a directory
+  small enough to keep its index inside the MFT record genuinely occupies
+  nothing, and so does one camembert never opens (a junction, a mount
+  point, an unreadable directory). See the README's Platform support
+  section.
 
 Look & feel (interactive mode):
   Colors and glyphs adapt to the terminal: truecolor -> 256 -> 16 -> mono

@@ -6,6 +6,8 @@
 //! sections (D2); each integrated section becomes one child run.
 
 use crate::errno::ScanErrno;
+#[cfg(windows)]
+use crate::size::Size;
 use crate::tree::{ExcludedReason, Kind};
 
 /// Section flush threshold (entries). One run per flushed section.
@@ -83,4 +85,27 @@ pub(crate) struct Batch {
     /// The directory itself could not be opened/read. Terminal:
     /// `is_last_section` is true and `entries` is empty.
     pub dir_error: Option<ScanErrno>,
+    /// **Windows only**: this directory's *own* size, read from the handle
+    /// the worker opened to enumerate it, correcting the zero its parent's
+    /// listing reported for it.
+    ///
+    /// A Windows directory listing reports `AllocationSize = EndOfFile = 0`
+    /// for every subdirectory entry, so the node the parent created for this
+    /// directory carries 0 where NTFS actually charges it a real index
+    /// allocation (48 INDX blocks — 192 KiB — for 400 long-named entries).
+    /// `GetFileInformationByHandleEx(FileStandardInfo)` on the open handle
+    /// returns the real figures, which is why the scan root, opened by
+    /// handle in `super::windows::open_root`, was the only directory whose
+    /// self-size was right. The correction is carried per *directory*, not
+    /// per section: exactly one batch per job carries `Some`, and the owner
+    /// applies it as a delta against whatever the node already holds, so it
+    /// is idempotent and order-independent. `None` everywhere else,
+    /// including on error batches (a directory that could not be opened
+    /// keeps its 0).
+    ///
+    /// Linux has no such field and no such problem — `statx` gives a
+    /// directory its real `st_size`/`st_blocks` in the same call that gives
+    /// it everything else.
+    #[cfg(windows)]
+    pub dir_own_size: Option<Size>,
 }

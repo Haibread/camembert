@@ -197,6 +197,72 @@ fn non_utf8_name_is_preserved_by_a_scan() {
     assert!(node.is_some(), "non-UTF-8 name must be preserved");
 }
 
+/// A directory's size must not depend on whether it is the scan root.
+///
+/// Portable, and it means something on both platforms — but it was written
+/// for Windows, where it failed. A directory listing there reports
+/// `AllocationSize = EndOfFile = 0` for every subdirectory entry, so a
+/// directory scanned as a *child* contributed nothing while the same
+/// directory scanned as a *root* — opened by handle, and asked with
+/// `FileStandardInfo` — reported its real index allocation. On the fixture
+/// below that was 0 B against ~192 KiB, i.e. `camembert sub` and
+/// `camembert parent` disagreed about `sub` by two orders of magnitude, and
+/// counting directory inodes is precisely what the README claims separates
+/// camembert from `du -sb`.
+///
+/// The names are long and there are many of them on purpose: NTFS keeps a
+/// small directory index resident inside the MFT record and allocates INDX
+/// blocks only once it outgrows that, so a handful of short names would make
+/// both answers 0 and the test would pass while measuring nothing. 400
+/// entries of ~38 characters allocate 48 blocks of 4 KiB — verified
+/// independently by reading the directory's own `:$I30:$INDEX_ALLOCATION`
+/// stream, which is a different object reached through a different call.
+#[test]
+fn directory_size_does_not_depend_on_being_the_scan_root() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sub = tmp.path().join("sub");
+    fs::create_dir(&sub).unwrap();
+    for i in 0..400 {
+        fs::write(
+            sub.join(format!("entry-with-a-fairly-long-name-{i:04}.txt")),
+            b"x",
+        )
+        .unwrap();
+    }
+
+    let as_root = Scanner::new(ScanOptions::default()).scan(&sub).unwrap();
+    let root_own = as_root.node(as_root.dir(as_root.root()).node).size();
+
+    let as_child = Scanner::new(ScanOptions::default())
+        .scan(tmp.path())
+        .unwrap();
+    let sub_node = child_by_name(&as_child, as_child.root(), b"sub").expect("sub is a child");
+    let child_own = as_child.node(sub_node).size();
+
+    assert_eq!(
+        child_own, root_own,
+        "the same directory reports different sizes as a child and as a root"
+    );
+    assert_ne!(
+        root_own.real, 0,
+        "the fixture is meant to force a non-resident directory index; a zero here \
+         means the test can no longer tell the two answers apart"
+    );
+
+    // And the subtree the parent attributes to it is the subtree it claims
+    // for itself — the same property one level up, where the correction has
+    // to have reached every ancestor's aggregate and not just the node.
+    let sub_dir = as_child.tree().dir_of(sub_node).expect("sub was scanned");
+    assert_eq!(
+        (as_child.dir(sub_dir).ta, as_child.dir(sub_dir).td),
+        (
+            as_root.dir(as_root.root()).ta,
+            as_root.dir(as_root.root()).td
+        ),
+        "subtree aggregates disagree between the two scans"
+    );
+}
+
 /// A symlink is stored as its own node — `Kind::Symlink`, never descended
 /// into as a directory. Skipped where the platform cannot create a symlink
 /// at all (Windows without Developer Mode or an elevated process).

@@ -13,7 +13,8 @@
 //! - **One listing call replaces `getdents64` + n × `statx`.**
 //!   `GetFileInformationByHandleEx(FileIdExtdDirectoryInfo)` returns name,
 //!   both sizes, attributes, reparse tag and a 128-bit file id per entry,
-//!   for zero per-entry syscalls. The rejected alternative
+//!   for zero per-entry syscalls (everything except the directory's *own*
+//!   size — see below). The rejected alternative
 //!   (`CreateFileW` + `GetFileInformationByHandle` + `CloseHandle` per
 //!   entry) is 20-200× more expensive per published measurements.
 //! - **The link count is not asked for at all**, by default. It is the one
@@ -32,6 +33,15 @@
 //!   users who want the true count. The whole measurement is
 //!   `docs/design/windows-nlink-dossier.md`. Per-directory shape by
 //!   default: 1 open, ⌈n/~1000⌉ listing calls, **0** per-entry calls.
+//! - **A directory's own size comes from its own handle**, not from the
+//!   listing that discovered it: a Windows listing reports
+//!   `AllocationSize = 0` for every subdirectory entry, while NTFS really
+//!   does charge a directory for its index. One
+//!   `GetFileInformationByHandleEx(FileStandardInfo)` per directory
+//!   (~1.13 µs, on a handle the job holds anyway) buys back the figure, and
+//!   [`crate::scan::message::Batch::dir_own_size`] carries it to the owner.
+//!   Per-directory, not per-entry — the distinction the nlink hole was
+//!   about.
 //! - **Paths, not descriptors.** There is no `openat`, so a child is opened
 //!   by its full `\\?\` path. That loses the Linux backend's immunity to
 //!   hostile symlink swaps mid-walk; the compensating guard is that no
@@ -71,7 +81,7 @@ use crate::errno::from_win32;
 use crate::tree::{ExcludedReason, Kind};
 use crate::winlink::{LinkCount, links_at};
 
-use super::{WidePath, entry_size, filetime_to_unix, open_dir};
+use super::{WidePath, dir_own_size, entry_size, filetime_to_unix, open_dir};
 use crate::scan::message::{Batch, BatchEntry, SECTION_CAP, SectionSums};
 
 /// Directory-listing buffer, in bytes. 64 KiB holds ~1000 entries of
@@ -265,6 +275,11 @@ struct Section {
     entries: Vec<BatchEntry>,
     sums: SectionSums,
     child_dirs: u32,
+    /// The enumerated directory's own size (see [`dir_own_size`]), pending
+    /// delivery. It belongs to the *directory*, not to a section, so
+    /// [`Section::take`] moves it out: the first batch this job sends
+    /// carries it and every later one carries `None`.
+    dir_own_size: Option<crate::size::Size>,
 }
 
 impl Section {
@@ -276,6 +291,7 @@ impl Section {
             is_last_section,
             child_dirs: std::mem::take(&mut self.child_dirs),
             dir_error: None,
+            dir_own_size: self.dir_own_size.take(),
         }
     }
 }
@@ -290,8 +306,11 @@ fn process_job(
     buf: &mut [u64],
 ) -> bool {
     let token = job.token;
-    let (handle, path) = match job.dir {
-        JobDir::Opened(handle, path) => (handle, path),
+    let (handle, path, own_size) = match job.dir {
+        // The root, already opened *and* already sized by `open_root`'s own
+        // `FileStandardInfo` query — asking again would only re-derive what
+        // the node holds.
+        JobDir::Opened(handle, path) => (handle, path, None),
         JobDir::At(parent, name) => {
             let path = Arc::new(parent.join(&name));
             // `FILE_FLAG_OPEN_REPARSE_POINT` below the root is the
@@ -299,7 +318,22 @@ fn process_job(
             // turned into a symlink between the listing and this open must
             // fail to open as a directory rather than redirect the walk.
             match open_dir(&path, FILE_FLAG_OPEN_REPARSE_POINT) {
-                Ok(handle) => (handle, path),
+                Ok(handle) => {
+                    // The parent's listing said this directory occupies
+                    // nothing, which is what a Windows listing always says
+                    // about a subdirectory; the handle knows better. A
+                    // directory that never gets opened — one that failed
+                    // below, and equally a junction, mount point or unknown
+                    // reparse tag, which `classify` never descends into —
+                    // keeps the listing's zero, because there is no handle
+                    // to ask and inventing a figure would be worse.
+                    let own = dir_own_size(&handle)
+                        .inspect_err(|code| {
+                            debug!(path = %path, code, "directory self-size query failed");
+                        })
+                        .ok();
+                    (handle, path, own)
+                }
                 Err(code) => {
                     debug!(path = %path, code, "directory open failed");
                     return send_batch(tx, shared, error_batch(token, code));
@@ -315,7 +349,10 @@ fn process_job(
         shared,
     };
 
-    let mut section = Section::default();
+    let mut section = Section {
+        dir_own_size: own_size,
+        ..Section::default()
+    };
     if !enumerate(&ctx, &mut section, buf, tx) {
         return false;
     }
@@ -689,6 +726,9 @@ fn error_batch(token: u64, code: u32) -> Batch {
         // Win32 code → canonical reason at the platform boundary, through
         // the table that knows `ERROR_ACCESS_DENIED` is 5 and 5 is not EIO.
         dir_error: Some(from_win32(code)),
+        // Never opened, so never sized: an unreadable directory keeps the 0
+        // its parent's listing reported, exactly as before.
+        dir_own_size: None,
     }
 }
 

@@ -302,6 +302,64 @@ impl Owner {
         self.holding.entry(batch.dir_token).or_default().push(batch);
     }
 
+    /// Windows only: apply a directory's real self-size, the figure only its
+    /// own handle knows ([`Batch::dir_own_size`]).
+    ///
+    /// The node was created by the *parent's* section carrying the listing's
+    /// zero, and [`Tree::add_dir`] seeded this directory's aggregates from
+    /// that same node — so one delta from `dir` upward repairs the
+    /// directory, its parent's total and every ancestor in a single walk,
+    /// with nothing double-counted. The node is rewritten in the same
+    /// breath, which is what preserves the invariant every other subsystem
+    /// reads off this tree: **a directory's aggregate equals the sum of its
+    /// own entry lines** (plus its own inode).
+    ///
+    /// Expressed as a delta against what the node already holds rather than
+    /// as an assignment, so it is idempotent and order-independent: a repeat
+    /// delivery, or the scan root whose node `windows::open_root` already
+    /// sized correctly, is a no-op. A figure *smaller* than the node's is
+    /// refused whole: a Windows listing only ever reports 0 for a
+    /// subdirectory so it cannot arise, and applying half of it would break
+    /// the very invariant this exists to keep.
+    #[cfg(windows)]
+    fn correct_dir_own_size(&mut self, dir: DirId, size: Size) {
+        let node = self.tree.dir(dir).node;
+        let held = self.tree.node(node).size();
+        if size.apparent < held.apparent || size.real < held.real {
+            debug!(
+                ?dir,
+                ?held,
+                ?size,
+                "by-handle directory size is below the listing's; keeping the listing's"
+            );
+            return;
+        }
+        let da = size.apparent - held.apparent;
+        let dd = size.real - held.real;
+        if da == 0 && dd == 0 {
+            return;
+        }
+        self.tree.set_node_size(node, size);
+        self.tree.apply_delta(dir, da, dd, 0, 0);
+        // Bytes, not entries: the directory's inode was counted when its
+        // parent's section created the node.
+        self.progress.add_disk_bytes(dd);
+        // The live flat view accounted this directory's inode at the
+        // listing's zero, while the frozen-arena fold will read the
+        // corrected node — so the accumulator has to learn the difference,
+        // or the two engines disagree (the D2 agreement invariant,
+        // `tests/flat_agreement.rs`).
+        if let Some(flat) = &mut self.flat {
+            flat.add_dir_bytes(
+                dir,
+                Size {
+                    apparent: da,
+                    real: dd,
+                },
+            );
+        }
+    }
+
     /// Integrate one section into the tree. Returns the tokens of child
     /// directories registered by this section.
     fn integrate(&mut self, dir: DirId, batch: Batch) -> Vec<u64> {
@@ -320,6 +378,15 @@ impl Owner {
             self.progress.add_errors(1);
             self.tree.release_token(dir);
             return new_tokens;
+        }
+
+        // Windows: this directory's real self-size, which only its own
+        // handle knows (see `Batch::dir_own_size`). Applied before the
+        // section's own aggregation so the two arrive at the ancestors in
+        // one wave rather than leaving a visible half-state.
+        #[cfg(windows)]
+        if let Some(size) = batch.dir_own_size {
+            self.correct_dir_own_size(dir, size);
         }
 
         let dir_node = self.tree.dir(dir).node;
@@ -598,6 +665,8 @@ mod tests {
             is_last_section: is_last,
             child_dirs,
             dir_error: None,
+            #[cfg(windows)]
+            dir_own_size: None,
         }
     }
 
@@ -690,6 +759,8 @@ mod tests {
             is_last_section: true,
             child_dirs: 0,
             dir_error: Some(crate::errno::ScanErrno::ACCESS),
+            #[cfg(windows)]
+            dir_own_size: None,
         });
         assert!(owner.root_complete());
         let root_meta = owner.tree().dir(owner.root());
