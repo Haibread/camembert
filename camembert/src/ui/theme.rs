@@ -340,6 +340,20 @@ impl Theme {
             ColorLevel::Ansi16 | ColorLevel::Mono => Style::new().add_modifier(Modifier::REVERSED),
         }
     }
+
+    /// Mouse-hovered row: a *transient preview*, and therefore deliberately
+    /// not [`Theme::selection_style`]. The cursor is the state a keypress
+    /// acts on; if the two looked alike, a user with the pointer resting
+    /// anywhere could no longer tell what `Enter` would open.
+    ///
+    /// `UNDERLINED` rather than another background: it is the one marker
+    /// that survives every rung of the ladder down to mono, where a
+    /// background is unavailable and `REVERSED` is already spoken for by
+    /// the cursor. The row's identity colour is what links it to the wheel
+    /// slice; this only has to say *which* row.
+    pub fn hover_style(&self) -> Style {
+        Style::new().add_modifier(Modifier::UNDERLINED)
+    }
 }
 
 /// Assign identity ranks to rows given their disk sizes (in snapshot
@@ -448,6 +462,34 @@ mod tests {
             Theme::new(ThemeName::TokyoNight, ColorLevel::Mono).color(ACCENT),
             Color::Reset
         );
+    }
+
+    /// The hovered row and the cursor row must never look the same, on any
+    /// theme at any rung. They mean different things — one is a pointer
+    /// preview, the other is what a keypress will act on — and a user whose
+    /// mouse happens to rest over the table must still be able to see which
+    /// row `Enter` would open.
+    #[test]
+    fn hover_never_looks_like_the_cursor() {
+        for name in [
+            ThemeName::TokyoNight,
+            ThemeName::Light,
+            ThemeName::HighContrast,
+        ] {
+            for level in [
+                ColorLevel::Truecolor,
+                ColorLevel::Ansi256,
+                ColorLevel::Ansi16,
+                ColorLevel::Mono,
+            ] {
+                let theme = Theme::new(name, level);
+                assert_ne!(
+                    theme.hover_style(),
+                    theme.selection_style(),
+                    "{name:?} at {level:?}"
+                );
+            }
+        }
     }
 
     #[test]

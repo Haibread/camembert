@@ -3227,7 +3227,17 @@ fn draw_table(
             Cell::from(format!("{:>8}", items)),
             Cell::from(name),
         ]);
-        TableRow::new(cells)
+        let table_row = TableRow::new(cells);
+        // The other half of the wheel↔table link: hovering a slice already
+        // drives the selection card, and marking its row here is what lets
+        // the eye travel from the disc to the listing without hunting for a
+        // colour match. Distinct from the cursor by construction — see
+        // `Theme::hover_style`.
+        if ui.hover() == Some(index) {
+            table_row.style(theme.hover_style())
+        } else {
+            table_row
+        }
     });
     let table = Table::new(rows, widths)
         .header(
