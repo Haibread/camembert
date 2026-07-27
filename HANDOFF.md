@@ -544,6 +544,25 @@ syscall, and the shape has changed completely. Re-measure.
   survive; deletion, the freeable panel, the confidence verdict and the
   FIEMAP floor line do not. A feature that cannot work is absent from the
   keymap and the help, never present-and-failing.
+- **Capability detection keys on the terminal, and an absent `TERM` means
+  the opposite thing on Windows** (2026-07-27). `TERM`/`COLORTERM` are a
+  Unix convention that no Windows console sets — not `cmd`, not
+  PowerShell, not Windows Terminal — so reading the silence as "advertises
+  nothing" put every Windows user on the bottom rung of *both* ladders:
+  `caps=Caps { color: Mono, glyphs: Ascii }`, i.e. no colour and no wheel
+  at all, on hardware that renders 24-bit fine. The floor there is
+  truecolor (the console has taken 24-bit SGR since Windows 10 1511 with
+  VT processing, which crossterm enables); an explicitly set `TERM` still
+  wins, keeping MSYS/Git Bash correct. Glyphs key on `WT_SESSION`:
+  Windows Terminal gets sextants (its Cascadia font covers
+  U+1FB00..U+1FB1F — *rendered on the box to check, not inferred*), any
+  other console stops at half-blocks because a legacy `conhost` may be on
+  a raster font and empty boxes are worse than a coarse wheel. The
+  platform is carried in `TermEnv` as data rather than read from `cfg!`
+  inside the detection, so both matrices are unit-testable from either OS.
+  **Beware when probing this by hand: the agent harness sets `NO_COLOR` in
+  its own shells**, which silently pins any measurement to `Mono` — clear
+  it explicitly or you will measure your instrument.
 
 ### Why `errno.rs` was the blocker, in case it comes up again
 
