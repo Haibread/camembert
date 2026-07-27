@@ -413,6 +413,46 @@ fn scan_default_mode_is_untouched_by_the_subcommand_split() {
     assert!(text.contains("Top 3 directories by real size:"), "{text}");
 }
 
+/// A tree with no hardlinks at all, scanned without `--links`.
+///
+/// The two platforms owe the user different answers and both are honest.
+/// Unix knows every file's `st_nlink` for free, so a zero means "nothing
+/// here is hardlinked" and printing that line would be noise. A Windows
+/// scan never asked, so the same zero means "none reached twice *in this
+/// scan*, and links outside it were not checked" — silence there would
+/// answer a question that was never put to the filesystem, and answer it
+/// wrongly: on `C:\Windows\System32\drivers` the honest figure is 0 while
+/// 728 of 756 files do have a WinSxS twin.
+#[test]
+fn hardlink_line_says_when_the_question_was_not_asked() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tree = dir.path().join("tree");
+    fs::create_dir_all(&tree).unwrap();
+    write_file(&tree.join("a.bin"), 1024);
+    write_file(&tree.join("b.bin"), 1024);
+
+    let output = run(&[tree.to_str().unwrap(), "--no-ui", "--top", "0"]);
+    assert_eq!(code(&output), 0, "{output:?}");
+    let text = stdout(&output);
+
+    #[cfg(windows)]
+    {
+        assert!(
+            text.contains("hardlinked inodes: 0"),
+            "the line survives the zero that makes it necessary: {text}"
+        );
+        assert!(
+            text.contains("--links"),
+            "and it names the recourse: {text}"
+        );
+    }
+    #[cfg(not(windows))]
+    assert!(
+        !text.contains("hardlinked inodes"),
+        "a known zero is not worth a line: {text}"
+    );
+}
+
 // ---- D5: flat-view top files in the --no-ui summary ----
 
 #[test]

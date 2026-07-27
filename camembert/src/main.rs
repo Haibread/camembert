@@ -276,8 +276,23 @@ fn hardlink_line_qualifier(outcome: &camembert_core::scan::ScanOutcome) -> &'sta
     if outcome.link_counts_known {
         "each counted once"
     } else {
-        "reached by more than one path in this scan; each counted once"
+        "reached by more than one path in this scan; each counted once. Links \
+         outside it were not checked — `--links`"
     }
+}
+
+/// Whether the summary prints the hardlink line at all.
+///
+/// A zero is normally not worth a line, and on a scan that holds real link
+/// counts it is genuinely informative: nothing here is hardlinked. Without
+/// them it is not. `C:\Windows\System32\drivers` reports 0 by default and
+/// 728 under `--links`, so suppressing the line would answer "are these
+/// files hardlinked?" with silence — which reads as *no* — on a tree where
+/// 96 % of the files have a WinSxS twin. The line is what carries the
+/// qualifier saying the question was not asked, so it has to survive the
+/// zero that makes it necessary.
+fn show_hardlink_line(outcome: &camembert_core::scan::ScanOutcome) -> bool {
+    outcome.hardlink_inodes > 0 || !outcome.link_counts_known
 }
 
 fn summary(args: &ScanArgs, scanner: &Scanner, flat_config: &flat::FlatConfig) -> ExitCode {
@@ -416,7 +431,7 @@ fn summary(args: &ScanArgs, scanner: &Scanner, flat_config: &flat::FlatConfig) -
             outcome.excluded_dirs,
             outcome.excluded_kernfs
         );
-        if outcome.hardlink_inodes > 0 {
+        if show_hardlink_line(&outcome) {
             print!(
                 "  hardlinked inodes: {} ({})",
                 outcome.hardlink_inodes,
