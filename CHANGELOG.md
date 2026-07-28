@@ -9,6 +9,8 @@ one is called out under **Breaking** with the migration to apply.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-28
+
 ### Breaking
 
 - **`--links`/`LINKS` no longer exists off Windows.** It was accepted
@@ -232,7 +234,8 @@ and musl builds for x86_64 and aarch64. See the
 [commit history](https://github.com/Haibread/camembert/commits/v0.1.0) for
 the full detail.
 
-[Unreleased]: https://github.com/Haibread/camembert/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Haibread/camembert/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Haibread/camembert/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Haibread/camembert/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Haibread/camembert/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Haibread/camembert/releases/tag/v0.1.0

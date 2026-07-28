@@ -11,7 +11,7 @@ ours. The AUR is what makes `yay -S camembert` work today.
 
 ## Requirements this package makes of the source tree
 
-- **`camembert >= 0.3.0`** — `package()` installs man pages produced by the
+- **`camembert >= 0.4.0`** — `package()` installs man pages produced by the
   `camembert-mangen` helper binary, which does not exist in v0.2.0, and shell
   completions from `camembert-completions`, which landed later still.
 - **`CAMEMBERT_GIT_SHA`** — `build.rs` uses a pre-set value over its own git
@@ -30,7 +30,7 @@ ours. The AUR is what makes `yay -S camembert` work today.
 cd packaging/aur
 # 1. bump pkgver to the new tag (without the leading "v")
 # 2. set _commit to the commit that tag points at:
-git rev-list -n 1 --abbrev-commit v0.3.0
+git rev-list -n 1 --abbrev-commit v0.4.0
 # 3. refresh the checksum from the published tarball:
 updpkgsums
 # 4. regenerate the metadata AUR reads:

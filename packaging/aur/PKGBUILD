@@ -1,6 +1,6 @@
 # Maintainer: Haibread <haibread@users.noreply.github.com>
 
-# Requires camembert >= 0.3.0: the man-page and shell-completion generators
+# Requires camembert >= 0.4.0: the man-page and shell-completion generators
 # (the `camembert-mangen` and `camembert-completions` helper binaries) landed
 # after v0.2.0, and package() installs their output.
 #
@@ -14,7 +14,7 @@
 # See README.md in this directory.
 
 pkgname=camembert
-pkgver=0.3.0
+pkgver=0.4.0
 pkgrel=1
 _commit=0000000
 pkgdesc='Disk usage analyzer that answers the real questions: what grew, what is freeable, what is cold'
