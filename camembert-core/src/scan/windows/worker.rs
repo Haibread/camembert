@@ -574,10 +574,23 @@ fn is_sentinel_id(id: [u8; 16]) -> bool {
 /// would give every sibling the same inode and the hardlink pass would
 /// dedup an entire directory away. Hence: fold, never truncate.
 ///
-/// At 10 M hardlinked inodes the fold collides with probability ~2.7e-6,
-/// and its failure mode is truncation's — two inodes fused — 2^64 times
-/// rarer. `folded` records that it happened so the fact can be reported
-/// rather than passed off as NTFS-grade precision.
+/// **The exposed population is every plain file, not the hardlinked ones.**
+/// It used to be the latter, when `nlink > 1` gated entry into the
+/// registry; the default now admits every non-reparse file with a
+/// non-sentinel id ([`REGISTRY_ADMIT`]), so the birthday problem is drawn
+/// over the whole tree. At 10 M *files* the fold collides with probability
+/// ~2.7e-6 — the same figure the gated version quoted for 10 M hardlinked
+/// inodes, now reached by a far more ordinary tree.
+///
+/// The consequence also changed. A collision between two hardlinks of one
+/// inode was a wrongly-grouped link; a collision between two **unrelated**
+/// files flags the second `HARDLINK_EXTRA`, so its bytes leave every
+/// aggregate — a silent undercount, not a mislabel. Only ReFS-shaped
+/// volumes fold at all (NTFS keeps the high half zero and passes through
+/// exactly), and `--links` restores the `nlink > 1` gate and with it the
+/// old, much smaller population. `folded` records that folding happened so
+/// the fact can be reported rather than passed off as NTFS-grade
+/// precision; on a ReFS volume it deserves to be louder than a log line.
 fn fold_file_id(id: [u8; 16], folded: &AtomicBool) -> u64 {
     let lo = u64::from_le_bytes(id[0..8].try_into().expect("8 bytes"));
     let hi = u64::from_le_bytes(id[8..16].try_into().expect("8 bytes"));
@@ -975,6 +988,42 @@ mod tests {
         assert_eq!(
             error_batch(1, 33).dir_error,
             Some(ScanErrno::SHARING_VIOLATION)
+        );
+    }
+
+    /// The latch is scan-wide, so what flips it matters: a name that is
+    /// merely absent must cost that entry its link count and nothing more.
+    /// Were it to latch, every later file in the scan would fall back to
+    /// `nlink = 1` — the value that keeps an entry *out* of the hardlink
+    /// registry — so one racing deletion would silently stop deduplicating
+    /// the rest of the tree, and (since `scan.rs` now narrows
+    /// `link_counts_known` from this same flag) turn a `--links` scan into
+    /// one that reports its counts as unknown.
+    ///
+    /// Real syscalls against a real directory: the point is what NTFS
+    /// actually returns, not what the status table says it would.
+    #[test]
+    fn a_missing_file_costs_only_itself_its_link_count() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("present.txt"), b"x").expect("write");
+        let dir_path = super::super::WidePath::from_path(tmp.path());
+        let Ok(dir) = super::super::open_dir(&dir_path, 0) else {
+            eprintln!("skipping: could not open the temp directory");
+            return;
+        };
+
+        let supported = AtomicBool::new(true);
+        // A real file first: proves the call works here at all, so a later
+        // `1` is evidence about the missing name rather than about the box.
+        let present = query_nlink(&dir, &wide("present.txt"), &supported);
+        assert_eq!(present, 1, "a lone file has exactly one link");
+        assert!(supported.load(Ordering::Relaxed));
+
+        let absent = query_nlink(&dir, &wide("no-such-file.txt"), &supported);
+        assert_eq!(absent, 1, "an absent name falls back, honestly");
+        assert!(
+            supported.load(Ordering::Relaxed),
+            "a per-file failure must not disable the lookup for the whole scan"
         );
     }
 }

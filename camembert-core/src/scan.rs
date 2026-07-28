@@ -508,6 +508,17 @@ impl Scanner {
         });
         let cancelled = result?;
 
+        // `--links` asked for link counts; this is where we find out
+        // whether the filesystem kept answering. The lookup latches itself
+        // off for the rest of a scan on a "not implemented here" status,
+        // and every file after that falls back to `nlink = 1` — the value
+        // that keeps an entry out of the hardlink registry. Claiming the
+        // counts were known would then fabricate an `l` in the dump and
+        // word the summary as "links on the volume" for a scan that gave
+        // up. Narrowing to the honest meaning costs one atomic read.
+        #[cfg(windows)]
+        let link_counts_known = link_counts_known && backend::link_counts_obtained(&shared);
+
         let elapsed = start.elapsed();
         let excluded_dirs = owner.excluded_dirs();
         let excluded_kernfs = owner.excluded_kernfs();

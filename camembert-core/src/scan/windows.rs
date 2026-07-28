@@ -392,6 +392,29 @@ pub(crate) fn run(worker_id: usize, local: WorkerQueue<Job>, shared: &Shared, tx
     worker::run(worker_id, local, shared, tx);
 }
 
+/// Whether the per-file link-count lookup survived the whole scan.
+///
+/// `--links` asks for it; this reports whether the filesystem actually
+/// answered. `query_nlink` latches
+/// [`worker::WorkerShared::nt_stat_supported`] off for the rest of the scan
+/// the first time a status says "this build or filesystem does not
+/// implement `FileStatInformation`" — an SMB share, a filesystem driver
+/// without it — and every file after that silently falls back to `nlink =
+/// 1`, which is exactly the value that keeps an entry *out* of the hardlink
+/// registry.
+///
+/// So a latched-off scan deduplicates nothing from that point on, and if it
+/// still claimed its link counts were known it would put a fabricated
+/// `l: 1` on every entry of a dump and word the summary as "links on the
+/// volume". Read after the workers join, so no ordering beyond `Relaxed` is
+/// needed. Meaningless (and always `true`) when `--links` is off, since
+/// nothing consulted the flag.
+pub(crate) fn link_counts_obtained(shared: &Shared) -> bool {
+    shared
+        .nt_stat_supported
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Whether the filesystem under `path` compresses transparently.
 ///
 /// Always `false` on Windows, and that is the honest answer rather than a
