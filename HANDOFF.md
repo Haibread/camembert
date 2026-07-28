@@ -629,6 +629,52 @@ through std's own WTF-8 encoder. Linux is untouched: its arm of
 (`not(any(unix, windows))`) preserves the old behaviour for any other
 platform.
 
+### Landing 5 — the Recycle Bin meter, 2026-07-28
+
+Slice 1 of the delete dossier's recommendation
+([windows-delete-dossier.md](docs/design/windows-delete-dossier.md) §4.3,
+§7), and the first of the two zero-destruction surfaces it says must exist
+before any executor. `camembert-core/src/recycle.rs` (`cfg(windows)`,
+read-only, no write path) asks `SHQueryRecycleBinW` about the volume
+holding the scan root — resolved with `GetVolumePathNameW`, the same volume
+`GetDiskFreeSpaceExW` measured for the gauge, so the two figures describe
+one disk. On this box: **6 264 307 348 bytes across 66 items**, matching
+the dossier's probe exactly.
+
+That gap is the Windows twin of the `/proc` sweep's: `C:\$Recycle.Bin` is
+hidden, per-SID and ACL'd, so no directory tree shows it, while the
+free-space figure counts every byte as used.
+
+- **Wording is the design.** The gauge grows `· 5.8 GiB in the Recycle Bin`
+  and one thresholded toast says `Recycle Bin: 5.8 GiB in 66 items — not
+  free until you empty it`. The word *freeable* is banned, and a test
+  enforces the ban: on Linux it means "a `close(2)` away", and these bytes
+  come back only when the user empties the bin, which camembert never does
+  and never offers.
+- **Threshold reuses freeable D5 verbatim** — ≥ 100 MiB *and* ≥ 1 % of
+  capacity — restated in `camembert/src/ui/recycle_rt.rs` rather than
+  imported, because `freeable_panel` is `cfg(unix)` and never compiles
+  here. Suffix unthresholded, toast thresholded, exactly as on Linux.
+- **Off the UI thread**, because it is not free: measured **16.5–23.3 ms**
+  on a 66-item bin (`recycle::tests::bench_query_cost`, `#[ignore]`d), i.e.
+  half a frame already, and a bin with tens of thousands of items is not
+  bounded by that. One job thread, a one-shot channel, non-blocking
+  `try_recv` in the event loop at step 2.57 — the freeable sweep's shape.
+- **No CLI or env surface**, no key, no panel, no palette command. There is
+  one number and one sentence; `?`/keymap/palette are untouched.
+- **`\\?\` is stripped before the call.** The Windows backend carries the
+  extended prefix everywhere and shell entry points refuse it (dossier
+  §2.5e). Only a drive-letter root is rewritten; a UNC or volume-GUID path
+  keeps its prefix and the call refuses, which is the honest outcome since
+  those have no bin.
+- Pinned by a `TestBackend` render test asserting the suffix appears, that
+  it never says "freeable", and that an empty or unmeasured bin adds
+  **nothing** (verified to fail with the suffix suppressed). Plus the
+  wording/threshold unit tests and two live-call tests.
+
+Linux is untouched: the gauge's freeable arm is byte-identical and the new
+push sits behind `#[cfg(windows)]` after it.
+
 ### Decisions taken, not to be relitigated without a new element
 
 - **`windows-sys` is a T1 dependency** (2026-07-26). A `std`-only walker

@@ -68,6 +68,12 @@ mod nlink_rt;
 mod oracle;
 mod osc11;
 mod palette;
+// Windows' answer to the question the `/proc` sweep answers on Linux:
+// space the free-space figure already counts as used that no directory
+// tree shows. Read-only — camembert measures the Recycle Bin and never
+// empties it (`docs/design/windows-delete-dossier.md` §4.3).
+#[cfg(windows)]
+mod recycle_rt;
 // `o`: reveal the selected entry in the system file manager. Unlike the
 // reclaim subsystem this is cross-platform — Windows gets it too, and
 // needs it more, since Windows has no delete path at all (see the
@@ -622,6 +628,12 @@ fn event_loop(
     // oracle, applied to one row instead of a whole selection.
     #[cfg(windows)]
     let mut links = nlink_rt::LinkRuntime::new();
+    // The Windows Recycle-Bin meter's one-shot channel, filled at scan end
+    // and drained in step 2.7 — the same shape as the Linux freeable
+    // sweep's `Reclaim::sweep_rx`, kept as a plain local because Windows
+    // has no `Reclaim` fields to sit beside.
+    #[cfg(windows)]
+    let mut recycle_rx: Option<Receiver<camembert_core::recycle::BinStatus>> = None;
 
     loop {
         // 1. Input (drain everything pending; block at most one frame
@@ -638,7 +650,7 @@ fn event_loop(
         // A link-count query is in flight: the card owes the answer within a
         // frame or two of it landing, so the loop cannot go back to sleep.
         #[cfg(windows)]
-        if links.has_pending() {
+        if links.has_pending() || recycle_rx.is_some() {
             deadline = FRAME;
         }
         while event::poll(deadline)? {
@@ -723,6 +735,17 @@ fn event_loop(
             if !ctx.no_proc_sweep {
                 let root_dev = outcome.dir(outcome.root()).dev;
                 reclaim.sweep_rx = spawn_freeable_sweep(root_dev);
+            }
+            // Windows' counterpart, sequenced at the same moment and for
+            // the same reason: the Recycle Bin holds bytes the disk gauge
+            // already counts as used and no directory tree can show. Scoped
+            // to the scan root's own volume — the one
+            // `GetDiskFreeSpaceExW` measured for that gauge — so the two
+            // figures describe the same disk. `SHQueryRecycleBinW` is
+            // read-only; nothing here can empty anything.
+            #[cfg(windows)]
+            {
+                recycle_rx = recycle_rt::spawn(outcome.root_path().to_path_buf());
             }
             local_generation = ui.snapshot().generation;
             phase = Phase::Done(Arc::new(RwLock::new(outcome)));
@@ -834,6 +857,31 @@ fn event_loop(
             // current.
             if let Some(map) = reclaim.floor.poll() {
                 ui.set_floor(Arc::new(map), Instant::now());
+            }
+        }
+
+        // 2.57. Recycle-Bin meter landed? (Windows only — the same
+        // non-blocking `try_recv` idiom as the freeable sweep above, and
+        // the same one-shot lifetime: the channel is dropped the moment it
+        // answers, so this costs nothing for the rest of the session.)
+        // The toast is rationed by freeable D5's rule; the gauge suffix is
+        // not, exactly as on Linux.
+        #[cfg(windows)]
+        if let Some(rx) = &recycle_rx {
+            match rx.try_recv() {
+                Ok(status) => {
+                    let capacity = ctx.disk.map_or(0, |disk| disk.capacity);
+                    if recycle_rt::should_toast(status.bytes, capacity) {
+                        toasts.push(recycle_rt::toast_text(&status));
+                    }
+                    ui.set_recycle_bin(status);
+                    recycle_rx = None;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    debug!("recycle-bin query ended without a result");
+                    recycle_rx = None;
+                }
             }
         }
 
@@ -3131,6 +3179,14 @@ fn draw_disk_gauge(
     if freeable_bytes > 0 {
         text.push_str(&format!(" · {} freeable", HumanSize(freeable_bytes)));
     }
+    // The Windows counterpart, and deliberately *not* the same word: these
+    // bytes are recoverable by the user, not released by anything camembert
+    // can do. `recycle_rt::gauge_suffix` owns the wording and the reasoning
+    // behind it. Not clickable — there is no panel to click through to.
+    #[cfg(windows)]
+    if let Some(suffix) = ui.recycle_bin().and_then(recycle_rt::gauge_suffix) {
+        text.push_str(&suffix);
+    }
     text.push(' ');
     let label = " disk ";
     let bar_width = area
@@ -5043,6 +5099,75 @@ mod tests {
             compressed.contains("scan logical exceeds on-disk (compressed mount)"),
             "compressed row: {compressed}"
         );
+    }
+
+    /// Windows: the Recycle-Bin meter reaches the gauge, in its own words.
+    ///
+    /// The gap it closes is the whole point — the bin's bytes are inside
+    /// the gauge's `used` and inside no directory tree — so the assertion
+    /// is that the figure appears *and* that it is never dressed up as
+    /// space camembert can release. An empty bin must add nothing at all,
+    /// or every Windows session grows a permanent zero.
+    #[cfg(windows)]
+    #[test]
+    fn the_disk_gauge_names_the_recycle_bin_without_calling_it_freeable() {
+        use camembert_core::recycle::BinStatus;
+
+        let render = |bin: Option<BinStatus>| -> String {
+            let mut render_ctx = ctx(GlyphLevel::Ascii, ColorLevel::Truecolor);
+            render_ctx.disk = Some(DiskSpace {
+                capacity: 1_000_000_000_000,
+                used: 400_000_000_000,
+                compressed: false,
+            });
+            let mut ui = UiState::new(sample_snapshot());
+            if let Some(bin) = bin {
+                ui.set_recycle_bin(bin);
+            }
+            let mut terminal = Terminal::new(TestBackend::new(140, 1)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw_disk_gauge(frame, frame.area(), &ui, None, &render_ctx);
+                })
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol().to_owned())
+                .collect::<String>()
+        };
+
+        // The figure measured on the dev box: 6 264 307 348 bytes across
+        // 66 items.
+        let full = render(Some(BinStatus {
+            volume: std::path::PathBuf::from(r"C:\"),
+            bytes: 6_264_307_348,
+            items: 66,
+        }));
+        assert!(
+            full.contains("5.8 GiB in the Recycle Bin"),
+            "gauge row: {full}"
+        );
+        assert!(
+            !full.to_lowercase().contains("freeable"),
+            "the bin is not freeable space: {full}"
+        );
+
+        for quiet in [
+            render(None),
+            render(Some(BinStatus {
+                volume: std::path::PathBuf::from(r"C:\"),
+                bytes: 0,
+                items: 0,
+            })),
+        ] {
+            assert!(
+                !quiet.contains("Recycle Bin"),
+                "nothing to say, so nothing said: {quiet}"
+            );
+        }
     }
 
     /// D6: the palette modal (query mode empty/typed/erroring, command

@@ -23,6 +23,11 @@ pub mod flat;
 pub mod freeable;
 pub mod ncdu;
 pub mod query;
+// `SHQueryRecycleBinW` is the Windows answer to the question `freeable`
+// answers on Linux — space already counted as used that no directory tree
+// shows. Read-only, and deliberately isolated the same way `freeable` is.
+#[cfg(windows)]
+pub mod recycle;
 pub mod scan;
 pub mod size;
 pub mod tree;

@@ -27,6 +27,9 @@ use camembert_core::view::{Row, ViewSnapshot};
 #[cfg(unix)]
 use super::freeable_panel::{FreeableGroup, OpenWarning};
 #[cfg(windows)]
+use camembert_core::recycle::BinStatus;
+
+#[cfg(windows)]
 use super::nlink_rt::LinkState;
 #[cfg(unix)]
 use super::oracle::OracleSlot;
@@ -474,6 +477,14 @@ pub struct UiState {
     /// from showing an unknown one.
     #[cfg(windows)]
     link_state: Option<LinkState>,
+    /// Windows only: what the scan root's volume holds in its Recycle Bin,
+    /// `None` until the off-thread query lands (`ui::recycle_rt`) and
+    /// forever if it never does — a volume with no bin, or one that
+    /// refused the call. The gauge suffix keys off it exactly as the Linux
+    /// gauge keys off `freeable`, and nothing else in the UI reads it: it
+    /// is a volume-level side artifact, never tree or snapshot data.
+    #[cfg(windows)]
+    recycle_bin: Option<BinStatus>,
 }
 
 impl UiState {
@@ -521,6 +532,8 @@ impl UiState {
             floor: None,
             #[cfg(windows)]
             link_state: None,
+            #[cfg(windows)]
+            recycle_bin: None,
         };
         state.ensure_sorted();
         state
@@ -1171,6 +1184,17 @@ impl UiState {
     /// The current row's link-count answer, if it is a row that gets one.
     pub fn link_state(&self) -> Option<LinkState> {
         self.link_state
+    }
+
+    /// Adopt the scan-end Recycle-Bin measurement (`ui::recycle_rt`, once
+    /// per session).
+    pub fn set_recycle_bin(&mut self, status: BinStatus) {
+        self.recycle_bin = Some(status);
+    }
+
+    /// What the scan root's volume holds in its Recycle Bin, once measured.
+    pub fn recycle_bin(&self) -> Option<&BinStatus> {
+        self.recycle_bin.as_ref()
     }
 }
 

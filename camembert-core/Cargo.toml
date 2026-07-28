@@ -47,6 +47,9 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_SystemServices",
+    # `SHQueryRecycleBinW` (recycle.rs) — the one shell entry point in the
+    # crate, and read-only.
+    "Win32_UI_Shell",
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",
 ] }

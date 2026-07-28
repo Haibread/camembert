@@ -179,7 +179,10 @@ footer never names them:
   now decode through a real WTF-8 decoder, exactly — see below.)
 - **[Freeable](#freeable-deleted-but-open-files)** — the `f` panel and the
   gauge's "· N freeable" suffix. Structural: it reads `/proc/[pid]/fd`, and
-  Windows has no equivalent.
+  Windows has no equivalent. The *question* it answers — which bytes does
+  the disk count as used that no directory tree shows? — does have one, and
+  Windows answers it with [the Recycle Bin
+  meter](#the-recycle-bin-meter-windows) below.
 - **[The reclaim oracle](#reclaim-oracle-freeable-phase-2)** and its
   ambient exclusive floor — no confidence verdict, no `excl ≥ …` card line,
   no bright in-bar segment. Both need `FS_IOC_FIEMAP`, a Linux-only ioctl.
@@ -189,6 +192,52 @@ therefore accepted but inert on Windows: there is nothing left to switch
 off. `--links`/`LINKS` runs the other way — it is accepted everywhere and
 inert *off* Windows, where link counts arrive inside `statx` for free (see
 [Hardlinks on Windows](#hardlinks-on-windows-and---links)).
+
+### The Recycle Bin meter (Windows)
+
+*Windows only. Nothing to enable, nothing to configure, and camembert never
+empties anything.*
+
+Delete a file in Explorer and the space does not come back. It goes to
+`C:\$Recycle.Bin`, which is hidden, per-SID and ACL'd, so no disk-usage
+tool's directory tree shows it — while `GetDiskFreeSpaceExW`, the call
+behind camembert's disk gauge, keeps counting every byte of it as used.
+That gap is the Windows twin of the question the
+[freeable](#freeable-deleted-but-open-files) sweep answers on Linux, and
+`SHQueryRecycleBinW` answers it read-only, unelevated, in one call.
+
+At the end of every scan camembert asks it, off the UI thread, about the
+volume holding the scan root — the same volume the gauge describes. What
+you get:
+
+- **A gauge suffix** whenever the bin is not empty: `· 5.8 GiB in the
+  Recycle Bin`, next to the capacity and used figures.
+- **One toast, once per session**, when the figure is worth interrupting
+  for: `Recycle Bin: 5.8 GiB in 66 items — not free until you empty it`.
+  The threshold is the same one the Linux freeable toast uses — at least
+  100 MiB **and** at least 1% of the volume's capacity — so a small disk is
+  not nagged about crumbs and a large array is not nagged about rounding
+  noise. The suffix has no threshold; only the interruption is rationed.
+
+**It is deliberately never called "freeable."** On Linux that word means
+"a `close(2)` away". Recycle Bin bytes come back only when *you* empty the
+bin — an action camembert does not perform and does not offer — so the
+wording says where the bytes are and what that costs, and never claims a
+saving the tool cannot deliver.
+
+Scope and limits, in the same spirit:
+
+- **One volume**, the scan root's. A session spanning several volumes
+  under-reports the machine's total, exactly as the Linux figure is scoped
+  to the root filesystem. Summing across volumes would put one disk's bytes
+  on another disk's gauge.
+- **A volume with no Recycle Bin** — a network share, a stick with the bin
+  disabled — is silent rather than reporting zero. The reverse is not
+  distinguishable from here: a bin that exists and is *empty* answers with
+  zeros too, so this is a size oracle and not an availability one.
+- **No key, no panel, no flag.** There is one number and one sentence about
+  it; a modal would be ceremony. `?`, the palette and the keymap are
+  unchanged.
 
 **Numbers differ in ways worth knowing before trusting one:**
 
