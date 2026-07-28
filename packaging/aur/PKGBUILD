@@ -1,7 +1,8 @@
 # Maintainer: Haibread <haibread@users.noreply.github.com>
 
-# Requires camembert >= 0.3.0: the man-page generator (the `camembert-mangen`
-# helper binary) landed after v0.2.0, and package() installs its output.
+# Requires camembert >= 0.3.0: the man-page and shell-completion generators
+# (the `camembert-mangen` and `camembert-completions` helper binaries) landed
+# after v0.2.0, and package() installs their output.
 #
 # Per release, in this order:
 #   1. bump pkgver
@@ -22,6 +23,14 @@ url='https://github.com/Haibread/camembert'
 license=('MIT OR Apache-2.0')
 depends=('gcc-libs')
 makedepends=('cargo')
+# makepkg enables LTO by default, which makes `zstd-sys` compile its bundled
+# C library into GCC LTO bitcode; rustc's linker cannot resolve symbols out
+# of that, and the build dies on undefined `ZSTD_*` at link time. Only the C
+# dependency is affected — Rust's own LTO is a cargo profile setting, which
+# this workspace does not enable either way — so the cost is nil. The
+# alternative, linking the system zstd, would make dump compatibility depend
+# on whichever zstd Arch ships that week.
+options=('!lto')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
 
@@ -40,6 +49,8 @@ build() {
 	export CAMEMBERT_GIT_SHA="$_commit"
 	cargo build --frozen --release --package camembert
 	cargo run --frozen --release --package camembert --bin camembert-mangen -- man
+	cargo run --frozen --release --package camembert \
+		--bin camembert-completions -- completions
 }
 
 check() {
@@ -60,6 +71,15 @@ package() {
 	for page in man/*.1; do
 		install -Dm0644 "$page" "$pkgdir/usr/share/man/man1/${page##*/}"
 	done
+
+	# Each shell looks in its own directory, under its own naming rule.
+	# Arch has no `vendor-completions`: zsh site functions go here.
+	install -Dm0644 completions/"$pkgname".bash \
+		"$pkgdir/usr/share/bash-completion/completions/$pkgname"
+	install -Dm0644 completions/_"$pkgname" \
+		"$pkgdir/usr/share/zsh/site-functions/_$pkgname"
+	install -Dm0644 completions/"$pkgname".fish \
+		"$pkgdir/usr/share/fish/vendor_completions.d/$pkgname.fish"
 
 	install -Dm0644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
 	install -Dm0644 CHANGELOG.md "$pkgdir/usr/share/doc/$pkgname/CHANGELOG.md"

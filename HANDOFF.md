@@ -216,8 +216,18 @@ pitch.
   distro-archive-policy packages, and there is no APT/DNF repository
   (that is a separate decision, not an oversight). Verified 2026-07-28
   by installing both in Debian 12 and Fedora 42 containers: real scan,
-  correct file layout, clean removal. `--version` embeds the build
-  commit (build.rs, `-dirty` aware). Release notes come from
+  correct file layout, clean removal. Arch is served by the pre-existing
+  [`packaging/aur/PKGBUILD`](packaging/aur/PKGBUILD) (source build against
+  the system glibc), which gained the completions and, more importantly,
+  `options=('!lto')`: makepkg enables LTO by default, which makes
+  `zstd-sys` emit GCC LTO bitcode that rustc's linker cannot resolve, so
+  the package did not build at all on a stock Arch box (undefined
+  `ZSTD_*` at link time) — do not drop that line without re-testing.
+  Verified 2026-07-28 with `makepkg` end to end: builds, packages, and
+  the installed binary runs a real scan. Its `check()` runs the workspace
+  suite, so it currently fails on btrfs for the two directory-index test
+  failures below; `makepkg --nocheck` until those are fixed.
+  `--version` embeds the build commit (build.rs, `-dirty` aware). Release notes come from
   [CHANGELOG.md](CHANGELOG.md) — the workflow extracts the tag's
   section and passes it as `--notes-file`, failing the job if there is
   none, then appends GitHub's generated notes (label categories in
@@ -251,6 +261,18 @@ pitch.
 
 ## Known limitations (documented in code where they live)
 
+- **Two directory-index tests are red on btrfs (found 2026-07-28, not
+  yet fixed).** `flat_agreement::accumulator_and_fold_agree_when_a_
+  directory_index_is_not_resident` and
+  `scan::directory_size_does_not_depend_on_being_the_scan_root` both
+  fail on the dev box and pass in CI. Both arrived with landing 3
+  ("directories get their index bytes back") and both assume a
+  filesystem where a directory has non-zero allocated index bytes;
+  btrfs reports none, so the first fixture can no longer tell its
+  corrected answer from the listing's zero. CI runs on ext4, which is
+  why `quality` is green. This is a fixture assumption, not a scan
+  bug — but it makes `cargo test --workspace` (and therefore
+  `makepkg` without `--nocheck`) fail on any btrfs machine.
 - **Cross-filesystem validation (2026-07-25, Scaleway DEV1-S, kernel
   6.8, ext4 / XFS / btrfs / btrfs+zstd / f2fs / exfat / tmpfs / ZFS on
   one host).** Totals are byte-exact against an independent `lstat` walk

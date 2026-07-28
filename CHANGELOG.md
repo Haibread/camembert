@@ -36,6 +36,11 @@ one is called out under **Breaking** with the migration to apply.
   pattern `camembert-mangen` already used for the man pages). Packagers
   and from-source installers get them with
   `cargo run --release --package camembert --bin camembert-completions -- <OUT_DIR>`.
+- The Arch `PKGBUILD` ([`packaging/aur/`](packaging/aur/)) installs the
+  shell completions too, and now carries `options=('!lto')`: makepkg's
+  default LTO makes `zstd-sys` emit GCC LTO bitcode that rustc's linker
+  cannot resolve, so the package did not build at all on a stock Arch
+  configuration.
 - `scripts/build-packages.sh`, which builds the release binary,
   regenerates the man pages and completions, and produces both packages.
   It is what the release workflow runs, so a package can be reproduced

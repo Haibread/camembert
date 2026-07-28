@@ -12,13 +12,20 @@ ours. The AUR is what makes `yay -S camembert` work today.
 ## Requirements this package makes of the source tree
 
 - **`camembert >= 0.3.0`** — `package()` installs man pages produced by the
-  `camembert-mangen` helper binary, which does not exist in v0.2.0.
+  `camembert-mangen` helper binary, which does not exist in v0.2.0, and shell
+  completions from `camembert-completions`, which landed later still.
 - **`CAMEMBERT_GIT_SHA`** — `build.rs` uses a pre-set value over its own git
   lookup, so `--version` reports the packaged commit instead of `unknown`
   when building from a `.git`-less tarball.
 - **A `check()`-able test suite** — extent-dependent tests guard-skip on
   filesystems without extents, and the statx engine falls back to synchronous
   `statx` when io_uring is unavailable, so the suite passes in a clean chroot.
+  **Currently untrue on btrfs**: two directory-index tests added with the
+  Windows landings assume a filesystem where a directory has non-zero
+  allocated index bytes, which btrfs does not report, so `makepkg` fails in
+  `check()` there (see HANDOFF.md's known limitations). Build with
+  `--nocheck` on a btrfs machine until they are fixed — and do not publish a
+  release whose `check()` was skipped without running the suite elsewhere.
 
 ## Per-release update
 

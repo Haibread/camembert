@@ -134,6 +134,24 @@ build against its own libc). They exist so that `dpkg -i` and `dnf install`
 work today, not to enter Debian or Fedora proper. There is no APT/DNF
 repository yet, so upgrades mean downloading the next release.
 
+### Arch Linux
+
+[`packaging/aur/PKGBUILD`](packaging/aur/PKGBUILD) builds from source and
+links against the system glibc, the way Arch expects — no static musl here,
+since a rolling distro has no old-libc problem to work around:
+
+```bash
+git clone https://github.com/Haibread/camembert
+cd camembert/packaging/aur
+makepkg -si
+```
+
+It installs the same set as the `.deb`/`.rpm` (binary, man pages,
+bash/zsh/fish completions). It builds the *tagged release* tarball rather
+than the checkout it sits in, so it tracks releases, not `main`.
+[`packaging/aur/README.md`](packaging/aur/README.md) has the per-release
+runbook and the AUR publishing steps.
+
 ### From source
 
 Rust stable, edition 2024:
