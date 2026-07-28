@@ -11,6 +11,18 @@ one is called out under **Breaking** with the migration to apply.
 
 ### Breaking
 
+- **`--links`/`LINKS` no longer exists off Windows.** It was accepted
+  everywhere and did nothing off Windows — the value was only ever read
+  inside a `#[cfg(windows)]` branch, because `st_nlink` arrives inside
+  the `statx` result a Unix scan already asks for. It is now compiled
+  out there, so a Linux or macOS `camembert --links` fails with an
+  unknown-argument error instead of silently ignoring it. Migration:
+  drop the flag; nothing about the scan changes, since nothing about it
+  ever depended on the flag on those platforms. This matters more than
+  it did before because the man page and shell completions are generated
+  from the same `clap` definitions and are now installed by the
+  `.deb`/`.rpm`/`PKGBUILD` packages — a no-op flag documented in terms
+  of Windows would have shipped to every Linux user.
 - **`camembert-core` no longer exposes `rustix::io::Errno` in its error
   taxonomy**, replaced by `camembert_core::errno::ScanErrno` — a newtype
   over the canonical POSIX errno number in Linux/x86-64 numbering.

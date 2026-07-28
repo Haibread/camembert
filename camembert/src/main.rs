@@ -176,7 +176,13 @@ fn run_scan(cli: &Cli) -> ExitCode {
         threads: args.threads,
         cross_filesystems: !args.one_filesystem,
         statx_engine: args.statx_engine.into(),
+        // `ScanOptions::link_counts` stays a plain field of the library's
+        // cross-platform options struct — it is documented as ignored off
+        // Windows — but the CLI flag that feeds it exists only there.
+        #[cfg(windows)]
         link_counts: args.links,
+        #[cfg(not(windows))]
+        link_counts: false,
     });
 
     if interactive {

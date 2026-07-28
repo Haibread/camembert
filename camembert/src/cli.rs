@@ -124,12 +124,14 @@ pub(crate) struct ScanArgs {
     #[arg(long, env = "ONE_FILESYSTEM")]
     pub(crate) one_filesystem: bool,
 
-    /// Windows: look up every file's true link count — ~19x slower on a
-    /// file-dense tree, experimental (env: LINKS)
+    /// Look up every file's true link count — ~19x slower on a file-dense
+    /// tree, experimental (env: LINKS)
     ///
-    /// Accepted but inert off Windows, where `st_nlink` arrives inside the
-    /// `statx` result the scan already asks for: link counts there are
-    /// always exact and always free.
+    /// Windows-only, and compiled out elsewhere rather than accepted and
+    /// ignored: off Windows `st_nlink` arrives inside the `statx` result
+    /// the scan already asks for, so link counts are always exact and
+    /// always free, and a flag that could only ever be a no-op has no
+    /// business appearing in `--help`, the man page or the completions.
     ///
     /// On Windows the directory listing carries everything about an entry
     /// *except* its link count, and obtaining one costs a per-file
@@ -165,6 +167,7 @@ pub(crate) struct ScanArgs {
     /// Experimental: the surface may change as the lazy per-file lookup at
     /// the point of consumption lands, which is expected to make the
     /// whole-scan sweep unnecessary for most users.
+    #[cfg(windows)]
     #[arg(long, env = "LINKS")]
     pub(crate) links: bool,
 

@@ -262,8 +262,11 @@ is nothing left to switch off. `--no-proc-sweep`/`NO_PROC_SWEEP` **does**
 mean something there — it is the same request ("do not go looking at what
 other processes have open") answered by a different mechanism, and it
 switches off [the open-file advisory](#who-has-this-file-open-windows).
-`--links`/`LINKS` runs the other way — it is accepted everywhere and inert
-*off* Windows, where link counts arrive inside `statx` for free (see
+`--links`/`LINKS` runs the other way, and is the one flag this project
+compiles out in the *Linux* direction: off Windows, link counts arrive
+inside `statx` for free, so the flag could only ever be a no-op — it is
+absent from `--help`, from the man page and from the completions there,
+exactly as the Windows-absent features above are absent on Windows (see
 [Hardlinks on Windows](#hardlinks-on-windows-and---links)).
 
 ### The Recycle Bin meter (Windows)
