@@ -9,6 +9,23 @@ one is called out under **Breaking** with the migration to apply.
 
 ## [Unreleased]
 
+### Changed
+
+- **Release archive names drop the target triple's vendor field.**
+  `camembert-<version>-x86_64-linux-musl.tar.gz` instead of
+  `…-x86_64-unknown-linux-musl.tar.gz`, and
+  `…-x86_64-windows-msvc.zip` instead of `…-x86_64-pc-windows-msvc.zip`.
+  `unknown` is the one field of `<arch>-<vendor>-<os>-<abi>` that carries
+  no information, and it was the least readable thing in a release's
+  asset list. Architecture, OS and ABI all stay — dropping `musl` would
+  have hidden that these binaries are static, which is why they install
+  on any glibc. The `.deb` and `.rpm` names are unchanged: those follow
+  their own ecosystems' conventions, which is why the same CPU appears
+  as `amd64` there and `x86_64` here. Scripts pinned to the old asset
+  names need updating; the `cargo --target` triples are untouched, and
+  releases up to and including v0.4.0 keep the names they were
+  published with.
+
 ## [0.4.0] - 2026-07-28
 
 ### Breaking

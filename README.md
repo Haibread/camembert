@@ -172,20 +172,28 @@ Static musl binaries for `x86_64` and `aarch64` Linux are attached to every
 
 ```bash
 # pick one:
-TARGET=x86_64-unknown-linux-musl
-TARGET=aarch64-unknown-linux-musl
+ARCH=x86_64-linux-musl
+ARCH=aarch64-linux-musl
 
 VERSION=0.4.0 # match the release tag, without the leading "v"
-curl -LO "https://github.com/Haibread/camembert/releases/download/v${VERSION}/camembert-${VERSION}-${TARGET}.tar.gz"
-curl -LO "https://github.com/Haibread/camembert/releases/download/v${VERSION}/camembert-${VERSION}-${TARGET}.tar.gz.sha256"
+curl -LO "https://github.com/Haibread/camembert/releases/download/v${VERSION}/camembert-${VERSION}-${ARCH}.tar.gz"
+curl -LO "https://github.com/Haibread/camembert/releases/download/v${VERSION}/camembert-${VERSION}-${ARCH}.tar.gz.sha256"
 
 # verify, then unpack
-sha256sum -c "camembert-${VERSION}-${TARGET}.tar.gz.sha256"
-tar xzf "camembert-${VERSION}-${TARGET}.tar.gz"
+sha256sum -c "camembert-${VERSION}-${ARCH}.tar.gz.sha256"
+tar xzf "camembert-${VERSION}-${ARCH}.tar.gz"
 ```
 
 Each archive contains the `camembert` binary alongside `LICENSE-MIT`,
 `LICENSE-APACHE`, and `README.md`.
+
+Archive names drop the rustc triple's vendor field, which is literally
+`unknown` on these targets and says nothing: `x86_64-linux-musl`, not
+`x86_64-unknown-linux-musl`. To *build* one of these yourself, the
+corresponding `cargo --target` triple puts the vendor back —
+`x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`. Releases up
+to and including **v0.4.0 use the full triple** in their asset names; the
+shortened form starts with the release after it.
 
 Both binaries are fully static (no libc to match, no dynamic loader). The
 x86_64 one is additionally `static-pie`, so it gets ASLR; the aarch64 one
@@ -198,12 +206,13 @@ build from source if you need PIE on ARM64.
 
 ### Windows
 
-A `.zip` for `x86_64-pc-windows-msvc` is attached to every release, holding
-`camembert.exe` alongside the same licences and README:
+A `.zip` for 64-bit Windows (the `x86_64-pc-windows-msvc` target) is
+attached to every release, holding `camembert.exe` alongside the same
+licences and README:
 
 ```powershell
 $VERSION = "0.4.0" # match the release tag, without the leading "v"
-$NAME = "camembert-$VERSION-x86_64-pc-windows-msvc"
+$NAME = "camembert-$VERSION-x86_64-windows-msvc"
 Invoke-WebRequest -OutFile "$NAME.zip" `
   "https://github.com/Haibread/camembert/releases/download/v$VERSION/$NAME.zip"
 

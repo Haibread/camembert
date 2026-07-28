@@ -12,10 +12,19 @@ jobs:
   build:
     strategy:
       matrix:
+        # `target` is the rustc triple; `slug` is what the published archive
+        # is named. They differ by the triple's vendor field, which is
+        # literally `unknown` on these targets — the one field of
+        # `<arch>-<vendor>-<os>-<abi>` carrying no information, and the one
+        # thing in an asset list nobody can read. Architecture, OS and ABI
+        # all stay: dropping `musl` would hide that these are static
+        # binaries, which is the whole reason they install anywhere.
         include:
           - target: x86_64-unknown-linux-musl
+            slug: x86_64-linux-musl
             runner: ubuntu-24.04
           - target: aarch64-unknown-linux-musl
+            slug: aarch64-linux-musl
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
@@ -47,10 +56,11 @@ jobs:
       - name: package the release archive
         env:
           TARGET: ${{ matrix.target }}
+          SLUG: ${{ matrix.slug }}
           TAG: ${{ github.ref_name }}
         run: |
           version="${TAG#v}"
-          name="camembert-${version}-${TARGET}"
+          name="camembert-${version}-${SLUG}"
           mkdir "$name"
           cp target/"$TARGET"/release/camembert LICENSE-MIT LICENSE-APACHE README.md "$name"/
           tar czf "$name.tar.gz" "$name"
@@ -112,7 +122,9 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           $version = $env:TAG -replace '^v', ''
-          $name = "camembert-$version-x86_64-pc-windows-msvc"
+          # Same rule as the Linux legs' `slug`: the rustc triple's vendor
+          # field (`pc` here) is dropped, everything informative stays.
+          $name = "camembert-$version-x86_64-windows-msvc"
           New-Item -ItemType Directory -Path $name | Out-Null
           Copy-Item target/release/camembert.exe, LICENSE-MIT, LICENSE-APACHE, README.md $name
           Compress-Archive -Path $name -DestinationPath "$name.zip"
