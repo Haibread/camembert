@@ -165,7 +165,7 @@ cargo install --path camembert
 Note that `cargo install` places only the binary: man pages and completions
 come from the generators described under [Packaging](#packaging).
 
-### Prebuilt binaries
+### Prebuilt Linux binaries
 
 Static musl binaries for `x86_64` and `aarch64` Linux are attached to every
 [GitHub Release](https://github.com/Haibread/camembert/releases):
@@ -196,16 +196,37 @@ startup ([rust-lang/rust#95926](https://github.com/rust-lang/rust/issues/95926))
 A working binary without ASLR beats a hardened one that does not run;
 build from source if you need PIE on ARM64.
 
+### Windows
+
+A `.zip` for `x86_64-pc-windows-msvc` is attached to every release, holding
+`camembert.exe` alongside the same licences and README:
+
+```powershell
+$VERSION = "0.3.0" # match the release tag, without the leading "v"
+$NAME = "camembert-$VERSION-x86_64-pc-windows-msvc"
+Invoke-WebRequest -OutFile "$NAME.zip" `
+  "https://github.com/Haibread/camembert/releases/download/v$VERSION/$NAME.zip"
+
+# verify against the published sum, then unpack
+(Get-FileHash "$NAME.zip" -Algorithm SHA256).Hash.ToLower()
+Expand-Archive "$NAME.zip"
+```
+
+The published `.sha256` files use the `sha256sum` format for every
+architecture, Windows included, so one `sha256sum -c` verifies a whole
+release if you have the tool. See [Platform support](#platform-support) for
+what the Windows build does and does not do.
+
 `camembert --version` embeds the exact commit it was built from (e.g.
 `camembert 0.3.0 (abc1234)`), so you can always tell what you're running.
 
 ## Platform support
 
 Linux is the primary target and gets everything below. **Windows builds and
-runs a reduced interface**: `cargo install --path camembert` on
-`x86_64-pc-windows-msvc` (no prebuilt binary yet). It scans with a
-path-based walker, deduplicates hardlinks, and drives almost the whole
-interactive UI.
+runs a reduced interface**: a prebuilt `x86_64-pc-windows-msvc` `.zip` ships
+with every release (see [Windows](#windows) above), or
+`cargo install --path camembert`. It scans with a path-based walker,
+deduplicates hardlinks, and drives almost the whole interactive UI.
 
 Identical on both: the directory table, the donut wheel, the disk gauge
 (`GetDiskFreeSpaceExW` in place of `statvfs`), navigation, sorting, the `p`

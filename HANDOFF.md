@@ -207,8 +207,10 @@ pitch.
   `--filter`/FILTER (strict in --no-ui, exit 2; dumps never filtered).
 - **Releases**: tag-triggered workflow builds static musl binaries
   (x86_64 + aarch64, native runners) with sha256 sums attached to the
-  GitHub Release, plus a `.deb` and an `.rpm` per architecture
-  (`scripts/build-packages.sh`, driven by `cargo-deb` /
+  GitHub Release, an `x86_64-pc-windows-msvc` `.zip` from its own
+  `windows-2025` job (Windows-on-ARM would need a cross build or an ARM
+  runner, and nothing has asked), plus a `.deb` and an `.rpm` per Linux
+  architecture (`scripts/build-packages.sh`, driven by `cargo-deb` /
   `cargo-generate-rpm` metadata in `camembert/Cargo.toml`) carrying the
   binary, the three man pages and bash/zsh/fish completions. The
   packages wrap the same static musl binary, so they declare no

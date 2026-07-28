@@ -49,9 +49,13 @@ one is called out under **Breaking** with the migration to apply.
   builds and its scan engine runs there: real allocated sizes from
   `AllocationSize` (measured compression-aware on NTFS), real hardlink
   dedup from `NtQueryInformationByName`, reparse points classified by tag,
-  and paths beyond `MAX_PATH`. The `camembert` binary does not build on
-  Windows yet — its TUI still assumes `delete`, `freeable` and the
-  confidence oracle, all of which are Linux-only.
+  and paths beyond `MAX_PATH`. The `camembert` binary builds and runs
+  there too, with a reduced interface: deletion, the freeable oracle and
+  the open-file confidence verdict are compiled out rather than disabled,
+  so the keys do not exist, `?` does not list them and the palette does
+  not offer them. See the README's "Platform support" for the full split.
+  Prebuilt `x86_64-pc-windows-msvc` binaries are attached to releases as
+  a `.zip`.
 - `errno::ScanErrno::SHARING_VIOLATION`, the taxonomy's first non-POSIX
   reason: Windows' `ERROR_SHARING_VIOLATION`/`ERROR_LOCK_VIOLATION`, i.e.
   another process holding the file open. Its wire name is

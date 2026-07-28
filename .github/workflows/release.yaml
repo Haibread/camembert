@@ -81,8 +81,59 @@ jobs:
             camembert*.rpm.sha256
           if-no-files-found: error
 
+  # Windows gets its own job rather than a leg of the matrix above: every
+  # step there is Linux-shaped (musl-tools, the bash packaging script,
+  # tar/sha256sum), and there is no .deb/.rpm counterpart to build. What
+  # ships is the same shape as the Linux tarball — the binary next to both
+  # licences and the README — in the archive format Windows opens without
+  # installing anything. No man pages or completions, for the same reason
+  # the Linux tarballs carry none: those are a package's job.
+  #
+  # Only x86_64. `aarch64-pc-windows-msvc` would need either a Windows-on-ARM
+  # runner or a cross build, and nothing has asked for it yet.
+  build-windows:
+    runs-on: windows-2025
+    steps:
+      - name: check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: set up the Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - name: cache compiled dependencies
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: x86_64-pc-windows-msvc
+      # No strip step: MSVC keeps debug info in a side-by-side .pdb, which
+      # is simply not copied into the archive.
+      - name: build the release binary
+        run: cargo build --release --locked --package camembert --bin camembert
+      - name: package the release archive
+        shell: pwsh
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          $version = $env:TAG -replace '^v', ''
+          $name = "camembert-$version-x86_64-pc-windows-msvc"
+          New-Item -ItemType Directory -Path $name | Out-Null
+          Copy-Item target/release/camembert.exe, LICENSE-MIT, LICENSE-APACHE, README.md $name
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          # The same `<hash>  <file>` shape the Linux legs write, lowercased
+          # and LF-terminated, so one `sha256sum -c` verifies every artifact
+          # of a release regardless of which job produced it.
+          $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip`n" | Out-File -Encoding ascii -NoNewline "$name.zip.sha256"
+      - name: upload the release artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: camembert-x86_64-pc-windows-msvc
+          path: |
+            camembert-*.zip
+            camembert-*.zip.sha256
+          if-no-files-found: error
+
   release:
-    needs: build
+    needs:
+      - build
+      - build-windows
     runs-on: ubuntu-24.04
     permissions:
       contents: write
