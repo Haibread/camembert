@@ -694,11 +694,27 @@ impl UiState {
     /// row) — `0` before the first summary of the relevant kind has
     /// arrived. Every cursor-bound method below goes through this so mode
     /// switches never need their own clamping logic.
+    ///
+    /// D4 composition: under an active filter, `t`/`b` render the
+    /// filtered match set ([`flatview::filtered_flat_rows`]/
+    /// [`flatview::filtered_breakdown_rows`], `ui.rs`), which can be a
+    /// different size than the whole-scan summary this reads without the
+    /// check below — an unfiltered count here would clamp the cursor
+    /// against a row set nothing on screen actually shows (attack
+    /// finding: it let the cursor drift past the filtered table's last
+    /// row and resolve `o`/`y`/mark/jump against an unrelated whole-scan
+    /// row at the same stale position).
     pub fn row_count(&self) -> usize {
         match self.mode {
             ViewMode::Tree => self.order.len(),
-            ViewMode::FlatTop => self.flat.as_ref().map_or(0, |f| f.top_files.len()),
-            ViewMode::Breakdown => self.flat.as_ref().map_or(0, |f| f.groups.len() + 1),
+            ViewMode::FlatTop => match &self.filter {
+                Some(filter) => filter.result.top_files.len(),
+                None => self.flat.as_ref().map_or(0, |f| f.top_files.len()),
+            },
+            ViewMode::Breakdown => match &self.filter {
+                Some(filter) => filter.result.groups.len() + 1,
+                None => self.flat.as_ref().map_or(0, |f| f.groups.len() + 1),
+            },
         }
     }
 

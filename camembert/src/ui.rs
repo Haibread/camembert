@@ -1789,6 +1789,27 @@ fn activate_selected(ui: &mut UiState, phase: &Phase, flash: &mut Flash) {
     }
 }
 
+/// The [`ViewMode::FlatTop`] rows a cursor position resolves against: the
+/// filtered match set while a filter is active (D4 composition — the
+/// exact set [`draw_flat_table`] renders), the whole-scan summary
+/// otherwise (empty before the first summary of either kind has arrived).
+/// `o`/`y`/Enter/`Space` all resolve a flat-mode cursor position through
+/// this and nothing else, so the row an action names can never diverge
+/// from the row the table shows at that position — before this existed,
+/// each of the three read `ui.flat_summary()` unconditionally, so under
+/// an active filter the table showed the match set but every action still
+/// acted on the whole-scan row sharing the cursor's position, which is
+/// almost never the same row once the filter actually narrows anything.
+fn flat_display_rows(ui: &UiState, outcome: &ScanOutcome) -> Vec<flatview::FlatRow> {
+    match ui.active_filter() {
+        Some(filter) => flatview::filtered_flat_rows(&filter.result, Some(outcome)),
+        None => ui
+            .flat_summary()
+            .map(|summary| flatview::flat_rows(summary, Some(outcome)))
+            .unwrap_or_default(),
+    }
+}
+
 /// Enter on a flat top-files row (D3): jump to its containing directory in
 /// tree view, cursor on the file itself. Only possible post-scan —
 /// resolving a containing directory needs a real path, and the live
@@ -1802,10 +1823,7 @@ fn try_jump_flat_row(ui: &mut UiState, phase: &Phase, flash: &mut Flash) {
     };
     let guard = read_outcome(lock);
     let outcome = &*guard;
-    let Some(summary) = ui.flat_summary() else {
-        return;
-    };
-    let rows = flatview::flat_rows(summary, Some(outcome));
+    let rows = flat_display_rows(ui, outcome);
     let order = flatview::sort_flat_rows(&rows, ui.sort());
     let Some(&index) = order.get(ui.cursor()) else {
         return; // empty view: silent no-op
@@ -1885,12 +1903,12 @@ fn selected_path(ui: &UiState, phase: &Phase) -> SelectedPath {
             let Phase::Done(lock) = phase else {
                 return SelectedPath::Unavailable(FLAT_ROW_DETAILS_LOCKED);
             };
-            let Some(summary) = ui.flat_summary() else {
+            if ui.active_filter().is_none() && ui.flat_summary().is_none() {
                 return SelectedPath::None;
-            };
+            }
             let guard = read_outcome(lock);
             let outcome = &*guard;
-            let rows = flatview::flat_rows(summary, Some(outcome));
+            let rows = flat_display_rows(ui, outcome);
             let order = flatview::sort_flat_rows(&rows, ui.sort());
             let Some(&index) = order.get(ui.cursor()) else {
                 return SelectedPath::None; // empty view: silent no-op
@@ -2182,10 +2200,7 @@ fn try_toggle_mark_flat(
     };
     let guard = read_outcome(lock);
     let outcome = &*guard;
-    let Some(summary) = ui.flat_summary() else {
-        return;
-    };
-    let rows = flatview::flat_rows(summary, Some(outcome));
+    let rows = flat_display_rows(ui, outcome);
     let order = flatview::sort_flat_rows(&rows, ui.sort());
     let Some(&index) = order.get(ui.cursor()) else {
         return; // empty view: silent no-op, matching tree mode
@@ -6549,6 +6564,72 @@ mod tests {
         assert_eq!(
             selected_path(&ui, &phase),
             SelectedPath::Path(tmp.path().join("big"))
+        );
+    }
+
+    /// D4 composition (attack finding): under an active filter, `t` mode
+    /// *renders* [`flatview::filtered_flat_rows`] — the match set — but
+    /// `selected_path` (which `o`/`y`/mark/jump all resolve through)
+    /// ignored the filter entirely and resolved the cursor against
+    /// [`UiState::flat_summary`]'s whole-scan top files instead. The two
+    /// lists have different rows at the same position the moment the
+    /// filter actually narrows anything, so the row named on screen and
+    /// the row an action acts on silently diverge — the same index-space
+    /// mismatch the hover bug shipped with (62d33d7), just between the
+    /// rendered list and the resolved one instead of two index spaces on
+    /// the same list.
+    ///
+    /// Fixture: cursor sits at position 0 under the *unfiltered* disk-desc
+    /// order, where "big" (8192 bytes) leads "small" (16 bytes) — matching
+    /// the previous test exactly. A filter matching only "small" then
+    /// makes the table show a single row, "small", at that same position
+    /// 0. `o`/`y`/Enter/mark must all act on "small", the row actually
+    /// on screen — never "big", a file the filtered table does not even
+    /// display.
+    #[test]
+    fn selected_path_under_a_filter_resolves_the_displayed_row_not_the_whole_scan_row() {
+        let (mut ui, phase, tmp) = done_ui_with_two_files();
+        ui.toggle_flat_top();
+        let flat_config = FlatConfig::default();
+        ensure_flat_summary_fresh(&phase, &flat_config, &mut ui);
+        assert!(ui.flat_summary().is_some(), "fold populated the summary");
+
+        let parsed = query::parse("small");
+        assert!(parsed.errors.is_empty());
+        let Phase::Done(lock) = &phase else {
+            panic!("done_ui_with_two_files always returns Phase::Done")
+        };
+        let outcome = read_outcome(lock);
+        let hardlinks = HardlinkIndex::build(&outcome, 0);
+        let result = query::apply(
+            outcome.tree(),
+            &parsed.query,
+            &flat_config.patterns,
+            &hardlinks,
+            &ApplyOptions {
+                cap: 10,
+                epoch: 0,
+                now_unix: 0,
+                threads: 1,
+            },
+        );
+        drop(outcome);
+        assert_eq!(
+            result.top_files.len(),
+            1,
+            "only \"small\" matches the filter"
+        );
+        ui.set_active_filter("small".to_owned(), Arc::new(result));
+
+        // The cursor is untouched by applying the filter (it was already
+        // in bounds), so it is still 0 — the position the table now shows
+        // "small" at, the filtered view's only row.
+        assert_eq!(ui.cursor(), 0);
+        assert_eq!(
+            selected_path(&ui, &phase),
+            SelectedPath::Path(tmp.path().join("small")),
+            "the row named on screen at the cursor position must be the \
+             row every action resolves, even under an active filter"
         );
     }
 
