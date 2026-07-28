@@ -2814,8 +2814,9 @@ fn draw(
     if layout == WheelLayout::Mini {
         draw_mini_donut(frame, header_area, &wheel_source, motion, ctx);
     }
-    let wheel =
-        wheel_area.and_then(|wheel_area| draw_wheel(frame, wheel_area, &wheel_source, motion, ctx));
+    let wheel = wheel_area.and_then(|wheel_area| {
+        draw_wheel(frame, wheel_area, &wheel_source, ui.hover(), motion, ctx)
+    });
 
     draw_filter_pill(frame, pill_area, ui, filter_fold_in_flight, ctx);
     #[cfg(unix)]
@@ -3882,10 +3883,19 @@ struct WheelSource {
 /// never itself one of `source`'s rows — see
 /// [`draw_breakdown_table`]); under the wheel: `source.caption`
 /// (abbreviated) and its total.
+///
+/// `hover` is the display-order row position under the pointer, if any
+/// (`UiState::hover`) — the other half of the wheel<->table link: hovering
+/// a table row already drives the selection card via that same position,
+/// and hovering a slice already resolves to a row position through
+/// `WheelGeometry::hit_test`, so this is the one place a *row* hover
+/// needs to find its way back to a *slice* to emphasize (`wheel::
+/// slice_for_target`, the reverse of that hit test).
 fn draw_wheel(
     frame: &mut Frame<'_>,
     area: Rect,
     source: &WheelSource,
+    hover: Option<usize>,
     motion: &mut anim::Motion,
     ctx: &RenderCtx,
 ) -> Option<WheelGeometry> {
@@ -3928,9 +3938,26 @@ fn draw_wheel(
                 ))
             }
         };
-        blit_wheel(frame, donut_area, &cells, &colors);
 
         let targets = wheel::build_slice_targets(&source.slice_rows, source.total);
+        // `slice_for_target` only ever resolves a `Some` target, so the
+        // merged rest slice (target `None`) can never come back as the
+        // hovered slice here — it stays unemphasized by construction, not
+        // by a special case (see the function's own doc).
+        let hovered_slice = hover.and_then(|position| wheel::slice_for_target(&targets, position));
+        let emphasis = hovered_slice.map(|slice| {
+            let style = slice_ranks
+                .get(slice as usize)
+                .copied()
+                .flatten()
+                .map_or_else(
+                    || theme.muted_emphasis(),
+                    |rank| theme.identity_emphasis(rank),
+                );
+            (slice, style)
+        });
+        blit_wheel(frame, donut_area, &cells, &colors, emphasis);
+
         let (width, height) = (donut_area.width as usize, donut_area.height as usize);
         let mut cell_slices = vec![None; width * height];
         for (row, line) in cells.iter().enumerate().take(height) {
@@ -4017,19 +4044,34 @@ fn draw_mini_donut(
             wheel::HALF_BLOCK_ASPECT,
         )),
     };
-    blit_wheel(frame, area, &cells, &colors);
+    // Decorative only (see the doc above): no hover state to emphasize.
+    blit_wheel(frame, area, &cells, &colors, None);
 }
 
 /// Copy a composed wheel-cell grid into the frame buffer, mapping slice
 /// indices to colors. All coordinates are bounded by `area`, which the
 /// caller guarantees lies within the frame.
+///
+/// `hovered` is `(slice, style)` for the currently hovered slice, if any
+/// — `style` is that slice's identity color emphasized the same way the
+/// freeable floor bar segment is (`Theme::identity_emphasis`/
+/// `muted_emphasis`): lightened at truecolor/256, plain color plus
+/// `Modifier::BOLD` at ANSI-16/mono, so the emphasis degrades down the
+/// capability ladder instead of vanishing or corrupting. A cell's fg and
+/// bg subpixels are checked independently (`wheel::hover_roles`) since a
+/// boundary cell can show two different slices at once; a bg match only
+/// ever borrows the style's color (`BOLD` has no meaning for a
+/// background). This is a per-cell style decision over the grid already
+/// composed for the frame — no second rasterization.
 fn blit_wheel(
     frame: &mut Frame<'_>,
     area: Rect,
     cells: &[Vec<wheel::WheelCell>],
     colors: &[Color],
+    hovered: Option<(u16, Style)>,
 ) {
     let buffer = frame.buffer_mut();
+    let hovered_slice = hovered.map(|(slice, _)| slice);
     for (row, line) in cells.iter().enumerate().take(area.height as usize) {
         for (col, cell) in line.iter().enumerate().take(area.width as usize) {
             if cell.fg.is_none() && cell.bg.is_none() {
@@ -4041,12 +4083,24 @@ fn blit_wheel(
             };
             buf_cell.set_char(cell.ch);
             let color_of = |slice: u16| colors.get(slice as usize).copied().unwrap_or(Color::Reset);
+            let (fg_hot, bg_hot) = wheel::hover_roles(*cell, hovered_slice);
             let mut style = Style::new();
             if let Some(fg) = cell.fg {
-                style = style.fg(color_of(fg));
+                style = if fg_hot {
+                    style.patch(hovered.expect("fg_hot implies a hovered slice").1)
+                } else {
+                    style.fg(color_of(fg))
+                };
             }
             if let Some(bg) = cell.bg {
-                style = style.bg(color_of(bg));
+                style = if bg_hot {
+                    let emphasis_color = hovered
+                        .and_then(|(_, style)| style.fg)
+                        .unwrap_or_else(|| color_of(bg));
+                    style.bg(emphasis_color)
+                } else {
+                    style.bg(color_of(bg))
+                };
             }
             buf_cell.set_style(style);
         }
@@ -5568,6 +5622,263 @@ mod tests {
              position 1, where the table actually shows it -- not 0, which \
              is where the uncategorized row (excluded from the filtered \
              slice list) happened to land: {targets:?}"
+        );
+    }
+
+    /// Renders [`sample_snapshot`] on a wide terminal (full side wheel,
+    /// `WheelLayout::Full`) with the table/wheel hover set to `hover`,
+    /// returning the frame geometry (to locate the donut) and the
+    /// rendered buffer — the shared setup for the hover-emphasis tests
+    /// below.
+    fn render_with_wheel_hover(
+        hover: Option<usize>,
+        glyphs: GlyphLevel,
+        color: ColorLevel,
+    ) -> (FrameGeometry, ratatui::buffer::Buffer) {
+        let mut ui = UiState::new(sample_snapshot());
+        if let Some(position) = hover {
+            ui.set_hover(position);
+        }
+        let render_ctx = ctx(glyphs, color);
+        let mut table_state = TableState::default();
+        let mut motion = no_motion();
+        let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
+        let mut geometry = None;
+        terminal
+            .draw(|frame| {
+                geometry = Some(draw(
+                    frame,
+                    &ui,
+                    &Phase::Transitioning,
+                    &mut table_state,
+                    '⠋',
+                    None,
+                    &[],
+                    &mut motion,
+                    &render_ctx,
+                    false,
+                    &[],
+                    None,
+                ));
+            })
+            .unwrap();
+        (geometry.unwrap(), terminal.backend().buffer().clone())
+    }
+
+    /// Recomposes the exact `WheelCell` grid `draw_wheel` produced for
+    /// [`sample_snapshot`] at `wheel`'s size, straight from the pure
+    /// `wheel` module (mirroring the tree-mode branch of `draw` with no
+    /// active filter and no motion easing — exactly what
+    /// [`render_with_wheel_hover`] renders). `WheelGeometry::cells` alone
+    /// is not enough to classify a screen cell's role: it only records
+    /// the composed cell's *foreground* slice, so a boundary cell whose
+    /// *background* is the hovered slice would be misclassified as
+    /// unrelated to it. This gives the tests the real fg/bg pair to run
+    /// [`wheel::hover_roles`] against, same as `blit_wheel` does.
+    fn sample_wheel_cells(wheel: &WheelGeometry) -> Vec<Vec<wheel::WheelCell>> {
+        let snapshot = sample_snapshot();
+        let disks: Vec<u64> = snapshot.rows.iter().map(|row| row.disk).collect();
+        let ranks = theme::assign_identity(&disks, theme::IDENTITY_LEN);
+        let slice_rows: Vec<(u64, Option<usize>)> = disks.into_iter().zip(ranks).collect();
+        let (fracs, _) = wheel::build_slices(&slice_rows, snapshot.totals.disk);
+        wheel::compose_half_blocks(&wheel::rasterize(
+            &fracs,
+            wheel.width,
+            2 * wheel.height,
+            wheel::HALF_BLOCK_ASPECT,
+        ))
+    }
+
+    /// The other half of the wheel<->table hover link (see
+    /// `handle_hover`'s own doc): hovering row 0 ("big", [`sample_snapshot`]'s
+    /// rank-0 child, its own kept slice) must brighten that slice's cells in
+    /// the donut and nothing else — not another slice's cells, and not the
+    /// merged gray "rest" wedge, which isn't a row at all and must never
+    /// promise otherwise by lighting up.
+    #[test]
+    fn hovering_a_wheel_slice_emphasizes_only_its_own_cells() {
+        let (baseline_geom, baseline) =
+            render_with_wheel_hover(None, GlyphLevel::HalfBlock, ColorLevel::Truecolor);
+        let wheel = baseline_geom
+            .wheel
+            .expect("120-column terminal renders the full wheel");
+        let hovered_slice = wheel::slice_for_target(&wheel.targets, 0)
+            .expect("row 0 is large enough to keep its own slice");
+        assert!(
+            wheel.targets.contains(&None),
+            "fixture must actually have a rest wedge for this test to mean anything"
+        );
+
+        let (hovered_geom, hovered) =
+            render_with_wheel_hover(Some(0), GlyphLevel::HalfBlock, ColorLevel::Truecolor);
+        let hovered_wheel = hovered_geom.wheel.expect("layout must not shift");
+        assert_eq!(
+            (
+                hovered_wheel.x,
+                hovered_wheel.y,
+                hovered_wheel.width,
+                hovered_wheel.height
+            ),
+            (wheel.x, wheel.y, wheel.width, wheel.height),
+            "hovering must not move or resize the donut"
+        );
+
+        let cells = sample_wheel_cells(&wheel);
+        let mut emphasized = 0;
+        for (row, line) in cells.iter().enumerate() {
+            for (col, &cell) in line.iter().enumerate() {
+                let (fg_hot, bg_hot) = wheel::hover_roles(cell, Some(hovered_slice));
+                let (x, y) = (wheel.x + col as u16, wheel.y + row as u16);
+                let base_cell = &baseline[(x, y)];
+                let hov_cell = &hovered[(x, y)];
+                if fg_hot || bg_hot {
+                    if base_cell != hov_cell {
+                        emphasized += 1;
+                    }
+                } else {
+                    assert_eq!(
+                        base_cell, hov_cell,
+                        "cell at ({x},{y}) touches neither the hovered slice's \
+                         fg nor bg ({cell:?}) — it must not change (this covers \
+                         the rest wedge too: its slice index is never \
+                         {hovered_slice} by construction)"
+                    );
+                }
+            }
+        }
+        assert!(
+            emphasized > 0,
+            "hovering slice {hovered_slice} must actually change some of its cells"
+        );
+    }
+
+    /// [`sample_snapshot`]'s row 3 ("tiny", 1 byte of 10 000) is too small
+    /// to keep a slice of its own (`MIN_SLICE_FRACTION`) — its bytes are
+    /// folded into the merged rest wedge. Hovering that row (e.g. by
+    /// resting the pointer on it in the table) must therefore emphasize
+    /// nothing at all in the donut, rather than lighting up the rest wedge
+    /// it happens to be merged into and implying a click there would land
+    /// on "tiny" specifically, which it does not (`WheelGeometry::hit_test`
+    /// never resolves the rest wedge to any row).
+    #[test]
+    fn hovering_a_row_merged_into_the_rest_wedge_lights_up_nothing() {
+        let (baseline_geom, baseline) =
+            render_with_wheel_hover(None, GlyphLevel::HalfBlock, ColorLevel::Truecolor);
+        let (hovered_geom, hovered) =
+            render_with_wheel_hover(Some(3), GlyphLevel::HalfBlock, ColorLevel::Truecolor);
+        let wheel = baseline_geom
+            .wheel
+            .expect("120-column terminal renders the full wheel");
+        let hovered_wheel = hovered_geom.wheel.expect("layout must not shift");
+        assert_eq!(
+            (
+                hovered_wheel.x,
+                hovered_wheel.y,
+                hovered_wheel.width,
+                hovered_wheel.height
+            ),
+            (wheel.x, wheel.y, wheel.width, wheel.height)
+        );
+        // Confirms the fixture assumption this test relies on: row 3
+        // ("tiny") really did not keep a slice of its own.
+        assert_eq!(
+            wheel::slice_for_target(&wheel.targets, 3),
+            None,
+            "fixture assumption: row 3 must be merged into the rest wedge"
+        );
+        for row in 0..wheel.height {
+            for col in 0..wheel.width {
+                let (x, y) = (wheel.x + col as u16, wheel.y + row as u16);
+                assert_eq!(
+                    baseline[(x, y)],
+                    hovered[(x, y)],
+                    "donut cell at ({x},{y}) changed when hovering a row \
+                     merged into the rest wedge — nothing should light up"
+                );
+            }
+        }
+    }
+
+    /// Every glyph x color rung renders with a slice hovered without
+    /// panicking — including ASCII, which hides the wheel outright
+    /// (`wheel_layout`) and so must simply ignore the hover, and mono,
+    /// where every identity color already collapses to `Color::Reset`
+    /// (`Theme::project`). `Theme::identity_emphasis` keeps that exact
+    /// `Color::Reset` at mono and carries the distinction as
+    /// `Modifier::BOLD` instead (same idiom as the freeable bright bar
+    /// segment) — so mono's donut shows the identical glyphs and colors
+    /// whether or not a slice is hovered, and the hovered slice's cells
+    /// gain bold rather than a color a mono terminal would render wrong.
+    #[test]
+    fn wheel_hover_survives_the_capability_ladder_without_panicking() {
+        for glyphs in [
+            GlyphLevel::Sextant,
+            GlyphLevel::HalfBlock,
+            GlyphLevel::Ascii,
+        ] {
+            for color in [
+                ColorLevel::Truecolor,
+                ColorLevel::Ansi256,
+                ColorLevel::Ansi16,
+                ColorLevel::Mono,
+            ] {
+                render_with_wheel_hover(Some(0), glyphs, color);
+            }
+        }
+
+        let (baseline_geom, baseline) =
+            render_with_wheel_hover(None, GlyphLevel::HalfBlock, ColorLevel::Mono);
+        let (hovered_geom, hovered) =
+            render_with_wheel_hover(Some(0), GlyphLevel::HalfBlock, ColorLevel::Mono);
+        let wheel = baseline_geom
+            .wheel
+            .expect("120-column terminal renders the full wheel");
+        let hovered_wheel = hovered_geom.wheel.expect("layout must not shift");
+        assert_eq!(
+            (
+                hovered_wheel.x,
+                hovered_wheel.y,
+                hovered_wheel.width,
+                hovered_wheel.height
+            ),
+            (wheel.x, wheel.y, wheel.width, wheel.height)
+        );
+        let hovered_slice = wheel::slice_for_target(&wheel.targets, 0)
+            .expect("row 0 is large enough to keep its own slice");
+        let cells = sample_wheel_cells(&wheel);
+        let mut bolded = 0;
+        for (row, line) in cells.iter().enumerate() {
+            for (col, &cell) in line.iter().enumerate() {
+                let (fg_hot, _bg_hot) = wheel::hover_roles(cell, Some(hovered_slice));
+                let (x, y) = (wheel.x + col as u16, wheel.y + row as u16);
+                let base_cell = &baseline[(x, y)];
+                let hov_cell = &hovered[(x, y)];
+                // Mono has no colors to begin with (`Theme::project`
+                // collapses everything to `Color::Reset`) — the glyph and
+                // both colors must match exactly regardless of hover, on
+                // every cell including the hovered slice's own.
+                assert_eq!(base_cell.symbol(), hov_cell.symbol(), "glyph at ({x},{y})");
+                assert_eq!(base_cell.fg, hov_cell.fg, "fg at ({x},{y})");
+                assert_eq!(base_cell.bg, hov_cell.bg, "bg at ({x},{y})");
+                if fg_hot {
+                    if hov_cell.modifier.contains(Modifier::BOLD)
+                        && !base_cell.modifier.contains(Modifier::BOLD)
+                    {
+                        bolded += 1;
+                    }
+                } else {
+                    assert_eq!(
+                        base_cell, hov_cell,
+                        "cell at ({x},{y}) does not carry the hovered slice's \
+                         fg — mono must leave it untouched"
+                    );
+                }
+            }
+        }
+        assert!(
+            bolded > 0,
+            "the hovered slice must carry bold at mono — emphasis must \
+             survive the capability ladder, not vanish"
         );
     }
 
