@@ -3565,9 +3565,10 @@ fn draw_flat_table(
 /// row ([`flatview::breakdown_rows`]) is always shown but never given an
 /// identity rank or a wheel slice of its own — D1's disjoint-partition
 /// invariant means the wheel's automatic "unaccounted" remainder already
-/// equals it exactly, so excluding it from `slice_rows` here is what
-/// produces the correct gray "uncategorized" wedge (attack finding 2's
-/// fix) instead of a second, redundant colored one.
+/// equals it exactly, so giving it `None` rank (never excluding it from
+/// `slice_rows` — see the field's own comment below) is what produces the
+/// correct gray "uncategorized" wedge (attack finding 2's fix) instead of
+/// a second, redundant colored one.
 fn draw_breakdown_table(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -3698,14 +3699,19 @@ fn draw_breakdown_table(
         height: area.height.saturating_sub(1),
         offset: table_state.offset(),
     };
-    // The uncategorized row is excluded from the donut's own rows (see the
-    // function doc): its share reaches the wheel only as the automatic
-    // "unaccounted" remainder `build_slices` computes from `total -
-    // sum(slice_rows)`, which — thanks to D1's disjoint partition — is
-    // exactly `summary.rest`, never an overlap artifact.
+    // The uncategorized row stays *in* `slice_rows`, in its real display
+    // position — only its rank is `None` (assigned above). `build_slices`
+    // already merges any `None`-ranked row into the automatic "unaccounted"
+    // wedge on its own (see the function doc), so this needs no filtering;
+    // filtering the row out here instead would drop it from the position
+    // count entirely, shifting every later row's target left by one
+    // whenever the uncategorized row does not happen to sort last — which,
+    // under the default disk-descending sort, is the common case (the
+    // unmatched "rest" bucket is often the *largest* row, not the
+    // smallest). `WheelSource`'s own doc requires `slice_rows`' position to
+    // equal the row's display position; a filtered list breaks that.
     let slice_rows: Vec<(u64, Option<usize>)> = order
         .iter()
-        .filter(|&&index| rows[index].kind.is_some())
         .map(|&index| (rows[index].disk, ranks.get(index).copied().flatten()))
         .collect();
     let wheel_source = WheelSource {
@@ -5364,6 +5370,85 @@ mod tests {
             underlined[0].contains("largest"),
             "the highlighted row must be the one the card names, not the \
              row sharing its snapshot index: {underlined:?}"
+        );
+    }
+
+    /// The breakdown donut's clickable slices must target the row's
+    /// *display* position (the same `order` the table renders), matching
+    /// [`WheelSource`]'s own doc: "`slice_rows`' position doubles as the
+    /// cursor position a click on that slice should land on". Before this
+    /// fix, `draw_breakdown_table` built `slice_rows` by filtering the
+    /// sorted rows down to the ones with a pattern kind -- dropping the
+    /// trailing uncategorized row wherever it actually sorted to. Under
+    /// the default disk-descending sort the unmatched "rest" bucket is
+    /// often the *largest* slice, not the smallest, so it routinely sorts
+    /// to the front rather than staying last -- exactly the fixture below.
+    /// The filter then silently shifted every later group's target left by
+    /// one, so clicking a group's slice landed on the row *before* it
+    /// (here, the uncategorized row itself) instead of the group.
+    #[test]
+    fn breakdown_wheel_targets_the_display_position_not_a_filtered_one() {
+        let summary = flat::FlatSummary {
+            groups: vec![flat::GroupTotal {
+                label: "grp".to_owned(),
+                kind: flat::PatternKind::Dir,
+                apparent: 3000,
+                disk: 3000,
+                entries: 5,
+            }],
+            rest: flat::RestTotal {
+                apparent: 5000,
+                disk: 5000,
+                entries: 10,
+            },
+            top_files: Vec::new(),
+            truncated: false,
+            provisional: false,
+            epoch: 0,
+        };
+
+        // Confirm the fixture actually drives the scenario: the default
+        // sort (disk descending) puts the bigger "rest" bucket at display
+        // position 0 and "grp" at position 1 -- the uncategorized row is
+        // not last.
+        let rows = flatview::breakdown_rows(&summary);
+        let order = flatview::sort_breakdown_rows(&rows, state::SortSpec::default());
+        assert_eq!(rows[order[0]].label, flatview::UNCATEGORIZED_LABEL);
+        assert_eq!(rows[order[1]].label, "grp");
+
+        let mut ui = UiState::new(sample_snapshot());
+        ui.toggle_breakdown();
+        ui.set_flat_summary(Arc::new(summary));
+
+        let ctx = ctx(GlyphLevel::HalfBlock, ColorLevel::Truecolor);
+        let mut table_state = TableState::default();
+        let area = Rect::new(0, 0, 40, 20);
+        let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
+        let mut result = None;
+        terminal
+            .draw(|frame| {
+                result = Some(draw_breakdown_table(
+                    frame,
+                    area,
+                    &ui,
+                    &mut table_state,
+                    1.0,
+                    &ctx,
+                ));
+            })
+            .unwrap();
+        let (_geometry, wheel_source) = result.unwrap();
+
+        let targets = wheel::build_slice_targets(&wheel_source.slice_rows, wheel_source.total);
+        // Two slices in the donut: the colored "grp" wedge, then the gray
+        // "rest" wedge merged from everything else (`None`, not navigable).
+        assert_eq!(
+            targets,
+            vec![Some(1), None],
+            "the wheel's colored slice (\"grp\") must target display \
+             position 1, where the table actually shows it -- not 0, which \
+             is where the uncategorized row (excluded from the filtered \
+             slice list) happened to land: {targets:?}"
         );
     }
 
