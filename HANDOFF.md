@@ -232,11 +232,25 @@ pitch.
   section and passes it as `--notes-file`, failing the job if there is
   none, then appends GitHub's generated notes (label categories in
   `.github/release.yaml` only ever catch dependabot PRs, since work
-  lands directly on `main`). **v0.2.0 is released** (2026-07-24: reclaim
+  lands directly on `main`). **v0.4.0 is released** (2026-07-28: the
+  Windows port, native `.deb`/`.rpm` packages, a prebuilt Windows
+  `.zip`, shell completions, and the breaking removal of `--links` off
+  Windows), and **verified from the published artifacts**: the amd64
+  `.deb` and the Windows `.zip` match their published sums, the `.deb`
+  installs and scans in a Debian 12 container reporting
+  `camembert 0.4.0 (b36f189)` — the tag's commit — and rejects
+  `--links` as an unknown argument, and `packaging/aur/PKGBUILD` builds
+  the published tarball end to end with `check()` enabled (no
+  `--nocheck`), producing the same commit string from `_commit`. The
+  release job's three new paths (the packaging script, the Windows job,
+  the package upload) all ran green on their first execution; the only
+  annotation was install-action having no curated `cargo-deb` build for
+  `aarch64_linux`, which fell back to `cargo-binstall` and worked.
+  Before it, **v0.2.0** (2026-07-24: reclaim
   oracle, ambient exclusive floor, confidence verdict, errno plumbing,
   deletion TOCTOU fix, and the breaking
-  `--cross-filesystems` → `--one-filesystem` swap), and **end-to-end
-  verified from the published artifacts**: both sha256 sums check out,
+  `--cross-filesystems` → `--one-filesystem` swap) was likewise
+  **verified from the published artifacts**: both sha256 sums check out,
   both binaries are statically linked, the x86_64 one runs a real scan
   and reports `camembert 0.2.0 (3d07b34)` — the tag's commit. One
   discrepancy found while verifying: **the aarch64 binary is static but

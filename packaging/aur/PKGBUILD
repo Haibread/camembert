@@ -16,7 +16,7 @@
 pkgname=camembert
 pkgver=0.4.0
 pkgrel=1
-_commit=0000000
+_commit=b36f189
 pkgdesc='Disk usage analyzer that answers the real questions: what grew, what is freeable, what is cold'
 arch=('x86_64' 'aarch64')
 url='https://github.com/Haibread/camembert'
@@ -32,7 +32,7 @@ makedepends=('cargo')
 # on whichever zstd Arch ships that week.
 options=('!lto')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('SKIP')
+sha256sums=('29475a2ea25c2d9a6b2f8e142082f6b410df14464e3ebdf9bb186419f1205ea8')
 
 prepare() {
 	cd "$pkgname-$pkgver"

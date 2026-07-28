@@ -1,0 +1,15 @@
+pkgbase = camembert
+	pkgdesc = Disk usage analyzer that answers the real questions: what grew, what is freeable, what is cold
+	pkgver = 0.4.0
+	pkgrel = 1
+	url = https://github.com/Haibread/camembert
+	arch = x86_64
+	arch = aarch64
+	license = MIT OR Apache-2.0
+	makedepends = cargo
+	depends = gcc-libs
+	options = !lto
+	source = camembert-0.4.0.tar.gz::https://github.com/Haibread/camembert/archive/refs/tags/v0.4.0.tar.gz
+	sha256sums = 29475a2ea25c2d9a6b2f8e142082f6b410df14464e3ebdf9bb186419f1205ea8
+
+pkgname = camembert

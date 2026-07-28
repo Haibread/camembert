@@ -2,3 +2,10 @@
 /.claude/worktrees/
 # `camembert-mangen` writes generated roff here; it is a build product.
 /man/
+# The per-release `updpkgsums` step downloads the release tarball next to
+# the PKGBUILD, and `makepkg` builds in place. Sources and build output,
+# not something to commit.
+/packaging/aur/*.tar.gz
+/packaging/aur/src/
+/packaging/aur/pkg/
+/packaging/aur/*.pkg.tar.zst
