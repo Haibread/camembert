@@ -151,7 +151,16 @@ pub(crate) struct ScanArgs {
     /// invent one. The price is per *file* — directories and reparse
     /// points are never queried — so the factor tracks the file:directory
     /// ratio: ~19x on a 200k-file synthetic tree, ~2x on `C:\Windows`.
-    /// Totals are identical either way.
+    /// Totals are identical either way **where the filesystem answers the
+    /// query**. Where it does not — measured on an SMB path, which returns
+    /// STATUS_NOT_SUPPORTED — the lookup latches off and every later file
+    /// falls back to a link count of 1, which is exactly the value that
+    /// keeps an entry out of the hardlink registry. That scan then stops
+    /// deduplicating and reports a hardlinked pair at twice its size,
+    /// while the default rule, keyed on the id the listing already
+    /// carries, still gets it right. The scan says so (the summary reports
+    /// its link counts as unknown), but the flag is the wrong tool on such
+    /// a volume: prefer the default there.
     ///
     /// Experimental: the surface may change as the lazy per-file lookup at
     /// the point of consumption lands, which is expected to make the

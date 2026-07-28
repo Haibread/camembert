@@ -212,8 +212,20 @@ minimum is taken over the same set of paths either way. What differs is
 which inodes are in the registry at all — an inode with exactly one link
 inside the scan and more outside is a group of one under the first rule
 and not a group under the second — and a group of one attributes its bytes
-to its only link under both. Subtree totals are consequently identical;
-this is measured, not argued (`docs/design/windows-nlink-dossier.md`).
+to its only link under both. Subtree totals are consequently identical
+**when the writer obtained a link count for every entry**.
+
+That proviso is not decoration. A writer implementing the first rule
+depends on a per-file query that can fail wholesale: measured on an SMB
+path, `NtQueryInformationByName(FileStatInformation)` answers
+`STATUS_NOT_SUPPORTED`, the writer falls back to a link count of 1 for
+every remaining entry, and a genuine two-link group is then not a group at
+all — its bytes are counted twice while the second rule still counts them
+once. So the two rules agree on the *owner* of every group they both see,
+but only a writer that actually got its counts sees the same groups. Such
+a writer must report its link counts as unknown (and therefore omit `l`,
+below), which is what tells a reader which of the two statements it is
+holding.
 
 Such a writer **must omit `l`**. It has no link count to report, and an
 absent `l` already means "single link, or not emitted" to every reader,
