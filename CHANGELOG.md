@@ -47,6 +47,19 @@ one is called out under **Breaking** with the migration to apply.
   denied (os error 13)`). Asking the host to describe a canonical number
   would reintroduce the very numbering assumption the newtype removes.
 
+### Fixed
+
+- **`camembert diff` no longer renders a Unix path with a backslash
+  separator** when the dump's root is a *relative* directory whose own name
+  contains one (`camembert 'back\slash' -o dump.cmbt`). The join picked the
+  first `/`-or-`\` byte in the directory path, which for such a root is part
+  of a filename, and printed `back\slash\plain.txt` — a path that exists
+  nowhere and that the dump's own `d` lines (`back\slash/sub`) contradict.
+  A legacy 0.3.0 Windows dump is now recognised by its root being a Windows
+  *absolute* path (`C:\…`, `\\server\share`, `\\?\C:\…`), which is the only
+  shape that writer could have produced, so those still render as the
+  Windows paths a user recognises.
+
 ## [0.3.0] - 2026-07-25
 
 ### Changed

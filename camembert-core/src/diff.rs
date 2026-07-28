@@ -724,23 +724,38 @@ impl Differ {
 /// on disk. Diffing one should print paths a user can recognise rather
 /// than compounding the original mistake.
 ///
-/// The *first* separator decides, not the last: every `dir` starts with
-/// the header's root, so the leading separator is the one the dump was
-/// written with, and a component deeper down whose **name** contains the
-/// other character cannot override it. A Unix file genuinely called
-/// `back\slash` therefore stays joined with `/`, which scanning from the
-/// right got wrong.
+/// What decides is the shape of the dump's **root prefix**, not the first
+/// separator-looking byte in the path: 0.3.0 only ever wrote `\` because
+/// the Windows root was interned verbatim, so a legacy dump is recognised
+/// by that root being a Windows *absolute* path — `C:\…`, `\\server\share`,
+/// `\\?\C:\…`. Anything else joins with `/`.
+///
+/// "First separator wins" was the earlier rule and it is wrong for a root
+/// that contains no separator of its own: a Unix dump rooted at a relative
+/// directory called `back\slash` has `\` as the first such byte, and the
+/// join then produced `back\slash\plain.txt` — a path that exists nowhere
+/// and that the dump's own `d` lines (`back\slash/sub`) contradict.
 fn join_path(dir: &[u8], name: &[u8]) -> Vec<u8> {
-    let sep = dir
-        .iter()
-        .find(|&&b| b == b'/' || b == b'\\')
-        .copied()
-        .unwrap_or(b'/');
+    let sep = if is_windows_absolute(dir) {
+        b'\\'
+    } else {
+        b'/'
+    };
     let mut path = Vec::with_capacity(dir.len() + 1 + name.len());
     path.extend_from_slice(dir);
     path.push(sep);
     path.extend_from_slice(name);
     path
+}
+
+/// Does `dir` open with a Windows absolute prefix spelled with `\`? That
+/// is the only shape a non-conformant 0.3.0 Windows dump can have taken
+/// from the OS, and the only one where `\` is a separator rather than an
+/// ordinary byte of somebody's filename.
+fn is_windows_absolute(dir: &[u8]) -> bool {
+    // `\\server\share`, `\\?\C:\…` — and `C:\…`.
+    dir.starts_with(br"\\")
+        || matches!(dir, [drive, b':', b'\\', ..] if drive.is_ascii_alphabetic())
 }
 
 fn verify_entry_order(entries: &[Entry], side: Side, path: &[u8]) -> Result<(), DiffError> {
@@ -1256,5 +1271,53 @@ mod tests {
         );
         // A relative root with no separator at all falls back to `/`.
         assert_eq!(join_path(b"tree", b"a"), b"tree/a");
+        // The other two shapes a legacy Windows root could take.
+        assert_eq!(
+            join_path(br"\\srv\share\data", b"x"),
+            br"\\srv\share\data\x"
+        );
+        assert_eq!(join_path(br"\\?\C:\tree", b"x"), br"\\?\C:\tree\x");
+    }
+
+    /// A Unix dump rooted at a **relative** directory whose name contains a
+    /// backslash. The root has no separator of its own, so "first separator
+    /// wins" picked the `\` out of the name and rendered
+    /// `back\slash\plain.txt` — a path that exists nowhere, and one the
+    /// dump's own `d` lines (`back\slash/sub`) contradict.
+    #[test]
+    fn a_backslash_in_a_relative_root_s_name_is_not_a_separator() {
+        assert_eq!(
+            join_path(br"back\slash", b"plain.txt"),
+            br"back\slash/plain.txt"
+        );
+        assert_eq!(
+            join_path(br"back\slash/sub", b"inner.txt"),
+            br"back\slash/sub/inner.txt"
+        );
+    }
+
+    /// The same thing end to end: a hand-built Unix dump rooted at
+    /// `back\slash`, diffed against a grown copy of itself, must report the
+    /// entry under the path the dump actually describes.
+    #[test]
+    fn a_relative_root_with_a_backslash_diffs_to_unix_paths() {
+        // JSON-escaped: the root is the two components-looking-but-not
+        // bytes `back\slash`, and the dump joins below it with `/`.
+        let side = |a: u64, dsk: u64| {
+            [
+                header(r"back\\slash", true),
+                d(r"back\\slash", a, dsk, 3),
+                f("plain.txt", a, dsk, 1),
+                d(r"back\\slash/sub", 0, 0, 1),
+                end_line().to_owned(),
+            ]
+            .join("\n")
+                + "\n"
+        };
+        let report = run(&side(100, 1024), &side(300, 3072), 20).expect("diff");
+        assert_eq!(
+            report.top_entries[0].path, br"back\slash/plain.txt",
+            "the grown entry keeps the dump's own separator"
+        );
     }
 }
