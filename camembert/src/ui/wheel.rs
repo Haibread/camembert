@@ -260,6 +260,45 @@ pub fn build_slice_targets(rows: &[(u64, Option<usize>)], total: u64) -> Vec<Opt
     targets
 }
 
+/// The slice index in `targets` whose click target is `position`, if any —
+/// the reverse of [`super::state::WheelGeometry::hit_test`]'s slice-to-row
+/// lookup, used to find which slice to emphasize when `position` is the
+/// hovered row. `targets` entries are unique where
+/// `Some` (each kept slice targets a different row), so at most one slice
+/// ever matches.
+///
+/// The merged "rest" slice — `targets[i] == None` — can never match,
+/// because it is compared against `Some(position)` and not `position`
+/// itself: there is no row position a caller could pass that means "the
+/// rest wedge". That is exactly the point (see the wheel-emphasis design
+/// note): hovering a row too small to have kept its own slice must not
+/// light up the wedge it got merged into, since clicking that wedge does
+/// not navigate to it.
+pub fn slice_for_target(targets: &[Option<usize>], position: usize) -> Option<u16> {
+    targets
+        .iter()
+        .position(|&target| target == Some(position))
+        .map(|i| i as u16)
+}
+
+/// Whether a composed cell's foreground and/or background subpixels
+/// belong to the `hovered` slice — the pure per-cell predicate behind the
+/// wheel's hover emphasis (`ui.rs`'s `blit_wheel`). A cell can carry two
+/// different slices at once (an interior boundary cell's fg pattern vs.
+/// its bg fill), so the two roles are reported independently: a boundary
+/// cell only half covered by the hovered slice should only light up the
+/// half that actually is it.
+///
+/// Purely a `==` check against already-composed cells — no rasterization,
+/// so this stays inside the per-frame style pass rather than adding a
+/// second pass over the donut.
+pub fn hover_roles(cell: WheelCell, hovered: Option<u16>) -> (bool, bool) {
+    match hovered {
+        Some(hovered) => (cell.fg == Some(hovered), cell.bg == Some(hovered)),
+        None => (false, false),
+    }
+}
+
 /// Shared implementation of [`build_slices`] and [`build_slice_targets`]:
 /// the same merge pass, carrying both the color rank and the originating
 /// row position for each kept slice.
@@ -544,6 +583,85 @@ mod tests {
         assert_eq!(build_slice_targets(&[], 0), Vec::<Option<usize>>::new());
         // No children: the whole donut is the rest slice — not navigable.
         assert_eq!(build_slice_targets(&[], 100), vec![None]);
+    }
+
+    #[test]
+    fn slice_for_target_finds_the_matching_slice() {
+        let targets = vec![Some(5), None, Some(2)];
+        assert_eq!(slice_for_target(&targets, 5), Some(0), "first slice");
+        assert_eq!(slice_for_target(&targets, 2), Some(2), "last slice");
+        assert_eq!(
+            slice_for_target(&targets, 3),
+            None,
+            "no slice targets this row"
+        );
+    }
+
+    /// The merged rest slice's target is always `None` — never `Some` of
+    /// any row position — so it can never be the slice a hover position
+    /// resolves to. Hovering a row too small to have kept its own slice
+    /// (here, row 1, folded into the rest wedge alongside row 0's
+    /// remainder) must therefore find nothing to emphasize, rather than
+    /// lighting up the wedge it happens to be merged into.
+    #[test]
+    fn slice_for_target_never_resolves_to_the_rest_slice() {
+        let targets = vec![Some(0), None];
+        for position in 0..4 {
+            let found = slice_for_target(&targets, position);
+            assert_ne!(found, Some(1), "slice 1 is the rest slice, target None");
+        }
+        // Row 1 itself (merged into the rest wedge) has no slice of its
+        // own to find.
+        assert_eq!(slice_for_target(&targets, 1), None);
+    }
+
+    #[test]
+    fn hover_roles_matches_fg_and_bg_independently() {
+        let cell = WheelCell {
+            ch: '▀',
+            fg: Some(2),
+            bg: Some(5),
+        };
+        assert_eq!(hover_roles(cell, Some(2)), (true, false), "fg matches");
+        assert_eq!(hover_roles(cell, Some(5)), (false, true), "bg matches");
+        assert_eq!(
+            hover_roles(cell, Some(9)),
+            (false, false),
+            "no slice matches"
+        );
+        assert_eq!(hover_roles(cell, None), (false, false), "nothing hovered");
+        let empty = WheelCell {
+            ch: ' ',
+            fg: None,
+            bg: None,
+        };
+        assert_eq!(hover_roles(empty, Some(0)), (false, false), "unlit cell");
+    }
+
+    /// Sweeping a real composed grid: exactly the cells that actually
+    /// carry the hovered slice (as fg or bg) come back hot, and every
+    /// other cell — including the ones carrying a *different* slice —
+    /// comes back cold in both roles.
+    #[test]
+    fn hover_roles_over_a_composed_grid_hits_only_the_hovered_slice() {
+        let grid = three_slice_grid();
+        let cells = compose_half_blocks(&grid);
+        let mut hot_cells = 0;
+        for row in &cells {
+            for &cell in row {
+                let (fg_hot, bg_hot) = hover_roles(cell, Some(1));
+                assert_eq!(fg_hot, cell.fg == Some(1));
+                assert_eq!(bg_hot, cell.bg == Some(1));
+                if fg_hot || bg_hot {
+                    hot_cells += 1;
+                }
+                // Never hot for a cell that touches slice 1 nowhere.
+                if cell.fg != Some(1) && cell.bg != Some(1) {
+                    assert_eq!((fg_hot, bg_hot), (false, false));
+                }
+            }
+        }
+        assert!(hot_cells > 0, "slice 1 must actually appear in the grid");
     }
 
     #[test]

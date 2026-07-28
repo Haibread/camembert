@@ -473,7 +473,7 @@ requires the mouse:
 | Click a donut slice | open that child directly |
 | Click a breadcrumb segment (header) | jump to that ancestor (like `⌫` repeated) |
 | Click the `errors` metric card | sort by subtree error count (like `e`) |
-| Move the mouse over a row | update the selection card below the table, without moving the keyboard cursor |
+| Move the mouse over a row or a donut slice | update the selection card below the table (without moving the keyboard cursor), underline the matching table row, and brighten the matching wheel slice — whichever of the two you're actually pointing at |
 
 Moving the keyboard cursor reclaims the selection card from the mouse.
 
