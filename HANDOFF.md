@@ -623,6 +623,21 @@ pinned portably by
   survive; deletion, the freeable panel, the confidence verdict and the
   FIEMAP floor line do not. A feature that cannot work is absent from the
   keymap and the help, never present-and-failing.
+- **OPEN, needs a decision: the TUI's `hardlinks` metric card and the
+  flat-view `⛓` column still read the pre-2026-07-27 meaning** (found by
+  adversarial review, 2026-07-27). `--no-ui`'s summary line was made
+  honest — it says "reached by more than one path in this scan" and names
+  `--links` — but the card shows a bare number, and `ViewSnapshot` carries
+  no `link_counts_known`, so it *cannot* qualify itself even if someone
+  wanted it to. On `C:\Windows\System32\drivers` the card reads `0` by
+  default and `728` under `--links` with nothing distinguishing them.
+  Fixing it is two things and only the first is mechanical: thread the
+  flag into `ViewSnapshot` (touches ~10 construction sites), then decide
+  what the card should *say* — which is a wording choice on a user-facing
+  surface, deliberately left to the user rather than picked by an agent.
+  The same question governs the `⛓` column in flat view, where filling it
+  from a live per-file query (landing 3 of the link-count work) would give
+  one glyph two meanings across tree and flat view.
 - **Capability detection keys on the terminal, and an absent `TERM` means
   the opposite thing on Windows** (2026-07-27). `TERM`/`COLORTERM` are a
   Unix convention that no Windows console sets — not `cmd`, not

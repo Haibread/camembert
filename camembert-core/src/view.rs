@@ -143,8 +143,17 @@ pub struct ViewSnapshot {
     /// The viewed directory's own subtree totals.
     pub totals: DirTotals,
     pub stats: ScanStats,
-    /// `nlink > 1` inodes seen so far. When `> 0`, totals are provisional
+    /// Multi-link inodes seen so far. When `> 0`, totals are provisional
     /// (first-seen attribution, D3) until the scan ends.
+    ///
+    /// **Which statement this is depends on the platform and on `--links`**,
+    /// exactly as for [`crate::scan::ScanOutcome::hardlink_inodes`]: inodes
+    /// with more than one link *on the filesystem* wherever a link count
+    /// was obtained (every Unix scan, and Windows under `--links`), and
+    /// inodes reached by more than one path *in this scan* on the Windows
+    /// default, which is a lower bound on the first. A snapshot carries no
+    /// flag distinguishing them, so any surface built on this number cannot
+    /// currently say which one it is showing — see the HANDOFF entry.
     pub hardlink_inodes: u64,
     /// Published on the degraded 250 ms cadence (D5): the UI shows
     /// "updating…".
