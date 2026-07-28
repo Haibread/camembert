@@ -3212,143 +3212,156 @@ fn draw_table(
         .unwrap_or(snapshot.totals.disk);
     let muted = theme.color(theme::MUTED);
     let coral = theme.color(theme::ERROR);
-    let rows = ui.rows_indexed().map(|(index, row)| {
-        let (disk, apparent, items) = match (active_filter, row.dir) {
-            (Some(filter), Some(dir)) => {
-                let totals = filter.result.dir_total(dir);
-                (totals.disk, totals.apparent, totals.entries)
-            }
-            _ => (row.disk, row.apparent, row.items),
-        };
-        #[cfg(unix)]
-        let marked = ui.is_marked(row.node);
-        #[cfg(not(unix))]
-        let marked = false;
-        let mark = if marked {
-            Span::from("*").fg(coral).bold()
-        } else {
-            Span::raw(" ")
-        };
-        let marker = match row.state {
-            RowState::Scanning => Span::from(spinner.to_string()).fg(theme.color(theme::ACCENT)),
-            RowState::Error => Span::from("!").fg(coral).bold(),
-            RowState::Complete | RowState::File if row.errors > 0 => Span::from("!").fg(coral),
-            RowState::Complete | RowState::File => Span::raw(" "),
-        };
-        let frac = if parent_disk > 0 {
-            disk as f64 / parent_disk as f64
-        } else {
-            0.0
-        };
-        let pct = if parent_disk > 0 {
-            format!("{:5.1}", 100.0 * frac)
-        } else {
-            format!("{:>5}", "-")
-        };
-        // Identity color: bar color == name color == wheel slice color.
-        let rank = ranks.get(index).copied().flatten();
-        let identity = rank.map(|rank| theme.identity(rank));
-        // Eased bar fill (design slice 5): the percentage text above
-        // shows the real value immediately, only the bar itself grows in
-        // — `bar_progress` is a uniform 0->1 reveal shared by every row
-        // in the view, restarted on the next navigation/sort.
-        let bar_text = wheel::proportion_bar(frac * bar_progress, BAR_WIDTH, ctx.ascii());
-        let bar_color = identity.unwrap_or(muted);
-        // Freeable phase 2 slice 2 (reservation 2, tui-design.md): split
-        // the *current* eased fill into a bright "floor-exclusive" prefix
-        // and the rest, using whatever `bar_text` actually rendered —
-        // reusing its own filled-cell count via `bright_split` keeps this
-        // in lockstep with the eased reveal instead of fighting it.
-        #[cfg(unix)]
-        let bright_len = {
-            let floor_bytes = ui
-                .floor()
-                .and_then(|(floor, _)| floor_rt::row_floor(floor, row));
-            floor_rt::bright_split(&bar_text, floor_bytes, disk)
-        };
-        // No FIEMAP, no exclusive floor: the bar has no bright prefix to
-        // split off, so every fill renders in the row's own identity color.
-        #[cfg(not(unix))]
-        let bright_len = 0;
-        let bar = if bright_len > 0 {
-            let emphasis = match rank {
-                Some(rank) => theme.identity_emphasis(rank),
-                None => theme.muted_emphasis(),
+    // Two different indices, and conflating them is a bug that stays
+    // invisible under the identity sort: `index` is the row's position in
+    // the *snapshot*, which is what identity colours are assigned in
+    // (`theme::assign_identity`), while `position` is its position in the
+    // *display order* — the space `hover`, `cursor` and every hit test
+    // speak.
+    let rows = ui
+        .rows_indexed()
+        .enumerate()
+        .map(|(position, (index, row))| {
+            let (disk, apparent, items) = match (active_filter, row.dir) {
+                (Some(filter), Some(dir)) => {
+                    let totals = filter.result.dir_total(dir);
+                    (totals.disk, totals.apparent, totals.entries)
+                }
+                _ => (row.disk, row.apparent, row.items),
             };
-            let split = bar_text
-                .char_indices()
-                .nth(bright_len)
-                .map_or(bar_text.len(), |(i, _)| i);
-            let (bright, rest) = bar_text.split_at(split);
-            Cell::from(Line::from(vec![
-                Span::from(bright.to_owned()).style(emphasis),
-                Span::from(rest.to_owned()).fg(bar_color),
-            ]))
-        } else {
-            Cell::from(Span::from(bar_text).fg(bar_color))
-        };
-        let mut name_text = String::from_utf8_lossy(&row.name).into_owned();
-        if row.is_dir {
-            name_text.push('/');
-        }
-        // D3/attack finding 1: a matched hardlink-extra row is present at
-        // 0 bytes (never silently absent) — flagged so the 0 makes sense
-        // instead of reading as "empty"; the pill spells out where the
-        // bytes are actually counted.
-        let is_extra = active_filter.is_some()
-            && !row.is_dir
-            && outcome.is_some_and(|outcome| {
-                outcome
-                    .node(row.node)
-                    .flags()
-                    .contains(NodeFlags::HARDLINK_EXTRA)
-            });
-        if is_extra {
-            name_text.push_str(" \u{26d3}");
-        }
-        let name = if row.is_dir {
-            Span::from(name_text).bold()
-        } else {
-            Span::from(name_text)
-        };
-        // Marked rows tint coral; otherwise the identity color (non-top-N
-        // rows keep the default foreground).
-        let name = if marked {
-            name.fg(coral)
-        } else if let Some(color) = identity {
-            name.fg(color)
-        } else {
-            name
-        };
-        let mut cells = vec![
-            Cell::from(mark),
-            Cell::from(marker),
-            Cell::from(format!("{:>9}", HumanSize(disk).to_string())),
-        ];
-        if ui.show_apparent {
-            cells.push(Cell::from(format!(
-                "{:>9}",
-                HumanSize(apparent).to_string()
-            )));
-        }
-        cells.extend([
-            Cell::from(pct),
-            bar,
-            Cell::from(format!("{:>8}", items)),
-            Cell::from(name),
-        ]);
-        let table_row = TableRow::new(cells);
-        // The other half of the wheel↔table link: hovering a slice already
-        // drives the selection card, and marking its row here is what lets
-        // the eye travel from the disc to the listing without hunting for a
-        // colour match. Distinct from the cursor by construction — see
-        // `Theme::hover_style`.
-        if ui.hover() == Some(index) {
-            table_row.style(theme.hover_style())
-        } else {
-            table_row
-        }
-    });
+            #[cfg(unix)]
+            let marked = ui.is_marked(row.node);
+            #[cfg(not(unix))]
+            let marked = false;
+            let mark = if marked {
+                Span::from("*").fg(coral).bold()
+            } else {
+                Span::raw(" ")
+            };
+            let marker = match row.state {
+                RowState::Scanning => {
+                    Span::from(spinner.to_string()).fg(theme.color(theme::ACCENT))
+                }
+                RowState::Error => Span::from("!").fg(coral).bold(),
+                RowState::Complete | RowState::File if row.errors > 0 => Span::from("!").fg(coral),
+                RowState::Complete | RowState::File => Span::raw(" "),
+            };
+            let frac = if parent_disk > 0 {
+                disk as f64 / parent_disk as f64
+            } else {
+                0.0
+            };
+            let pct = if parent_disk > 0 {
+                format!("{:5.1}", 100.0 * frac)
+            } else {
+                format!("{:>5}", "-")
+            };
+            // Identity color: bar color == name color == wheel slice color.
+            let rank = ranks.get(index).copied().flatten();
+            let identity = rank.map(|rank| theme.identity(rank));
+            // Eased bar fill (design slice 5): the percentage text above
+            // shows the real value immediately, only the bar itself grows in
+            // — `bar_progress` is a uniform 0->1 reveal shared by every row
+            // in the view, restarted on the next navigation/sort.
+            let bar_text = wheel::proportion_bar(frac * bar_progress, BAR_WIDTH, ctx.ascii());
+            let bar_color = identity.unwrap_or(muted);
+            // Freeable phase 2 slice 2 (reservation 2, tui-design.md): split
+            // the *current* eased fill into a bright "floor-exclusive" prefix
+            // and the rest, using whatever `bar_text` actually rendered —
+            // reusing its own filled-cell count via `bright_split` keeps this
+            // in lockstep with the eased reveal instead of fighting it.
+            #[cfg(unix)]
+            let bright_len = {
+                let floor_bytes = ui
+                    .floor()
+                    .and_then(|(floor, _)| floor_rt::row_floor(floor, row));
+                floor_rt::bright_split(&bar_text, floor_bytes, disk)
+            };
+            // No FIEMAP, no exclusive floor: the bar has no bright prefix to
+            // split off, so every fill renders in the row's own identity color.
+            #[cfg(not(unix))]
+            let bright_len = 0;
+            let bar = if bright_len > 0 {
+                let emphasis = match rank {
+                    Some(rank) => theme.identity_emphasis(rank),
+                    None => theme.muted_emphasis(),
+                };
+                let split = bar_text
+                    .char_indices()
+                    .nth(bright_len)
+                    .map_or(bar_text.len(), |(i, _)| i);
+                let (bright, rest) = bar_text.split_at(split);
+                Cell::from(Line::from(vec![
+                    Span::from(bright.to_owned()).style(emphasis),
+                    Span::from(rest.to_owned()).fg(bar_color),
+                ]))
+            } else {
+                Cell::from(Span::from(bar_text).fg(bar_color))
+            };
+            let mut name_text = String::from_utf8_lossy(&row.name).into_owned();
+            if row.is_dir {
+                name_text.push('/');
+            }
+            // D3/attack finding 1: a matched hardlink-extra row is present at
+            // 0 bytes (never silently absent) — flagged so the 0 makes sense
+            // instead of reading as "empty"; the pill spells out where the
+            // bytes are actually counted.
+            let is_extra = active_filter.is_some()
+                && !row.is_dir
+                && outcome.is_some_and(|outcome| {
+                    outcome
+                        .node(row.node)
+                        .flags()
+                        .contains(NodeFlags::HARDLINK_EXTRA)
+                });
+            if is_extra {
+                name_text.push_str(" \u{26d3}");
+            }
+            let name = if row.is_dir {
+                Span::from(name_text).bold()
+            } else {
+                Span::from(name_text)
+            };
+            // Marked rows tint coral; otherwise the identity color (non-top-N
+            // rows keep the default foreground).
+            let name = if marked {
+                name.fg(coral)
+            } else if let Some(color) = identity {
+                name.fg(color)
+            } else {
+                name
+            };
+            let mut cells = vec![
+                Cell::from(mark),
+                Cell::from(marker),
+                Cell::from(format!("{:>9}", HumanSize(disk).to_string())),
+            ];
+            if ui.show_apparent {
+                cells.push(Cell::from(format!(
+                    "{:>9}",
+                    HumanSize(apparent).to_string()
+                )));
+            }
+            cells.extend([
+                Cell::from(pct),
+                bar,
+                Cell::from(format!("{:>8}", items)),
+                Cell::from(name),
+            ]);
+            let table_row = TableRow::new(cells);
+            // The other half of the wheel↔table link: hovering a slice already
+            // drives the selection card, and marking its row here is what lets
+            // the eye travel from the disc to the listing without hunting for a
+            // colour match. Distinct from the cursor by construction — see
+            // `Theme::hover_style`.
+            // Compared against `position`, never `index`: hover lives in
+            // display order.
+            if ui.hover() == Some(position) {
+                table_row.style(theme.hover_style())
+            } else {
+                table_row
+            }
+        });
     let table = Table::new(rows, widths)
         .header(
             TableRow::new(header_cells).style(
@@ -5244,6 +5257,114 @@ mod tests {
 
         handle_hover(11, 3, &mut ui);
         assert_eq!(ui.hover(), None, "an unlit wheel cell hovers nothing");
+    }
+
+    /// The hover highlight must land on the row the pointer is over, which
+    /// means comparing *display* positions — the space `hover` and every
+    /// hit test live in — and never snapshot indices, the space identity
+    /// colours live in. The two coincide under the identity sort, so this
+    /// fixture is deliberately built in **ascending** size: the default
+    /// disk-descending order reverses it, and comparing the wrong index
+    /// then underlines a different row than the one the card names. That
+    /// is exactly the bug this shipped with.
+    #[test]
+    fn the_hover_highlight_lands_on_the_hovered_row_under_a_sort() {
+        let row = |name: &[u8], disk: u64| Row {
+            name: name.into(),
+            node: NodeId::from_raw(0),
+            dir: None,
+            is_dir: false,
+            apparent: disk,
+            disk,
+            items: 1,
+            errors: 0,
+            state: RowState::File,
+            error_reason: None,
+            mtime: 1_000_000,
+        };
+        let snapshot = Arc::new(ViewSnapshot {
+            generation: 1,
+            dir: DirId::from_raw(0),
+            parent: None,
+            path: PathBuf::from("/scan/root"),
+            rows: vec![
+                row(b"smallest", 10),
+                row(b"middling", 200),
+                row(b"largest", 4000),
+            ],
+            totals: DirTotals {
+                apparent: 4210,
+                disk: 4210,
+                items: 3,
+                errors: 0,
+            },
+            stats: ScanStats {
+                entries: 3,
+                dirs: 0,
+                errors: 0,
+                disk_bytes: 4210,
+                elapsed: Duration::from_millis(1),
+                root_complete: true,
+            },
+            hardlink_inodes: 0,
+            degraded: false,
+        });
+
+        let mut ui = UiState::new(snapshot);
+        // Display position 0 is `largest` once sorted; snapshot index 0 is
+        // `smallest`. Confusing the two shows up right here.
+        assert_eq!(&*ui.card_row().unwrap().name, b"largest");
+        ui.set_hover(0);
+
+        let ctx = ctx(GlyphLevel::HalfBlock, ColorLevel::Truecolor);
+        let mut table_state = TableState::default();
+        let mut motion = no_motion();
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw(
+                    frame,
+                    &ui,
+                    &Phase::Transitioning,
+                    &mut table_state,
+                    '⠋',
+                    None,
+                    &[],
+                    &mut motion,
+                    &ctx,
+                    false,
+                    &[],
+                    None,
+                );
+            })
+            .unwrap();
+
+        // Underlined data rows, found by name (the header is underlined
+        // too, which is why this filters rather than taking the only one).
+        let buffer = terminal.backend().buffer();
+        let underlined: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .filter(|&x| {
+                        buffer[(x, y)]
+                            .modifier
+                            .contains(ratatui::style::Modifier::UNDERLINED)
+                    })
+                    .map(|x| buffer[(x, y)].symbol().to_owned())
+                    .collect::<String>()
+            })
+            .filter(|line| line.contains("largest") || line.contains("smallest"))
+            .collect();
+        assert_eq!(
+            underlined.len(),
+            1,
+            "exactly one data row is highlighted: {underlined:?}"
+        );
+        assert!(
+            underlined[0].contains("largest"),
+            "the highlighted row must be the one the card names, not the \
+             row sharing its snapshot index: {underlined:?}"
+        );
     }
 
     #[test]
