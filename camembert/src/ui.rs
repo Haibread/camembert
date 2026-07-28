@@ -5140,6 +5140,110 @@ mod tests {
         }
     }
 
+    /// Extends [`draw_never_panics_across_sizes_and_caps`] with the specific
+    /// degenerate shapes an adversarial review should try and the previous
+    /// matrix did not exercise: a sliver terminal narrower than any panel
+    /// (2x40, tall and thin rather than the square-ish sizes above), a
+    /// snapshot with zero rows (nothing to select, nothing to hover), a
+    /// snapshot with exactly one row, a name long enough to blow through
+    /// every column/abbreviation budget (500 chars, well past `MAX_PATH`
+    /// and past any bar/table width), and a mouse hover set past the end of
+    /// the row count — `UiState::set_hover` takes any `usize` unchecked, so
+    /// nothing but `Vec::get`'s own bounds-checking stands between a stale
+    /// or adversarial hover position and an out-of-bounds read.
+    #[test]
+    fn draw_never_panics_at_degenerate_row_counts_and_hover_positions() {
+        let rungs = [
+            (GlyphLevel::Sextant, ColorLevel::Truecolor),
+            (GlyphLevel::Ascii, ColorLevel::Mono),
+        ];
+        let row = |name: &[u8], disk: u64| Row {
+            name: name.into(),
+            node: NodeId::from_raw(0),
+            dir: None,
+            is_dir: false,
+            apparent: disk,
+            disk,
+            items: 1,
+            errors: 0,
+            state: RowState::File,
+            error_reason: None,
+            mtime: 1_000_000,
+        };
+        let snapshot_with = |rows: Vec<Row>| {
+            let total_disk: u64 = rows.iter().map(|r| r.disk).sum();
+            Arc::new(ViewSnapshot {
+                generation: 1,
+                dir: DirId::from_raw(0),
+                parent: None,
+                path: PathBuf::from("/scan/root"),
+                rows,
+                totals: DirTotals {
+                    apparent: total_disk,
+                    disk: total_disk,
+                    items: 1,
+                    errors: 0,
+                },
+                stats: ScanStats {
+                    entries: 1,
+                    dirs: 0,
+                    errors: 0,
+                    disk_bytes: total_disk,
+                    elapsed: Duration::from_millis(1),
+                    root_complete: true,
+                },
+                hardlink_inodes: 0,
+                degraded: false,
+            })
+        };
+        let long_name: Vec<u8> = vec![b'x'; 500];
+        let fixtures: Vec<(&str, Arc<ViewSnapshot>)> = vec![
+            ("zero rows", snapshot_with(Vec::new())),
+            ("one row", snapshot_with(vec![row(b"solo", 100)])),
+            (
+                "a 500-char name",
+                snapshot_with(vec![row(&long_name, 100), row(b"normal", 50)]),
+            ),
+        ];
+        for (label, snapshot) in fixtures {
+            for (glyphs, color) in rungs {
+                let ctx = ctx(glyphs, color);
+                let mut ui = UiState::new(Arc::clone(&snapshot));
+                // Force a hover well past the end of the row count —
+                // `set_hover` performs no bounds check itself, so this is
+                // exactly the state a stale hover (or a hostile caller)
+                // could leave behind; only render-time `.get()` calls stand
+                // between this and an out-of-bounds panic.
+                ui.set_hover(9999);
+                let mut table_state = TableState::default();
+                let mut motion = no_motion();
+                for (width, height) in [(120, 35), (2, 40), (1, 1)] {
+                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    terminal
+                        .draw(|frame| {
+                            draw(
+                                frame,
+                                &ui,
+                                &Phase::Transitioning,
+                                &mut table_state,
+                                '⠋',
+                                None,
+                                &[],
+                                &mut motion,
+                                &ctx,
+                                false,
+                                &[],
+                                None,
+                            );
+                        })
+                        .unwrap_or_else(|err| {
+                            panic!("{label} at {width}x{height} ({glyphs:?}/{color:?}): {err}")
+                        });
+                }
+            }
+        }
+    }
+
     /// D3: the flat top-files and breakdown tables (and their donut)
     /// render without panicking at every size/capability rung, both with
     /// a populated summary and with none at all yet (mode entered before
