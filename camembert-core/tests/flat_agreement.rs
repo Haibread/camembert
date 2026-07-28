@@ -248,15 +248,28 @@ fn accumulator_and_fold_agree_when_a_directory_index_is_not_resident() {
     // The fixture must actually force the correction, or it measures
     // nothing — which is the flaw it exists to close. Every scanned
     // directory below the root has to report a real self-size.
-    for child in outcome.children_of(outcome.root()) {
-        if outcome.tree().dir_of(child).is_some() {
-            assert_ne!(
-                outcome.node(child).size().real,
-                0,
-                "{:?} reports no index bytes: the fixture can no longer tell \
-                 the corrected answer from the listing's zero",
-                String::from_utf8_lossy(outcome.name_of(child))
-            );
+    //
+    // Windows-only, because that is the only platform where the assertion
+    // means anything. The correction it guards exists to reconcile a
+    // listing's resident-index zero with the by-handle figure, and only
+    // Windows has that gap; on Unix `statx` answers correctly in the call
+    // the scan already makes (see this test's doc comment). Worse, on Unix
+    // the property is not even an invariant: btrfs keeps directory entries
+    // in metadata B-trees and reports zero allocated blocks for a directory
+    // however many names it holds, so this fired on every btrfs machine
+    // while passing in CI's ext4. The agreement assertions below — what the
+    // test is *for* — run everywhere regardless.
+    if cfg!(windows) {
+        for child in outcome.children_of(outcome.root()) {
+            if outcome.tree().dir_of(child).is_some() {
+                assert_ne!(
+                    outcome.node(child).size().real,
+                    0,
+                    "{:?} reports no index bytes: the fixture can no longer tell \
+                     the corrected answer from the listing's zero",
+                    String::from_utf8_lossy(outcome.name_of(child))
+                );
+            }
         }
     }
 

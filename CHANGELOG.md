@@ -70,6 +70,16 @@ one is called out under **Breaking** with the migration to apply.
 
 ### Fixed
 
+- **The test suite is green on btrfs again.** Two directory-index
+  fixtures asserted their own potency ("this directory reports allocated
+  index bytes, so the test can tell the corrected answer from the
+  listing's zero") on every platform. That is a Windows property: the
+  correction it guards reconciles a listing's resident-index zero with
+  the by-handle figure, a gap only Windows has, and on Unix "a directory
+  has allocated blocks" is not an invariant at all — btrfs keeps
+  directory entries in metadata B-trees and reports zero for any
+  directory. The guards are now Windows-only; the agreement assertions
+  the tests exist for still run everywhere.
 - **`camembert diff` no longer renders a Unix path with a backslash
   separator** when the dump's root is a *relative* directory whose own name
   contains one (`camembert 'back\slash' -o dump.cmbt`). The join picked the

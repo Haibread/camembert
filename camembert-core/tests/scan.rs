@@ -243,11 +243,22 @@ fn directory_size_does_not_depend_on_being_the_scan_root() {
         child_own, root_own,
         "the same directory reports different sizes as a child and as a root"
     );
-    assert_ne!(
-        root_own.real, 0,
-        "the fixture is meant to force a non-resident directory index; a zero here \
-         means the test can no longer tell the two answers apart"
-    );
+    // Windows-only: a non-resident index is what makes the two answers
+    // differ *there* (a listing reports 0 for a subdirectory entry, the
+    // by-handle figure does not), so that is where a zero would mean the
+    // fixture proves nothing. On Unix `statx` returns the same size whether
+    // the directory is the scan root or a child, which is what the equality
+    // above checks, and "a directory has allocated blocks" is not an
+    // invariant at all: btrfs stores directory entries in metadata B-trees
+    // and reports zero for any directory, so this failed on btrfs while
+    // passing in CI's ext4.
+    if cfg!(windows) {
+        assert_ne!(
+            root_own.real, 0,
+            "the fixture is meant to force a non-resident directory index; a zero here \
+             means the test can no longer tell the two answers apart"
+        );
+    }
 
     // And the subtree the parent attributes to it is the subtree it claims
     // for itself — the same property one level up, where the correction has

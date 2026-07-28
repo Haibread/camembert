@@ -20,12 +20,9 @@ ours. The AUR is what makes `yay -S camembert` work today.
 - **A `check()`-able test suite** — extent-dependent tests guard-skip on
   filesystems without extents, and the statx engine falls back to synchronous
   `statx` when io_uring is unavailable, so the suite passes in a clean chroot.
-  **Currently untrue on btrfs**: two directory-index tests added with the
-  Windows landings assume a filesystem where a directory has non-zero
-  allocated index bytes, which btrfs does not report, so `makepkg` fails in
-  `check()` there (see HANDOFF.md's known limitations). Build with
-  `--nocheck` on a btrfs machine until they are fixed — and do not publish a
-  release whose `check()` was skipped without running the suite elsewhere.
+  The directory-index fixtures added with the Windows landings assert their
+  own potency only on Windows, so btrfs — which allocates no blocks to a
+  directory — does not fail `check()` either.
 
 ## Per-release update
 
