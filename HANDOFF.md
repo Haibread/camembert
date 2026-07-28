@@ -623,6 +623,34 @@ pinned portably by
   survive; deletion, the freeable panel, the confidence verdict and the
   FIEMAP floor line do not. A feature that cannot work is absent from the
   keymap and the help, never present-and-failing.
+- **OPEN, needs a decision: `--links` degrades totals where the query is
+  unsupported, and only the *reporting* half is fixed** (adversarial
+  review, 2026-07-28). On an SMB path `NtQueryInformationByName` answers
+  `STATUS_NOT_SUPPORTED`; the lookup latches off, every later entry falls
+  back to `nlink = 1`, and 1 is the value that keeps an entry out of the
+  registry. Measured on one file with two links inside the scan root:
+  default 100.0 KiB / 1 hardlinked inode, `--links` **200.0 KiB / 0** —
+  and diffing the two dumps of the same instant shows a phantom +100 KiB.
+  `link_counts_known` now narrows to `false` in that case (`43ba9ac`) and
+  the false "totals are identical either way" claim is retracted from
+  `--help` and spec §8.1 (`f2c8c66`), so the scan no longer *lies* about
+  it — but the totals still differ. The real fix is to fall back to
+  `LinkPolicy::FileIdRepeat` when the latch flips, which means changing
+  policy mid-scan; that is a design change, hence open.
+- **OPEN: the ncdu importer fabricates `l: 2`** (same review). An ncdu 1.x
+  export with `hlnkc: true` and no `nlink` (ncdu < 1.16, and gdu) is
+  imported as `nlink: 2` (`ncdu.rs`, `info.nlink.unwrap_or(2)`) and
+  `from_tree` hardcodes `link_counts_known: true`, so the dump carries an
+  `l` no source ever stated — the exact thing `f165d9c` forbade for scans.
+  Fix is small (`NLINK_UNDETERMINED` + gate `l` on `nlink > 1`), but it
+  changes bytes on the wire, so it is the user's call.
+- **Noted, cosmetic:** a bare-drive or trailing-separator root emits a
+  doubled separator in the dump (`"root":"X:/"` then `"path":"X://sub"`),
+  same shape as a Linux scan of `/` producing `//etc` — pre-existing in
+  kind, and self-diffs are still zero because `rel` is computed per side.
+  And `camembert diff` prints Windows paths with forward slashes, the
+  interchange separator leaking into human output; the renderer could map
+  back, the format should not change.
 - **OPEN, needs a decision: the TUI's `hardlinks` metric card and the
   flat-view `⛓` column still read the pre-2026-07-27 meaning** (found by
   adversarial review, 2026-07-27). `--no-ui`'s summary line was made
