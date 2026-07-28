@@ -195,6 +195,91 @@ fn accumulator_and_fold_agree_on_the_frozen_tree() {
     assert!(!post.truncated);
 }
 
+/// The same agreement, on a tree where a directory's own size is **not**
+/// what the listing that discovered it reported.
+///
+/// The fixture above cannot see that case. Its directories hold three to
+/// five short names, NTFS keeps an index that small resident inside the MFT
+/// record, and a Windows listing reports `AllocationSize = EndOfFile = 0`
+/// for a subdirectory entry either way — so the by-handle figure is 0 too,
+/// `Owner::correct_dir_own_size` short-circuits on a zero delta, and
+/// `Accumulator::add_dir_bytes` — the line that exists precisely to keep
+/// these two engines in step across that correction — is never called.
+/// Deleting it leaves the whole suite green.
+///
+/// Many long names force a non-resident index, in two directories that land
+/// in **different buckets**: `node_modules/` starts its own pattern group
+/// while its parent (the scan root) is uncovered, so a correction charged
+/// to the parent's coverage rather than to the directory's own would sink
+/// into `rest`; `plain/` is uncovered and belongs in `rest`. Both halves of
+/// a mis-bucketed delta are therefore visible.
+///
+/// Portable and meaningful on Unix as well — `statx` gives a directory its
+/// real size in the call the scan already makes, so there the correction
+/// never fires and the test can only pass. It is Windows it is written for.
+#[test]
+fn accumulator_and_fold_agree_when_a_directory_index_is_not_resident() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    for dir in ["node_modules", "plain"] {
+        let d = root.join(dir);
+        fs::create_dir(&d).unwrap();
+        for i in 0..300 {
+            fs::write(
+                d.join(format!("entry-with-a-fairly-long-name-{i:04}.txt")),
+                b"x",
+            )
+            .unwrap();
+        }
+    }
+
+    let patterns = PatternSet::presets();
+    let cap = 1000;
+    let outcome = Scanner::new(ScanOptions::default())
+        .with_flat(FlatConfig {
+            patterns: PatternSet::presets(),
+            cap,
+        })
+        .scan_live(root)
+        .join()
+        .unwrap();
+    assert!(!outcome.cancelled);
+
+    // The fixture must actually force the correction, or it measures
+    // nothing — which is the flaw it exists to close. Every scanned
+    // directory below the root has to report a real self-size.
+    for child in outcome.children_of(outcome.root()) {
+        if outcome.tree().dir_of(child).is_some() {
+            assert_ne!(
+                outcome.node(child).size().real,
+                0,
+                "{:?} reports no index bytes: the fixture can no longer tell \
+                 the corrected answer from the listing's zero",
+                String::from_utf8_lossy(outcome.name_of(child))
+            );
+        }
+    }
+
+    let accumulated = outcome
+        .flat_provisional()
+        .expect("flat view was enabled")
+        .clone();
+    let frozen = flat::fold(outcome.tree(), &patterns, cap, 0);
+    assert_eq!(
+        accumulated.groups, frozen.groups,
+        "group totals diverge across the directory-index correction"
+    );
+    assert_eq!(
+        accumulated.rest, frozen.rest,
+        "rest diverges across the directory-index correction"
+    );
+    assert_eq!(accumulated.top_files, frozen.top_files, "top-N diverges");
+
+    // And the partition still covers the whole tree.
+    let total: u64 = frozen.groups.iter().map(|g| g.disk).sum::<u64>() + frozen.rest.disk;
+    assert_eq!(total, outcome.tree().dir(outcome.root()).td);
+}
+
 #[test]
 fn fold_without_patterns_is_all_rest() {
     let tmp = tempfile::tempdir().unwrap();
