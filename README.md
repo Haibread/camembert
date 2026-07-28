@@ -187,10 +187,13 @@ footer never names them:
   ambient exclusive floor — no confidence verdict, no `excl ≥ …` card line,
   no bright in-bar segment. Both need `FS_IOC_FIEMAP`, a Linux-only ioctl.
 
-`--no-proc-sweep`/`NO_PROC_SWEEP` and `--no-fiemap`/`NO_FIEMAP` are
-therefore accepted but inert on Windows: there is nothing left to switch
-off. `--links`/`LINKS` runs the other way — it is accepted everywhere and
-inert *off* Windows, where link counts arrive inside `statx` for free (see
+`--no-fiemap`/`NO_FIEMAP` is therefore accepted but inert on Windows: there
+is nothing left to switch off. `--no-proc-sweep`/`NO_PROC_SWEEP` **does**
+mean something there — it is the same request ("do not go looking at what
+other processes have open") answered by a different mechanism, and it
+switches off [the open-file advisory](#who-has-this-file-open-windows).
+`--links`/`LINKS` runs the other way — it is accepted everywhere and inert
+*off* Windows, where link counts arrive inside `statx` for free (see
 [Hardlinks on Windows](#hardlinks-on-windows-and---links)).
 
 ### The Recycle Bin meter (Windows)
@@ -238,6 +241,49 @@ Scope and limits, in the same spirit:
 - **No key, no panel, no flag.** There is one number and one sentence about
   it; a modal would be ceremony. `?`, the palette and the keymap are
   unchanged.
+
+### Who has this file open? (Windows)
+
+*Windows only. Switched off by `--no-proc-sweep`/`NO_PROC_SWEEP`.*
+
+Put the cursor on a file, leave it there a moment, and the selection card
+answers who is holding it — via the **Restart Manager**, the same mechanism
+Windows installers use to work out what they need to close. It runs
+unelevated and off the UI thread, and it never shuts anything down:
+camembert calls `RmGetList` and nothing else.
+
+Its coverage is *better* than the Linux `/proc` sweep's in the direction
+that matters most for a shared machine: `C:\Windows\System32\svchost.exe`
+enumerates 104 distinct services running as SYSTEM, LOCAL SERVICE and
+NETWORK SERVICE, from an ordinary shell. `/proc` on a desktop can read
+about 28% of processes.
+
+Three answers, kept apart on purpose:
+
+| what the card says | what it means |
+| --- | --- |
+| `open in Code.exe (12345)` | it found that holder. Believe it. |
+| `open in 104 processes · svc0 (900), svc1 (901), +102 more` | a crowd — a couple named, the rest counted exactly |
+| `no holder found · not proof — many real locks stay invisible` | it found nobody, **which is not a clean bill of health** |
+| `open handles unknown · …` | it refused to answer, with the reason |
+
+**Why the negative is worded that way, with the measurement.** Over a live
+Firefox profile (11 processes running), the files that genuinely refused an
+open-for-delete were put through this check: **13 of 47 named a holder; 34
+came back empty.** In the other direction it was perfect — **0 of 60**
+files that opened cleanly reported a holder. So it is a *positive*
+predictor and not a negative one, and the empty answer says "not proof" in
+as many words rather than implying safety. `ntfs.sys` is the extreme case:
+held by the kernel, reported as unheld.
+
+**Cost, and the brake it forces.** One `RmGetList` is ~50 ms (and ~435 ms
+for the first one in a process, while the `RmSvc` service warms up) —
+three orders of magnitude more than the link-count query on the line
+above. So a row must sit still under the cursor for **250 ms** before
+anything is asked. Scrolling through a directory costs nothing; stopping to
+read a row costs one query, memoised. Directories are never asked about
+(the Restart Manager registers files), and nothing runs until the scan has
+finished.
 
 **Numbers differ in ways worth knowing before trusting one:**
 
@@ -396,7 +442,7 @@ schema.
 | `--color` | `COLOR` | `auto`/`always`/`never` |
 | `--theme` | `THEME` | `tokyo-night`/`light`/`high-contrast` |
 | `--no-motion` | `NO_MOTION` | disable bar/donut easing animations |
-| `--no-proc-sweep` | `NO_PROC_SWEEP` | disable the freeable `/proc` sweep (gauge suffix, `f` panel, toast, pre-deletion open-file check) |
+| `--no-proc-sweep` | `NO_PROC_SWEEP` | disable looking at what other processes have open: on Linux the freeable `/proc` sweep (gauge suffix, `f` panel, toast, pre-deletion open-file check), on Windows the selection card's [Restart Manager advisory](#who-has-this-file-open-windows) |
 | `--no-fiemap` | `NO_FIEMAP` | disable the freeable-2 selection oracle (mark-time reclaim estimate) and the ambient exclusive floor (in-bar bright segment, card figure) — see [Reclaim oracle](#reclaim-oracle-freeable-phase-2) |
 | `--log-filter` | `LOG_FILTER` | `tracing` filter directive |
 | `--log-file` | `LOG_FILE` | write diagnostics to a file instead of discarding them |

@@ -41,3 +41,8 @@ pub mod wtf8;
 // the TUI's lazy lookup at the point of consumption, share one wrapper.
 #[cfg(windows)]
 pub mod winlink;
+// The Restart Manager: "who has this file open", which is the question the
+// `/proc` sweep answers on Linux. Read-only — `RmShutdown`/`RmRestart` are
+// deliberately not imported.
+#[cfg(windows)]
+pub mod winrm;

@@ -46,6 +46,8 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_Security",
     "Win32_Storage_FileSystem",
     "Win32_System_IO",
+    # The Restart Manager (winrm.rs) — the open-file advisory, read-only.
+    "Win32_System_RestartManager",
     "Win32_System_SystemServices",
     # `SHQueryRecycleBinW` (recycle.rs) — the one shell entry point in the
     # crate, and read-only.

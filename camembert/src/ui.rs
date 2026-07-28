@@ -58,6 +58,10 @@ mod fmt;
 #[cfg(unix)]
 mod freeable_panel;
 mod history;
+// Windows' open-file advisory: the Restart Manager standing in for the
+// `/proc` sweep freeable phase 1 uses, at the point of consumption.
+#[cfg(windows)]
+mod holders_rt;
 mod keymap;
 // The Windows selection card's link-count lookup: the one piece of
 // hardlink honesty the scan stopped paying for per file, bought back where
@@ -634,6 +638,13 @@ fn event_loop(
     // has no `Reclaim` fields to sit beside.
     #[cfg(windows)]
     let mut recycle_rx: Option<Receiver<camembert_core::recycle::BinStatus>> = None;
+    // The Windows open-file advisory (`holders_rt`): freeable D6's contract
+    // with the Restart Manager in place of `/proc`, and a debounce in front
+    // of it because one `RmGetList` is ~50 ms rather than ~46 µs.
+    // `--no-proc-sweep`/`NO_PROC_SWEEP` switches it off — the same flag,
+    // for the same reason, on the other platform.
+    #[cfg(windows)]
+    let mut holders = holders_rt::HolderRuntime::new(!ctx.no_proc_sweep);
 
     loop {
         // 1. Input (drain everything pending; block at most one frame
@@ -650,7 +661,7 @@ fn event_loop(
         // A link-count query is in flight: the card owes the answer within a
         // frame or two of it landing, so the loop cannot go back to sleep.
         #[cfg(windows)]
-        if links.has_pending() || recycle_rx.is_some() {
+        if links.has_pending() || holders.has_pending() || recycle_rx.is_some() {
             deadline = FRAME;
         }
         while event::poll(deadline)? {
@@ -933,6 +944,20 @@ fn event_loop(
                 _ => None,
             };
             ui.set_link_state(state);
+
+            // 3.7. And who holds it open (`holders_rt`). Same target row,
+            // same post-scan-only rule, but debounced: `state_for` only
+            // spawns once the cursor has rested on the row, so scrolling
+            // costs nothing.
+            holders.poll(ui.flat_epoch());
+            let now = Instant::now();
+            let held = match (&phase, target) {
+                (Phase::Done(lock), Some(node)) => {
+                    holders.state_for(lock, node, ui.flat_epoch(), now)
+                }
+                _ => None,
+            };
+            ui.set_holder_state(held);
         }
 
         // 4. Render.
@@ -2779,7 +2804,14 @@ fn draw(
         _ => Vec::new(),
     };
     #[cfg(windows)]
-    let card_extra: Vec<String> = nlink_rt::card_lines(ui.link_state(), spinner);
+    let card_extra: Vec<String> = {
+        // Two independent answers about the same row, each one line and
+        // each present-or-absent on its own: how many links this file has,
+        // and who is holding it open.
+        let mut lines = nlink_rt::card_lines(ui.link_state(), spinner);
+        lines.extend(holders_rt::card_lines(ui.holder_state(), spinner));
+        lines
+    };
     // Neither feature exists, so the card keeps its base height.
     #[cfg(not(any(unix, windows)))]
     let card_extra: Vec<String> = Vec::new();
@@ -6133,6 +6165,116 @@ mod tests {
             let mut rt = LinkRuntime::new();
             assert_eq!(rt.state_for(&lock, node, 0), None);
             assert!(nlink_rt::card_lines(None, '⠋').is_empty());
+        }
+
+        /// The open-file advisory, driven end to end through the same
+        /// machinery: a real scan, a real Restart Manager session from
+        /// `holders_rt`'s job thread, and the real dashboard.
+        ///
+        /// The two cases are the two the advisory exists to tell apart —
+        /// and the *negative* one is the load-bearing assertion, because
+        /// `ntfs.sys` reports zero holders while the kernel is holding it.
+        /// An empty answer that did not say so would read as a guarantee.
+        mod holders {
+            use super::*;
+            use crate::ui::holders_rt::{HolderRuntime, HolderState};
+
+            fn resolve_holders(
+                rt: &mut HolderRuntime,
+                lock: &Arc<RwLock<ScanOutcome>>,
+                node: NodeId,
+            ) -> Option<HolderState> {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                loop {
+                    rt.poll(0);
+                    // A `now` far past the debounce: this test is about the
+                    // answer, and `holders_rt`'s own tests cover the brake.
+                    let state =
+                        rt.state_for(lock, node, 0, Instant::now() + Duration::from_secs(1));
+                    if state != Some(HolderState::Pending) {
+                        return state;
+                    }
+                    assert!(Instant::now() < deadline, "the holder query never landed");
+                    thread::sleep(Duration::from_millis(20));
+                }
+            }
+
+            #[test]
+            fn the_card_names_a_holder_and_qualifies_an_empty_answer() {
+                use std::os::windows::fs::OpenOptionsExt;
+
+                let tmp = tempfile::tempdir().expect("tempdir");
+                // Distinct sizes so the disk-descending default sort makes
+                // `focus` unambiguous.
+                std::fs::write(tmp.path().join("held.bin"), vec![b'a'; 40_960]).expect("write");
+                std::fs::write(tmp.path().join("loose.bin"), vec![b'b'; 20_480]).expect("write");
+                // Shared for read only: the share mode a holder must grant
+                // for a delete to even be attempted (delete dossier §3.2).
+                let _handle = std::fs::File::options()
+                    .read(true)
+                    .share_mode(windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ)
+                    .open(tmp.path().join("held.bin"))
+                    .expect("hold the file open");
+
+                let (mut ui, lock) = done_ui(tmp.path());
+                let phase = Phase::Done(Arc::clone(&lock));
+                let mut rt = HolderRuntime::new(true);
+
+                focus(&mut ui, b"held.bin");
+                let node = ui.card_row().expect("a focused row").node;
+                let state = resolve_holders(&mut rt, &lock, node);
+                ui.set_holder_state(state);
+                let card = card_block(&render_lines(&ui, &phase));
+                println!("--- held.bin ---\n{card}\n");
+                assert!(
+                    card.contains("open in "),
+                    "the holder was not named on the card:\n{card}"
+                );
+                assert!(
+                    card.contains(&format!("({})", std::process::id())),
+                    "the holder is this very process:\n{card}"
+                );
+
+                focus(&mut ui, b"loose.bin");
+                let node = ui.card_row().expect("a focused row").node;
+                let state = resolve_holders(&mut rt, &lock, node);
+                ui.set_holder_state(state);
+                let card = card_block(&render_lines(&ui, &phase));
+                println!("--- loose.bin ---\n{card}\n");
+                assert!(
+                    card.contains("not proof"),
+                    "an empty answer must refuse to be read as a guarantee:\n{card}"
+                );
+            }
+
+            /// `--no-proc-sweep` means no query *and no line*. An empty
+            /// line would claim a coverage the user just switched off.
+            #[test]
+            fn no_proc_sweep_removes_the_line_entirely() {
+                let tmp = tempfile::tempdir().expect("tempdir");
+                std::fs::write(tmp.path().join("x.bin"), vec![b'x'; 4096]).expect("write");
+                let (mut ui, lock) = done_ui(tmp.path());
+                focus(&mut ui, b"x.bin");
+                let node = ui.card_row().expect("a focused row").node;
+
+                let mut off = HolderRuntime::new(false);
+                assert_eq!(off.state_for(&lock, node, 0, Instant::now()), None);
+                assert!(holders_rt::card_lines(None, '⠋').is_empty());
+            }
+
+            /// A directory row gets no holder line either: the Restart
+            /// Manager registers files.
+            #[test]
+            fn a_directory_row_gets_no_holder_line() {
+                let tmp = tempfile::tempdir().expect("tempdir");
+                std::fs::create_dir_all(tmp.path().join("sub")).expect("mkdir");
+                std::fs::write(tmp.path().join("sub/x"), b"x").expect("write");
+                let (mut ui, lock) = done_ui(tmp.path());
+                focus(&mut ui, b"sub");
+                let node = ui.card_row().expect("a focused row").node;
+                let mut rt = HolderRuntime::new(true);
+                assert_eq!(rt.state_for(&lock, node, 0, Instant::now()), None);
+            }
         }
     }
 
