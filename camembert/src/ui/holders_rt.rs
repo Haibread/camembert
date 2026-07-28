@@ -348,6 +348,17 @@ impl HolderRuntime {
         Some(HolderState::Pending)
     }
 
+    /// Drop the debounce arm because there is no row to describe at all —
+    /// flat or breakdown mode, zen mode, or a scan still running.
+    ///
+    /// Without this the arm outlives its row and [`Self::has_pending`]
+    /// stays true forever, which pins the whole render loop at frame
+    /// cadence in a view that has nothing to update: a quiescent UI is
+    /// supposed to cost nothing between keypresses (design slice 5).
+    pub fn disarm(&mut self) {
+        self.armed = None;
+    }
+
     /// Drives the render loop's frame cadence: a query is armed or in
     /// flight, so the card owes an update soon.
     pub fn has_pending(&self) -> bool {
@@ -556,6 +567,24 @@ mod tests {
         rt.armed = Some((n(1), Instant::now()));
         assert!(rt.has_pending());
         assert!(rt.pending.is_empty(), "arming is not asking");
+    }
+
+    /// …and the arm must be released when the row goes away, or that same
+    /// "keep the loop awake" property pins a quiescent UI at frame cadence
+    /// for the rest of the session.
+    #[test]
+    fn leaving_tree_view_releases_the_arm_and_lets_the_loop_idle() {
+        let mut rt = HolderRuntime::new(true);
+        rt.armed = Some((n(1), Instant::now()));
+        assert!(rt.has_pending());
+
+        rt.disarm();
+
+        assert!(rt.armed.is_none());
+        assert!(
+            !rt.has_pending(),
+            "an arm that outlives its row never lets the loop sleep again"
+        );
     }
 
     #[test]

@@ -955,7 +955,14 @@ fn event_loop(
                 (Phase::Done(lock), Some(node)) => {
                     holders.state_for(lock, node, ui.flat_epoch(), now)
                 }
-                _ => None,
+                // No row to describe (flat/breakdown/zen, or still
+                // scanning): drop the debounce arm, or it outlives its row
+                // and keeps the loop awake in a view with nothing to
+                // update.
+                _ => {
+                    holders.disarm();
+                    None
+                }
             };
             ui.set_holder_state(held);
         }
