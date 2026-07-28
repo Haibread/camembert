@@ -23,12 +23,26 @@ pub mod flat;
 pub mod freeable;
 pub mod ncdu;
 pub mod query;
+// `SHQueryRecycleBinW` is the Windows answer to the question `freeable`
+// answers on Linux — space already counted as used that no directory tree
+// shows. Read-only, and deliberately isolated the same way `freeable` is.
+#[cfg(windows)]
+pub mod recycle;
 pub mod scan;
 pub mod size;
 pub mod tree;
 pub mod view;
+// WTF-8 -> UTF-16, the decoder `tree::os_name_from_bytes` needs to hand a
+// Windows name back to the filesystem unchanged. Pure and portable, so it
+// is compiled and tested everywhere even though only Windows consumes it.
+pub mod wtf8;
 // `NtQueryInformationByName(FileStatInformation)` is the Win32 half of the
 // hardlink story: the scan worker's per-file lookup under `--links`, and
 // the TUI's lazy lookup at the point of consumption, share one wrapper.
 #[cfg(windows)]
 pub mod winlink;
+// The Restart Manager: "who has this file open", which is the question the
+// `/proc` sweep answers on Linux. Read-only — `RmShutdown`/`RmRestart` are
+// deliberately not imported.
+#[cfg(windows)]
+pub mod winrm;

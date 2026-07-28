@@ -172,22 +172,118 @@ exist, `?` does not list them, the palette does not offer them and the
 footer never names them:
 
 - **Deletion, entirely**: `Space` mark, `u` clear, `v` review, `D` delete,
-  and the basket strip. Not a platform limit so much as a refusal to guess:
-  camembert stores names as bytes, and decoding them back for a Windows
-  delete call needs a real WTF-8 encoder. Lossy is fine for display; it is
-  a wrong-file-deleted bug for anything that touches disk.
+  and the basket strip. See
+  [docs/design/windows-delete-dossier.md](docs/design/windows-delete-dossier.md)
+  for what a Windows executor would have to guarantee and what it measurably
+  can. (The name-decoding blocker this list used to cite is **gone**: names
+  now decode through a real WTF-8 decoder, exactly — see below.)
 - **[Freeable](#freeable-deleted-but-open-files)** — the `f` panel and the
   gauge's "· N freeable" suffix. Structural: it reads `/proc/[pid]/fd`, and
-  Windows has no equivalent.
+  Windows has no equivalent. The *question* it answers — which bytes does
+  the disk count as used that no directory tree shows? — does have one, and
+  Windows answers it with [the Recycle Bin
+  meter](#the-recycle-bin-meter-windows) below.
 - **[The reclaim oracle](#reclaim-oracle-freeable-phase-2)** and its
   ambient exclusive floor — no confidence verdict, no `excl ≥ …` card line,
   no bright in-bar segment. Both need `FS_IOC_FIEMAP`, a Linux-only ioctl.
 
-`--no-proc-sweep`/`NO_PROC_SWEEP` and `--no-fiemap`/`NO_FIEMAP` are
-therefore accepted but inert on Windows: there is nothing left to switch
-off. `--links`/`LINKS` runs the other way — it is accepted everywhere and
-inert *off* Windows, where link counts arrive inside `statx` for free (see
+`--no-fiemap`/`NO_FIEMAP` is therefore accepted but inert on Windows: there
+is nothing left to switch off. `--no-proc-sweep`/`NO_PROC_SWEEP` **does**
+mean something there — it is the same request ("do not go looking at what
+other processes have open") answered by a different mechanism, and it
+switches off [the open-file advisory](#who-has-this-file-open-windows).
+`--links`/`LINKS` runs the other way — it is accepted everywhere and inert
+*off* Windows, where link counts arrive inside `statx` for free (see
 [Hardlinks on Windows](#hardlinks-on-windows-and---links)).
+
+### The Recycle Bin meter (Windows)
+
+*Windows only. Nothing to enable, nothing to configure, and camembert never
+empties anything.*
+
+Delete a file in Explorer and the space does not come back. It goes to
+`C:\$Recycle.Bin`, which is hidden, per-SID and ACL'd, so no disk-usage
+tool's directory tree shows it — while `GetDiskFreeSpaceExW`, the call
+behind camembert's disk gauge, keeps counting every byte of it as used.
+That gap is the Windows twin of the question the
+[freeable](#freeable-deleted-but-open-files) sweep answers on Linux, and
+`SHQueryRecycleBinW` answers it read-only, unelevated, in one call.
+
+At the end of every scan camembert asks it, off the UI thread, about the
+volume holding the scan root — the same volume the gauge describes. What
+you get:
+
+- **A gauge suffix** whenever the bin is not empty: `· 5.8 GiB in the
+  Recycle Bin`, next to the capacity and used figures.
+- **One toast, once per session**, when the figure is worth interrupting
+  for: `Recycle Bin: 5.8 GiB in 66 items — not free until you empty it`.
+  The threshold is the same one the Linux freeable toast uses — at least
+  100 MiB **and** at least 1% of the volume's capacity — so a small disk is
+  not nagged about crumbs and a large array is not nagged about rounding
+  noise. The suffix has no threshold; only the interruption is rationed.
+
+**It is deliberately never called "freeable."** On Linux that word means
+"a `close(2)` away". Recycle Bin bytes come back only when *you* empty the
+bin — an action camembert does not perform and does not offer — so the
+wording says where the bytes are and what that costs, and never claims a
+saving the tool cannot deliver.
+
+Scope and limits, in the same spirit:
+
+- **One volume**, the scan root's. A session spanning several volumes
+  under-reports the machine's total, exactly as the Linux figure is scoped
+  to the root filesystem. Summing across volumes would put one disk's bytes
+  on another disk's gauge.
+- **A volume with no Recycle Bin** — a network share, a stick with the bin
+  disabled — is silent rather than reporting zero. The reverse is not
+  distinguishable from here: a bin that exists and is *empty* answers with
+  zeros too, so this is a size oracle and not an availability one.
+- **No key, no panel, no flag.** There is one number and one sentence about
+  it; a modal would be ceremony. `?`, the palette and the keymap are
+  unchanged.
+
+### Who has this file open? (Windows)
+
+*Windows only. Switched off by `--no-proc-sweep`/`NO_PROC_SWEEP`.*
+
+Put the cursor on a file, leave it there a moment, and the selection card
+answers who is holding it — via the **Restart Manager**, the same mechanism
+Windows installers use to work out what they need to close. It runs
+unelevated and off the UI thread, and it never shuts anything down:
+camembert calls `RmGetList` and nothing else.
+
+Its coverage is *better* than the Linux `/proc` sweep's in the direction
+that matters most for a shared machine: `C:\Windows\System32\svchost.exe`
+enumerates 104 distinct services running as SYSTEM, LOCAL SERVICE and
+NETWORK SERVICE, from an ordinary shell. `/proc` on a desktop can read
+about 28% of processes.
+
+Three answers, kept apart on purpose:
+
+| what the card says | what it means |
+| --- | --- |
+| `open in Code.exe (12345)` | it found that holder. Believe it. |
+| `open in 104 processes · svc0 (900), svc1 (901), +102 more` | a crowd — a couple named, the rest counted exactly |
+| `no holder found · not proof — many real locks stay invisible` | it found nobody, **which is not a clean bill of health** |
+| `open handles unknown · …` | it refused to answer, with the reason |
+
+**Why the negative is worded that way, with the measurement.** Over a live
+Firefox profile (11 processes running), the files that genuinely refused an
+open-for-delete were put through this check: **13 of 47 named a holder; 34
+came back empty.** In the other direction it was perfect — **0 of 60**
+files that opened cleanly reported a holder. So it is a *positive*
+predictor and not a negative one, and the empty answer says "not proof" in
+as many words rather than implying safety. `ntfs.sys` is the extreme case:
+held by the kernel, reported as unheld.
+
+**Cost, and the brake it forces.** One `RmGetList` is ~50 ms (and ~435 ms
+for the first one in a process, while the `RmSvc` service warms up) —
+three orders of magnitude more than the link-count query on the line
+above. So a row must sit still under the cursor for **250 ms** before
+anything is asked. Scrolling through a directory costs nothing; stopping to
+read a row costs one query, memoised. Directories are never asked about
+(the Restart Manager registers files), and nothing runs until the scan has
+finished.
 
 **Numbers differ in ways worth knowing before trusting one:**
 
@@ -216,6 +312,17 @@ inert *off* Windows, where link counts arrive inside `statx` for free (see
   than implying NTFS-grade precision.
 - **`⛓` means "reached by more than one path in this scan"**, and
   `--links` changes it back to what it means on Linux. See below.
+- **Names with unpaired surrogates survive intact.** A Windows filename is
+  a sequence of 16-bit units that is not required to be valid UTF-16, and
+  camembert interns names as bytes (WTF-8, the encoding Rust's `OsStr`
+  already uses there). Decoding them back used to go through a lossy UTF-8
+  pass, which turned an unpaired surrogate into U+FFFD and made `o`/`y`
+  name a file that does not exist. Both directions are now exact, so such
+  an entry displays, reveals and copies as itself. Bytes that are not
+  well-formed WTF-8 cannot have come from a Windows scan at all — only from
+  a dump written on Linux — and are refused by the decoder rather than
+  guessed at; they still render lossily as a label, which is all they can
+  honestly be.
 
 ### Hardlinks on Windows, and `--links`
 
@@ -335,7 +442,7 @@ schema.
 | `--color` | `COLOR` | `auto`/`always`/`never` |
 | `--theme` | `THEME` | `tokyo-night`/`light`/`high-contrast` |
 | `--no-motion` | `NO_MOTION` | disable bar/donut easing animations |
-| `--no-proc-sweep` | `NO_PROC_SWEEP` | disable the freeable `/proc` sweep (gauge suffix, `f` panel, toast, pre-deletion open-file check) |
+| `--no-proc-sweep` | `NO_PROC_SWEEP` | disable looking at what other processes have open: on Linux the freeable `/proc` sweep (gauge suffix, `f` panel, toast, pre-deletion open-file check), on Windows the selection card's [Restart Manager advisory](#who-has-this-file-open-windows) |
 | `--no-fiemap` | `NO_FIEMAP` | disable the freeable-2 selection oracle (mark-time reclaim estimate) and the ambient exclusive floor (in-bar bright segment, card figure) — see [Reclaim oracle](#reclaim-oracle-freeable-phase-2) |
 | `--log-filter` | `LOG_FILTER` | `tracing` filter directive |
 | `--log-file` | `LOG_FILE` | write diagnostics to a file instead of discarding them |

@@ -258,17 +258,20 @@ pub(crate) struct ScanArgs {
     #[arg(long = "no-motion")]
     pub(crate) no_motion: bool,
 
-    /// Disable the freeable `/proc` sweep in the interactive UI (env:
+    /// Disable looking at what other processes have open (env:
     /// NO_PROC_SWEEP)
     ///
-    /// Skips both the scan-end sweep that powers the disk gauge's
-    /// "· X.X GiB freeable" suffix, the `f` panel and its toast, and the
-    /// pre-deletion open-file check `D` normally runs before the delete
-    /// confirmation — for paranoid environments and containers with a
-    /// masked /proc. Like NO_MOTION, any value at all counts as set, even
-    /// the empty string; there is no camembert.toml key for this (see the
-    /// README's Freeable section). Accepted but inert on Windows, which has
-    /// no /proc to sweep — the whole feature is absent there.
+    /// On Linux, skips the freeable `/proc` sweep: the scan-end pass that
+    /// powers the disk gauge's "· X.X GiB freeable" suffix, the `f` panel
+    /// and its toast, and the pre-deletion open-file check `D` normally
+    /// runs before the delete confirmation — for paranoid environments and
+    /// containers with a masked /proc. On Windows, skips the selection
+    /// card's open-file advisory: no Restart Manager session is started
+    /// and the "open in …" / "no holder found" line is absent entirely
+    /// (see the README's "Who has this file open?" section). The Recycle
+    /// Bin meter is a different question and is not affected. Like
+    /// NO_MOTION, any value at all counts as set, even the empty string;
+    /// there is no camembert.toml key for this.
     #[arg(long = "no-proc-sweep")]
     pub(crate) no_proc_sweep: bool,
 
@@ -469,8 +472,14 @@ Platform:
   disabled (no key, no cheatsheet row, no footer hint, no palette
   command): deletion in full (Space/u/v/D and the basket strip), the
   freeable panel (f) and the gauge's freeable suffix, and the reclaim
-  oracle's verdict plus the ambient exclusive floor. --no-proc-sweep and
-  --no-fiemap are accepted but inert on Windows. Windows sizes come from
+  oracle's verdict plus the ambient exclusive floor. Windows gains two
+  answers of its own: the disk gauge grows an `N in the Recycle Bin`
+  suffix (SHQueryRecycleBinW on the scan root's volume, read-only --
+  camembert never empties it), and the selection card answers who has
+  the file open, via the Restart Manager. --no-fiemap is accepted but
+  inert there; --no-proc-sweep switches off that advisory, which is the
+  same request answered by a different mechanism.
+  Windows sizes come from
   AllocationSize, alternate data streams are not counted, and junctions
   are refused rather than descended. A directory counts its NTFS index
   bytes like a Linux one counts st_blocks, read from the directory's own

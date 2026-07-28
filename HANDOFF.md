@@ -596,6 +596,157 @@ pinned portably by
 `camembert-core/tests/scan.rs::directory_size_does_not_depend_on_being_the_scan_root`
 — Unix passed it already, Windows did not.
 
+### Landing 4 — names decode back exactly, 2026-07-28
+
+`docs/design/windows-delete-dossier.md` §2.8's measurement, shipped as
+`camembert-core/src/wtf8.rs`: `wtf8_to_utf16(&[u8]) -> Option<Vec<u16>>`,
+pure, portable, `unsafe`-free, tested on every platform.
+`tree::os_name_from_bytes` now decodes a Windows name through it and
+`OsString::from_wide`, so an interned name comes back **byte for byte** —
+unpaired surrogates included. The old arm ran `String::from_utf8_lossy`,
+which turned a lone surrogate into U+FFFD and made `o` (reveal) and `y`
+(copy path) name a file that does not exist. The encode direction was
+already exact (`scan::windows::worker::wtf8_name`); only the way back was
+lossy.
+
+Bytes that are not well-formed WTF-8 are **refused** by the decoder rather
+than guessed at — overlong forms, scalars above U+10FFFF, truncated
+sequences, and a surrogate *pair* written as two three-byte surrogates
+(ill-formed WTF-8, and admitting it would give one name two encodings).
+Such bytes can only come from a dump written on another platform, so
+`os_name_from_bytes` keeps the lossy fallback for them and its doc says
+plainly that a filesystem round-trip must call the decoder itself and
+refuse on `None`. That turns "camembert cannot name a Windows file" into
+"camembert refuses to name entries that did not come from this platform",
+which is checkable.
+
+Pinned by `tree::tests::a_windows_name_with_a_lone_surrogate_decodes_to_
+itself` (verified to fail against the old lossy arm: *"[D800] came back as
+a different name"*) plus eleven decoder tests, one of which round-trips
+2000 pseudo-random UTF-16 strings — surrogate-biased, fixed seed —
+through std's own WTF-8 encoder. Linux is untouched: its arm of
+`os_name_from_bytes` is unchanged and the third arm
+(`not(any(unix, windows))`) preserves the old behaviour for any other
+platform.
+
+### Landing 5 — the Recycle Bin meter, 2026-07-28
+
+Slice 1 of the delete dossier's recommendation
+([windows-delete-dossier.md](docs/design/windows-delete-dossier.md) §4.3,
+§7), and the first of the two zero-destruction surfaces it says must exist
+before any executor. `camembert-core/src/recycle.rs` (`cfg(windows)`,
+read-only, no write path) asks `SHQueryRecycleBinW` about the volume
+holding the scan root — resolved with `GetVolumePathNameW`, the same volume
+`GetDiskFreeSpaceExW` measured for the gauge, so the two figures describe
+one disk. On this box: **6 264 307 348 bytes across 66 items**, matching
+the dossier's probe exactly.
+
+That gap is the Windows twin of the `/proc` sweep's: `C:\$Recycle.Bin` is
+hidden, per-SID and ACL'd, so no directory tree shows it, while the
+free-space figure counts every byte as used.
+
+- **Wording is the design.** The gauge grows `· 5.8 GiB in the Recycle Bin`
+  and one thresholded toast says `Recycle Bin: 5.8 GiB in 66 items — not
+  free until you empty it`. The word *freeable* is banned, and a test
+  enforces the ban: on Linux it means "a `close(2)` away", and these bytes
+  come back only when the user empties the bin, which camembert never does
+  and never offers.
+- **Threshold reuses freeable D5 verbatim** — ≥ 100 MiB *and* ≥ 1 % of
+  capacity — restated in `camembert/src/ui/recycle_rt.rs` rather than
+  imported, because `freeable_panel` is `cfg(unix)` and never compiles
+  here. Suffix unthresholded, toast thresholded, exactly as on Linux.
+- **Off the UI thread**, because it is not free: measured **16.5–23.3 ms**
+  on a 66-item bin (`recycle::tests::bench_query_cost`, `#[ignore]`d), i.e.
+  half a frame already, and a bin with tens of thousands of items is not
+  bounded by that. One job thread, a one-shot channel, non-blocking
+  `try_recv` in the event loop at step 2.57 — the freeable sweep's shape.
+- **No CLI or env surface**, no key, no panel, no palette command. There is
+  one number and one sentence; `?`/keymap/palette are untouched.
+- **`\\?\` is stripped before the call.** The Windows backend carries the
+  extended prefix everywhere and shell entry points refuse it (dossier
+  §2.5e). Only a drive-letter root is rewritten; a UNC or volume-GUID path
+  keeps its prefix and the call refuses, which is the honest outcome since
+  those have no bin.
+- Pinned by a `TestBackend` render test asserting the suffix appears, that
+  it never says "freeable", and that an empty or unmeasured bin adds
+  **nothing** (verified to fail with the suffix suppressed). Plus the
+  wording/threshold unit tests and two live-call tests.
+
+Linux is untouched: the gauge's freeable arm is byte-identical and the new
+push sits behind `#[cfg(windows)]` after it.
+
+### Landing 6 — the open-file advisory, 2026-07-28
+
+Slice 3 of the delete dossier's recommendation (§4.1, §7), and the second
+zero-destruction surface. `camembert-core/src/winrm.rs` (`cfg(windows)`)
+wraps `RmStartSession`/`RmRegisterResources`/`RmGetList`/`RmEndSession`
+behind an RAII session guard; `RmShutdown`/`RmRestart` are deliberately
+**not** imported, and a comment says so. `camembert/src/ui/holders_rt.rs`
+is the runtime, copied in shape from `nlink_rt` (off-thread job, `Pending`
+placeholder, update in place, memoised, epoch-invalidated) and then given a
+brake.
+
+The card gains one line under the link line: `open in Code.exe (12345)`, or
+`open in 104 processes · svc0 (900), svc1 (901), +102 more`, or
+`open handles unknown · <reason>`, or the negative below.
+
+- **The negative is the load-bearing wording, and the measurement moved
+  it.** The dossier's caveat was "kernel-held files are invisible"
+  (`ntfs.sys` reports 0 holders). Measured over a live Firefox profile,
+  that understates badly: **of 47 files that genuinely refused an
+  open-for-DELETE, only 13 named a holder here — 34 came back empty.**
+  Conversely there were **no false positives: 0 of 60** files that opened
+  cleanly reported one. So the Restart Manager is a *positive* predictor
+  and never a negative one, and the card says `no holder found · not
+  proof — many real locks stay invisible`. A test pins the phrase.
+- **The brake.** `RmGetList` is ~50 ms (~435 ms for the first call in a
+  process, `RmSvc` warming up) against `winlink`'s 46 µs, so one job per
+  row the cursor passes over would put dozens of 50 ms threads in flight
+  for rows nobody is looking at. A row must settle under the cursor for
+  **250 ms** first. The rule is a pure `brake()` function tested against
+  synthetic clocks — verified to fail when it always fires.
+- **`--no-proc-sweep`/`NO_PROC_SWEEP` now means something on Windows**: the
+  same request ("do not go looking at what other processes have open"),
+  answered by a different mechanism. Off, there is no session and *no
+  line* — an empty line would claim a coverage the user just switched off.
+  `--help`, the README flag table and the long help all say so. The Recycle
+  Bin meter is a different question and is unaffected.
+- Post-scan only, files only, no new flag, no key, no panel.
+- Pinned end to end by `ui::tests::windows_links::holders` — a real scan, a
+  real Restart Manager session through the job thread, the real dashboard
+  in a `TestBackend` — with this process holding one of the files open, so
+  the positive case cannot pass by accident.
+
+**The `ERROR_SHARING_VIOLATION` frequency the dossier's reservation asked
+for** (§7, "that measurement is cheap and should be taken *before* slice
+4's default is fixed"): a read-only probe opened every file for `DELETE`
+access and closed it immediately — no disposition ever set, nothing
+removed. Per tree, share of files refusing the open with win32 32:
+
+| tree | files | sharing violations | access denied |
+|---|---|---|---|
+| `personal-website\node_modules` | 20 000 | **0 (0.00 %)** | 0 |
+| `blog\node_modules` | 20 000 | **0 (0.00 %)** | 0 |
+| `.cargo\registry` | 20 000 | **0 (0.00 %)** | 0 |
+| Chrome profile (browser *not* running) | 20 000 | **0 (0.00 %)** | 0 |
+| Firefox profile (11 processes running) | 15 922 | **40–43 (0.25–0.27 %)** | 0 |
+| `%LOCALAPPDATA%\Mozilla` (running) | 7 452 | **7 (0.09 %)** | 0 |
+| `%LOCALAPPDATA%\Temp` | 11 933 | **17 (0.14 %)** | 0 |
+| `C:\Windows\System32` | 20 000 | 0 (0.00 %) | **19 996 (99.98 %)** |
+
+**Reading it.** On the trees a user would actually mark for deletion,
+sharing violations are a **fraction of a percent even with the owning
+application running** — the dossier's worry that "a large fraction of a
+typical basket is refused" does not reproduce. What *does* refuse in bulk
+is `C:\Windows\System32`, and that is `ERROR_ACCESS_DENIED` (ACLs), an
+entirely different failure that no Recycle Bin would fix. So the reservation
+against a permanent-delete default is **not** supported by this
+measurement; it should be closed with these numbers rather than left open.
+Two caveats on the probe itself: `%LOCALAPPDATA%\Temp` also produced 5.74 %
+win32 3 (`ERROR_PATH_NOT_FOUND`) because the probe opened by plain path and
+those exceed `MAX_PATH` — a real executor opens handle-relative and would
+not hit it; and one machine at one moment is one sample.
+
 ### Decisions taken, not to be relitigated without a new element
 
 - **`windows-sys` is a T1 dependency** (2026-07-26). A `std`-only walker
