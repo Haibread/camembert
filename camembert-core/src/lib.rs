@@ -27,6 +27,10 @@ pub mod scan;
 pub mod size;
 pub mod tree;
 pub mod view;
+// WTF-8 -> UTF-16, the decoder `tree::os_name_from_bytes` needs to hand a
+// Windows name back to the filesystem unchanged. Pure and portable, so it
+// is compiled and tested everywhere even though only Windows consumes it.
+pub mod wtf8;
 // `NtQueryInformationByName(FileStatInformation)` is the Win32 half of the
 // hardlink story: the scan worker's per-file lookup under `--links`, and
 // the TUI's lazy lookup at the point of consumption, share one wrapper.

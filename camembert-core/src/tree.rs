@@ -49,29 +49,48 @@ use crate::size::Size;
 /// std offers no *safe* way back — only `from_encoded_bytes_unchecked`,
 /// whose contract we cannot honour: these bytes may have come from a dump
 /// written on another platform, where arbitrary non-UTF-8 sequences are
-/// legal names. Feeding those to the unchecked constructor would be UB for
-/// a display string. So Windows takes valid UTF-8 exactly and everything
-/// else lossily.
+/// legal names. Feeding those to the unchecked constructor would be UB.
 ///
-/// That is sound for display and for dumps, and it is *not* sound for
-/// anything that round-trips to the filesystem — a lossily decoded name
-/// handed to a delete path is a wrong-file-deleted bug. [`crate::delete`]
-/// is `cfg(unix)`, where this function is exact, and it must stay that way
-/// until someone writes a real WTF-8 decoder.
+/// So the decode is checked instead, in two steps and with no `unsafe` at
+/// all: [`crate::wtf8::wtf8_to_utf16`] validates the bytes and yields the
+/// UTF-16 units they denote — **exactly**, unpaired surrogates included —
+/// and `OsString::from_wide` turns those back into a name. A name that came
+/// from a live Windows scan therefore round-trips byte for byte, which is
+/// what `o` (reveal) and `y` (copy path) need in order to name the entry the
+/// user is actually looking at rather than a U+FFFD-mangled twin of it. The
+/// valid-UTF-8 fast path stays a borrow, so the common case allocates
+/// nothing.
 ///
-/// The TUI's `o`/`y` (reveal-in-file-manager / copy-path, `camembert/src/
-/// ui.rs`) are a lower-stakes second consumer that *does* round-trip to
-/// the filesystem: opening the wrong file in Explorer is a bad experience,
-/// not a data-loss bug, so the pathological lone-surrogate corner this
-/// function already accepts is a tolerable, pre-existing gap there too —
-/// not a new one this function's wider visibility introduces.
+/// Bytes that are **not** well-formed WTF-8 cannot have come from this
+/// platform (a dump written on Linux is the only source), so there is no
+/// correct name to recover: they fall back to `String::from_utf8_lossy`,
+/// which is a display string and is documented as such. Anything that
+/// round-trips to the filesystem must therefore ask
+/// [`crate::wtf8::wtf8_to_utf16`] itself and refuse on `None` rather than
+/// trusting this function's fallback arm.
 #[cfg(unix)]
 pub fn os_name_from_bytes(bytes: &[u8]) -> std::borrow::Cow<'_, std::ffi::OsStr> {
     use std::os::unix::ffi::OsStrExt;
     std::borrow::Cow::Borrowed(std::ffi::OsStr::from_bytes(bytes))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub fn os_name_from_bytes(bytes: &[u8]) -> std::borrow::Cow<'_, std::ffi::OsStr> {
+    use std::os::windows::ffi::OsStringExt;
+    match std::str::from_utf8(bytes) {
+        Ok(s) => std::borrow::Cow::Borrowed(std::ffi::OsStr::new(s)),
+        Err(_) => match crate::wtf8::wtf8_to_utf16(bytes) {
+            Some(units) => std::borrow::Cow::Owned(std::ffi::OsString::from_wide(&units)),
+            None => std::borrow::Cow::Owned(std::ffi::OsString::from(
+                String::from_utf8_lossy(bytes).into_owned(),
+            )),
+        },
+    }
+}
+
+/// Neither Unix's byte-exact `OsStr` nor Windows' WTF-8: whatever this
+/// platform is, only valid UTF-8 can be decoded without guessing.
+#[cfg(not(any(unix, windows)))]
 pub fn os_name_from_bytes(bytes: &[u8]) -> std::borrow::Cow<'_, std::ffi::OsStr> {
     match std::str::from_utf8(bytes) {
         Ok(s) => std::borrow::Cow::Borrowed(std::ffi::OsStr::new(s)),
@@ -873,6 +892,48 @@ mod tests {
     #[test]
     fn node_is_32_bytes() {
         assert_eq!(std::mem::size_of::<Node>(), 32);
+    }
+
+    /// A name the scan interned must decode back to **itself**, not to a
+    /// display-safe twin of itself. The lone-surrogate case is the one the
+    /// old lossy decode got wrong (`docs/design/windows-delete-dossier.md`
+    /// §2.8): it produced U+FFFD, so `o`/`y` named a file that does not
+    /// exist. Windows-only because it needs an `OsString` that is not
+    /// valid UTF-8 in the platform's *own* encoding, which is exactly the
+    /// case Unix cannot construct.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_name_with_a_lone_surrogate_decodes_to_itself() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+
+        for units in [
+            vec![0xD800_u16],
+            vec![0x61, 0xDBFF, 0x62],
+            vec![0xDC00, 0x2E, 0x74, 0x78, 0x74],
+        ] {
+            let original = OsString::from_wide(&units);
+            let interned = original.as_encoded_bytes().to_vec();
+            let decoded = os_name_from_bytes(&interned);
+            assert_eq!(
+                &*decoded,
+                original.as_os_str(),
+                "{units:04X?} came back as a different name"
+            );
+            assert_eq!(
+                decoded.as_encoded_bytes(),
+                &interned[..],
+                "{units:04X?} re-encodes to different bytes"
+            );
+        }
+    }
+
+    /// Ordinary names keep the borrow (no allocation) and stay exact.
+    #[test]
+    fn valid_utf8_names_are_borrowed_unchanged() {
+        let decoded = os_name_from_bytes("fromage.txt".as_bytes());
+        assert!(matches!(decoded, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(&*decoded, std::ffi::OsStr::new("fromage.txt"));
     }
 
     #[test]

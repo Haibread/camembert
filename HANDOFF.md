@@ -596,6 +596,39 @@ pinned portably by
 `camembert-core/tests/scan.rs::directory_size_does_not_depend_on_being_the_scan_root`
 — Unix passed it already, Windows did not.
 
+### Landing 4 — names decode back exactly, 2026-07-28
+
+`docs/design/windows-delete-dossier.md` §2.8's measurement, shipped as
+`camembert-core/src/wtf8.rs`: `wtf8_to_utf16(&[u8]) -> Option<Vec<u16>>`,
+pure, portable, `unsafe`-free, tested on every platform.
+`tree::os_name_from_bytes` now decodes a Windows name through it and
+`OsString::from_wide`, so an interned name comes back **byte for byte** —
+unpaired surrogates included. The old arm ran `String::from_utf8_lossy`,
+which turned a lone surrogate into U+FFFD and made `o` (reveal) and `y`
+(copy path) name a file that does not exist. The encode direction was
+already exact (`scan::windows::worker::wtf8_name`); only the way back was
+lossy.
+
+Bytes that are not well-formed WTF-8 are **refused** by the decoder rather
+than guessed at — overlong forms, scalars above U+10FFFF, truncated
+sequences, and a surrogate *pair* written as two three-byte surrogates
+(ill-formed WTF-8, and admitting it would give one name two encodings).
+Such bytes can only come from a dump written on another platform, so
+`os_name_from_bytes` keeps the lossy fallback for them and its doc says
+plainly that a filesystem round-trip must call the decoder itself and
+refuse on `None`. That turns "camembert cannot name a Windows file" into
+"camembert refuses to name entries that did not come from this platform",
+which is checkable.
+
+Pinned by `tree::tests::a_windows_name_with_a_lone_surrogate_decodes_to_
+itself` (verified to fail against the old lossy arm: *"[D800] came back as
+a different name"*) plus eleven decoder tests, one of which round-trips
+2000 pseudo-random UTF-16 strings — surrogate-biased, fixed seed —
+through std's own WTF-8 encoder. Linux is untouched: its arm of
+`os_name_from_bytes` is unchanged and the third arm
+(`not(any(unix, windows))`) preserves the old behaviour for any other
+platform.
+
 ### Decisions taken, not to be relitigated without a new element
 
 - **`windows-sys` is a T1 dependency** (2026-07-26). A `std`-only walker

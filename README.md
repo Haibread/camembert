@@ -172,10 +172,11 @@ exist, `?` does not list them, the palette does not offer them and the
 footer never names them:
 
 - **Deletion, entirely**: `Space` mark, `u` clear, `v` review, `D` delete,
-  and the basket strip. Not a platform limit so much as a refusal to guess:
-  camembert stores names as bytes, and decoding them back for a Windows
-  delete call needs a real WTF-8 encoder. Lossy is fine for display; it is
-  a wrong-file-deleted bug for anything that touches disk.
+  and the basket strip. See
+  [docs/design/windows-delete-dossier.md](docs/design/windows-delete-dossier.md)
+  for what a Windows executor would have to guarantee and what it measurably
+  can. (The name-decoding blocker this list used to cite is **gone**: names
+  now decode through a real WTF-8 decoder, exactly — see below.)
 - **[Freeable](#freeable-deleted-but-open-files)** — the `f` panel and the
   gauge's "· N freeable" suffix. Structural: it reads `/proc/[pid]/fd`, and
   Windows has no equivalent.
@@ -216,6 +217,17 @@ inert *off* Windows, where link counts arrive inside `statx` for free (see
   than implying NTFS-grade precision.
 - **`⛓` means "reached by more than one path in this scan"**, and
   `--links` changes it back to what it means on Linux. See below.
+- **Names with unpaired surrogates survive intact.** A Windows filename is
+  a sequence of 16-bit units that is not required to be valid UTF-16, and
+  camembert interns names as bytes (WTF-8, the encoding Rust's `OsStr`
+  already uses there). Decoding them back used to go through a lossy UTF-8
+  pass, which turned an unpaired surrogate into U+FFFD and made `o`/`y`
+  name a file that does not exist. Both directions are now exact, so such
+  an entry displays, reveals and copies as itself. Bytes that are not
+  well-formed WTF-8 cannot have come from a Windows scan at all — only from
+  a dump written on Linux — and are refused by the decoder rather than
+  guessed at; they still render lossily as a label, which is all they can
+  honestly be.
 
 ### Hardlinks on Windows, and `--links`
 
