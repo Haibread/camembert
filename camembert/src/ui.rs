@@ -1789,6 +1789,27 @@ fn activate_selected(ui: &mut UiState, phase: &Phase, flash: &mut Flash) {
     }
 }
 
+/// The [`ViewMode::FlatTop`] rows a cursor position resolves against: the
+/// filtered match set while a filter is active (D4 composition — the
+/// exact set [`draw_flat_table`] renders), the whole-scan summary
+/// otherwise (empty before the first summary of either kind has arrived).
+/// `o`/`y`/Enter/`Space` all resolve a flat-mode cursor position through
+/// this and nothing else, so the row an action names can never diverge
+/// from the row the table shows at that position — before this existed,
+/// each of the three read `ui.flat_summary()` unconditionally, so under
+/// an active filter the table showed the match set but every action still
+/// acted on the whole-scan row sharing the cursor's position, which is
+/// almost never the same row once the filter actually narrows anything.
+fn flat_display_rows(ui: &UiState, outcome: &ScanOutcome) -> Vec<flatview::FlatRow> {
+    match ui.active_filter() {
+        Some(filter) => flatview::filtered_flat_rows(&filter.result, Some(outcome)),
+        None => ui
+            .flat_summary()
+            .map(|summary| flatview::flat_rows(summary, Some(outcome)))
+            .unwrap_or_default(),
+    }
+}
+
 /// Enter on a flat top-files row (D3): jump to its containing directory in
 /// tree view, cursor on the file itself. Only possible post-scan —
 /// resolving a containing directory needs a real path, and the live
@@ -1802,10 +1823,7 @@ fn try_jump_flat_row(ui: &mut UiState, phase: &Phase, flash: &mut Flash) {
     };
     let guard = read_outcome(lock);
     let outcome = &*guard;
-    let Some(summary) = ui.flat_summary() else {
-        return;
-    };
-    let rows = flatview::flat_rows(summary, Some(outcome));
+    let rows = flat_display_rows(ui, outcome);
     let order = flatview::sort_flat_rows(&rows, ui.sort());
     let Some(&index) = order.get(ui.cursor()) else {
         return; // empty view: silent no-op
@@ -1885,12 +1903,12 @@ fn selected_path(ui: &UiState, phase: &Phase) -> SelectedPath {
             let Phase::Done(lock) = phase else {
                 return SelectedPath::Unavailable(FLAT_ROW_DETAILS_LOCKED);
             };
-            let Some(summary) = ui.flat_summary() else {
+            if ui.active_filter().is_none() && ui.flat_summary().is_none() {
                 return SelectedPath::None;
-            };
+            }
             let guard = read_outcome(lock);
             let outcome = &*guard;
-            let rows = flatview::flat_rows(summary, Some(outcome));
+            let rows = flat_display_rows(ui, outcome);
             let order = flatview::sort_flat_rows(&rows, ui.sort());
             let Some(&index) = order.get(ui.cursor()) else {
                 return SelectedPath::None; // empty view: silent no-op
@@ -2182,10 +2200,7 @@ fn try_toggle_mark_flat(
     };
     let guard = read_outcome(lock);
     let outcome = &*guard;
-    let Some(summary) = ui.flat_summary() else {
-        return;
-    };
-    let rows = flatview::flat_rows(summary, Some(outcome));
+    let rows = flat_display_rows(ui, outcome);
     let order = flatview::sort_flat_rows(&rows, ui.sort());
     let Some(&index) = order.get(ui.cursor()) else {
         return; // empty view: silent no-op, matching tree mode
@@ -3565,9 +3580,10 @@ fn draw_flat_table(
 /// row ([`flatview::breakdown_rows`]) is always shown but never given an
 /// identity rank or a wheel slice of its own — D1's disjoint-partition
 /// invariant means the wheel's automatic "unaccounted" remainder already
-/// equals it exactly, so excluding it from `slice_rows` here is what
-/// produces the correct gray "uncategorized" wedge (attack finding 2's
-/// fix) instead of a second, redundant colored one.
+/// equals it exactly, so giving it `None` rank (never excluding it from
+/// `slice_rows` — see the field's own comment below) is what produces the
+/// correct gray "uncategorized" wedge (attack finding 2's fix) instead of
+/// a second, redundant colored one.
 fn draw_breakdown_table(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -3698,14 +3714,19 @@ fn draw_breakdown_table(
         height: area.height.saturating_sub(1),
         offset: table_state.offset(),
     };
-    // The uncategorized row is excluded from the donut's own rows (see the
-    // function doc): its share reaches the wheel only as the automatic
-    // "unaccounted" remainder `build_slices` computes from `total -
-    // sum(slice_rows)`, which — thanks to D1's disjoint partition — is
-    // exactly `summary.rest`, never an overlap artifact.
+    // The uncategorized row stays *in* `slice_rows`, in its real display
+    // position — only its rank is `None` (assigned above). `build_slices`
+    // already merges any `None`-ranked row into the automatic "unaccounted"
+    // wedge on its own (see the function doc), so this needs no filtering;
+    // filtering the row out here instead would drop it from the position
+    // count entirely, shifting every later row's target left by one
+    // whenever the uncategorized row does not happen to sort last — which,
+    // under the default disk-descending sort, is the common case (the
+    // unmatched "rest" bucket is often the *largest* row, not the
+    // smallest). `WheelSource`'s own doc requires `slice_rows`' position to
+    // equal the row's display position; a filtered list breaks that.
     let slice_rows: Vec<(u64, Option<usize>)> = order
         .iter()
-        .filter(|&&index| rows[index].kind.is_some())
         .map(|&index| (rows[index].disk, ranks.get(index).copied().flatten()))
         .collect();
     let wheel_source = WheelSource {
@@ -5119,6 +5140,110 @@ mod tests {
         }
     }
 
+    /// Extends [`draw_never_panics_across_sizes_and_caps`] with the specific
+    /// degenerate shapes an adversarial review should try and the previous
+    /// matrix did not exercise: a sliver terminal narrower than any panel
+    /// (2x40, tall and thin rather than the square-ish sizes above), a
+    /// snapshot with zero rows (nothing to select, nothing to hover), a
+    /// snapshot with exactly one row, a name long enough to blow through
+    /// every column/abbreviation budget (500 chars, well past `MAX_PATH`
+    /// and past any bar/table width), and a mouse hover set past the end of
+    /// the row count — `UiState::set_hover` takes any `usize` unchecked, so
+    /// nothing but `Vec::get`'s own bounds-checking stands between a stale
+    /// or adversarial hover position and an out-of-bounds read.
+    #[test]
+    fn draw_never_panics_at_degenerate_row_counts_and_hover_positions() {
+        let rungs = [
+            (GlyphLevel::Sextant, ColorLevel::Truecolor),
+            (GlyphLevel::Ascii, ColorLevel::Mono),
+        ];
+        let row = |name: &[u8], disk: u64| Row {
+            name: name.into(),
+            node: NodeId::from_raw(0),
+            dir: None,
+            is_dir: false,
+            apparent: disk,
+            disk,
+            items: 1,
+            errors: 0,
+            state: RowState::File,
+            error_reason: None,
+            mtime: 1_000_000,
+        };
+        let snapshot_with = |rows: Vec<Row>| {
+            let total_disk: u64 = rows.iter().map(|r| r.disk).sum();
+            Arc::new(ViewSnapshot {
+                generation: 1,
+                dir: DirId::from_raw(0),
+                parent: None,
+                path: PathBuf::from("/scan/root"),
+                rows,
+                totals: DirTotals {
+                    apparent: total_disk,
+                    disk: total_disk,
+                    items: 1,
+                    errors: 0,
+                },
+                stats: ScanStats {
+                    entries: 1,
+                    dirs: 0,
+                    errors: 0,
+                    disk_bytes: total_disk,
+                    elapsed: Duration::from_millis(1),
+                    root_complete: true,
+                },
+                hardlink_inodes: 0,
+                degraded: false,
+            })
+        };
+        let long_name: Vec<u8> = vec![b'x'; 500];
+        let fixtures: Vec<(&str, Arc<ViewSnapshot>)> = vec![
+            ("zero rows", snapshot_with(Vec::new())),
+            ("one row", snapshot_with(vec![row(b"solo", 100)])),
+            (
+                "a 500-char name",
+                snapshot_with(vec![row(&long_name, 100), row(b"normal", 50)]),
+            ),
+        ];
+        for (label, snapshot) in fixtures {
+            for (glyphs, color) in rungs {
+                let ctx = ctx(glyphs, color);
+                let mut ui = UiState::new(Arc::clone(&snapshot));
+                // Force a hover well past the end of the row count —
+                // `set_hover` performs no bounds check itself, so this is
+                // exactly the state a stale hover (or a hostile caller)
+                // could leave behind; only render-time `.get()` calls stand
+                // between this and an out-of-bounds panic.
+                ui.set_hover(9999);
+                let mut table_state = TableState::default();
+                let mut motion = no_motion();
+                for (width, height) in [(120, 35), (2, 40), (1, 1)] {
+                    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                    terminal
+                        .draw(|frame| {
+                            draw(
+                                frame,
+                                &ui,
+                                &Phase::Transitioning,
+                                &mut table_state,
+                                '⠋',
+                                None,
+                                &[],
+                                &mut motion,
+                                &ctx,
+                                false,
+                                &[],
+                                None,
+                            );
+                        })
+                        .unwrap_or_else(|err| {
+                            panic!("{label} at {width}x{height} ({glyphs:?}/{color:?}): {err}")
+                        });
+                }
+            }
+        }
+    }
+
     /// D3: the flat top-files and breakdown tables (and their donut)
     /// render without panicking at every size/capability rung, both with
     /// a populated summary and with none at all yet (mode entered before
@@ -5364,6 +5489,85 @@ mod tests {
             underlined[0].contains("largest"),
             "the highlighted row must be the one the card names, not the \
              row sharing its snapshot index: {underlined:?}"
+        );
+    }
+
+    /// The breakdown donut's clickable slices must target the row's
+    /// *display* position (the same `order` the table renders), matching
+    /// [`WheelSource`]'s own doc: "`slice_rows`' position doubles as the
+    /// cursor position a click on that slice should land on". Before this
+    /// fix, `draw_breakdown_table` built `slice_rows` by filtering the
+    /// sorted rows down to the ones with a pattern kind -- dropping the
+    /// trailing uncategorized row wherever it actually sorted to. Under
+    /// the default disk-descending sort the unmatched "rest" bucket is
+    /// often the *largest* slice, not the smallest, so it routinely sorts
+    /// to the front rather than staying last -- exactly the fixture below.
+    /// The filter then silently shifted every later group's target left by
+    /// one, so clicking a group's slice landed on the row *before* it
+    /// (here, the uncategorized row itself) instead of the group.
+    #[test]
+    fn breakdown_wheel_targets_the_display_position_not_a_filtered_one() {
+        let summary = flat::FlatSummary {
+            groups: vec![flat::GroupTotal {
+                label: "grp".to_owned(),
+                kind: flat::PatternKind::Dir,
+                apparent: 3000,
+                disk: 3000,
+                entries: 5,
+            }],
+            rest: flat::RestTotal {
+                apparent: 5000,
+                disk: 5000,
+                entries: 10,
+            },
+            top_files: Vec::new(),
+            truncated: false,
+            provisional: false,
+            epoch: 0,
+        };
+
+        // Confirm the fixture actually drives the scenario: the default
+        // sort (disk descending) puts the bigger "rest" bucket at display
+        // position 0 and "grp" at position 1 -- the uncategorized row is
+        // not last.
+        let rows = flatview::breakdown_rows(&summary);
+        let order = flatview::sort_breakdown_rows(&rows, state::SortSpec::default());
+        assert_eq!(rows[order[0]].label, flatview::UNCATEGORIZED_LABEL);
+        assert_eq!(rows[order[1]].label, "grp");
+
+        let mut ui = UiState::new(sample_snapshot());
+        ui.toggle_breakdown();
+        ui.set_flat_summary(Arc::new(summary));
+
+        let ctx = ctx(GlyphLevel::HalfBlock, ColorLevel::Truecolor);
+        let mut table_state = TableState::default();
+        let area = Rect::new(0, 0, 40, 20);
+        let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
+        let mut result = None;
+        terminal
+            .draw(|frame| {
+                result = Some(draw_breakdown_table(
+                    frame,
+                    area,
+                    &ui,
+                    &mut table_state,
+                    1.0,
+                    &ctx,
+                ));
+            })
+            .unwrap();
+        let (_geometry, wheel_source) = result.unwrap();
+
+        let targets = wheel::build_slice_targets(&wheel_source.slice_rows, wheel_source.total);
+        // Two slices in the donut: the colored "grp" wedge, then the gray
+        // "rest" wedge merged from everything else (`None`, not navigable).
+        assert_eq!(
+            targets,
+            vec![Some(1), None],
+            "the wheel's colored slice (\"grp\") must target display \
+             position 1, where the table actually shows it -- not 0, which \
+             is where the uncategorized row (excluded from the filtered \
+             slice list) happened to land: {targets:?}"
         );
     }
 
@@ -6464,6 +6668,72 @@ mod tests {
         assert_eq!(
             selected_path(&ui, &phase),
             SelectedPath::Path(tmp.path().join("big"))
+        );
+    }
+
+    /// D4 composition (attack finding): under an active filter, `t` mode
+    /// *renders* [`flatview::filtered_flat_rows`] — the match set — but
+    /// `selected_path` (which `o`/`y`/mark/jump all resolve through)
+    /// ignored the filter entirely and resolved the cursor against
+    /// [`UiState::flat_summary`]'s whole-scan top files instead. The two
+    /// lists have different rows at the same position the moment the
+    /// filter actually narrows anything, so the row named on screen and
+    /// the row an action acts on silently diverge — the same index-space
+    /// mismatch the hover bug shipped with (62d33d7), just between the
+    /// rendered list and the resolved one instead of two index spaces on
+    /// the same list.
+    ///
+    /// Fixture: cursor sits at position 0 under the *unfiltered* disk-desc
+    /// order, where "big" (8192 bytes) leads "small" (16 bytes) — matching
+    /// the previous test exactly. A filter matching only "small" then
+    /// makes the table show a single row, "small", at that same position
+    /// 0. `o`/`y`/Enter/mark must all act on "small", the row actually
+    /// on screen — never "big", a file the filtered table does not even
+    /// display.
+    #[test]
+    fn selected_path_under_a_filter_resolves_the_displayed_row_not_the_whole_scan_row() {
+        let (mut ui, phase, tmp) = done_ui_with_two_files();
+        ui.toggle_flat_top();
+        let flat_config = FlatConfig::default();
+        ensure_flat_summary_fresh(&phase, &flat_config, &mut ui);
+        assert!(ui.flat_summary().is_some(), "fold populated the summary");
+
+        let parsed = query::parse("small");
+        assert!(parsed.errors.is_empty());
+        let Phase::Done(lock) = &phase else {
+            panic!("done_ui_with_two_files always returns Phase::Done")
+        };
+        let outcome = read_outcome(lock);
+        let hardlinks = HardlinkIndex::build(&outcome, 0);
+        let result = query::apply(
+            outcome.tree(),
+            &parsed.query,
+            &flat_config.patterns,
+            &hardlinks,
+            &ApplyOptions {
+                cap: 10,
+                epoch: 0,
+                now_unix: 0,
+                threads: 1,
+            },
+        );
+        drop(outcome);
+        assert_eq!(
+            result.top_files.len(),
+            1,
+            "only \"small\" matches the filter"
+        );
+        ui.set_active_filter("small".to_owned(), Arc::new(result));
+
+        // The cursor is untouched by applying the filter (it was already
+        // in bounds), so it is still 0 — the position the table now shows
+        // "small" at, the filtered view's only row.
+        assert_eq!(ui.cursor(), 0);
+        assert_eq!(
+            selected_path(&ui, &phase),
+            SelectedPath::Path(tmp.path().join("small")),
+            "the row named on screen at the cursor position must be the \
+             row every action resolves, even under an active filter"
         );
     }
 
