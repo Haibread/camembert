@@ -33,10 +33,17 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-      - name: build the release binary
-        run: cargo build --release --locked --target ${{ matrix.target }} --package camembert
-      - name: strip the binary
-        run: strip target/${{ matrix.target }}/release/camembert
+      # `cargo-deb` is on install-action's curated list; `cargo-generate-rpm`
+      # is not, so that one comes through the cargo-binstall fallback.
+      - name: install the packaging tools
+        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
+        with:
+          tool: cargo-deb,cargo-generate-rpm
+      # Builds and strips the binary, regenerates the man pages and shell
+      # completions, then produces the .deb and .rpm. The tarball step below
+      # reuses the very binary that went into the packages.
+      - name: build the release binary and the native packages
+        run: scripts/build-packages.sh --target ${{ matrix.target }}
       - name: package the release archive
         env:
           TARGET: ${{ matrix.target }}
@@ -48,13 +55,30 @@ jobs:
           cp target/"$TARGET"/release/camembert LICENSE-MIT LICENSE-APACHE README.md "$name"/
           tar czf "$name.tar.gz" "$name"
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
-      - name: upload the release archive
+      # Both packagers already encode the architecture in the file name
+      # (`_amd64.deb` / `.x86_64.rpm`), so the two matrix legs never collide
+      # once the artifacts are merged.
+      - name: collect the native packages
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          for package in target/"$TARGET"/debian/*.deb \
+                         target/"$TARGET"/generate-rpm/*.rpm; do
+            cp "$package" .
+            name="$(basename "$package")"
+            sha256sum "$name" > "$name.sha256"
+          done
+      - name: upload the release artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: camembert-${{ matrix.target }}
           path: |
             camembert-*.tar.gz
             camembert-*.tar.gz.sha256
+            camembert*.deb
+            camembert*.deb.sha256
+            camembert*.rpm
+            camembert*.rpm.sha256
           if-no-files-found: error
 
   release:

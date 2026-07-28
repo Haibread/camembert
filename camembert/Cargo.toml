@@ -5,18 +5,23 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-# `camembert-mangen` only regenerates the man page, so it has no business
-# competing for the default. Without this, a bare `cargo run` refuses to
-# pick and asks for `--bin`.
+# The generator binaries only regenerate packaging assets, so they have no
+# business competing for the default. Without this, a bare `cargo run`
+# refuses to pick and asks for `--bin`.
 default-run = "camembert"
 
 [[bin]]
 name = "camembert-mangen"
 path = "src/bin/mangen.rs"
 
+[[bin]]
+name = "camembert-completions"
+path = "src/bin/completions.rs"
+
 [dependencies]
 camembert-core = { workspace = true }
 clap = { workspace = true }
+clap_complete = "4"
 clap_mangen = "0.3"
 crossterm = { workspace = true }
 ratatui = { workspace = true }
@@ -43,3 +48,68 @@ windows-sys = { version = "0.61.2", features = [
 portable-pty = "0.9.0"
 serde_json = { workspace = true }
 tempfile = "3.27.0"
+
+# Native `.deb`/`.rpm` packages, built by `scripts/build-packages.sh` (which
+# is also what the release workflow runs). Both packagers consume assets that
+# already exist on disk: the binary from `cargo build --release`, and the man
+# pages and completion scripts from the `camembert-mangen` /
+# `camembert-completions` generators, which the script writes to
+# `target/packaging/`. `target/release/...` sources are rewritten to
+# `target/<triple>/release/...` when a `--target` is passed, so the same
+# metadata serves both the x86_64 and aarch64 builds.
+#
+# The binary is statically linked (musl), so neither package declares a
+# runtime dependency — that is the whole point of shipping musl here: one
+# package per architecture that installs on any glibc vintage. It also means
+# these are deliberately *not* distro-policy-clean packages (a Debian or
+# Fedora archive would want a dynamically linked build against the distro's
+# own libc); they exist so `dpkg -i` / `dnf install` works, not to enter an
+# archive. See README's "Install".
+[package.metadata.deb]
+maintainer = "Haibread <haibread@users.noreply.github.com>"
+copyright = "2026 Haibread"
+section = "utils"
+priority = "optional"
+# `$auto` would run `ldd` over the binary to derive this. A static binary has
+# no dynamic dependencies to find, and letting the resolver guess anyway is
+# how a package ends up demanding a libc it never calls.
+depends = ""
+extended-description = """
+camembert scans a filesystem and answers the questions a disk fills up over: \
+what grew since last time, how much space deleting something would actually \
+free, and what has not been touched in years. It ships an interactive \
+terminal browser, a non-interactive summary mode, and a dump format that \
+`camembert diff` compares across scans."""
+assets = [
+    { source = "target/release/camembert", dest = "/usr/bin/camembert", mode = "755" },
+    { source = "../target/packaging/man/camembert.1", dest = "/usr/share/man/man1/", mode = "644" },
+    { source = "../target/packaging/man/camembert-diff.1", dest = "/usr/share/man/man1/", mode = "644" },
+    { source = "../target/packaging/man/camembert-import.1", dest = "/usr/share/man/man1/", mode = "644" },
+    { source = "../target/packaging/completions/camembert.bash", dest = "/usr/share/bash-completion/completions/camembert", mode = "644" },
+    # Debian's own completion dumps live in `vendor-completions`;
+    # `site-functions` is reserved for the local administrator.
+    { source = "../target/packaging/completions/_camembert", dest = "/usr/share/zsh/vendor-completions/_camembert", mode = "644" },
+    { source = "../target/packaging/completions/camembert.fish", dest = "/usr/share/fish/vendor_completions.d/camembert.fish", mode = "644" },
+    { source = "../LICENSE-MIT", dest = "/usr/share/doc/camembert/LICENSE-MIT", mode = "644" },
+    { source = "../LICENSE-APACHE", dest = "/usr/share/doc/camembert/LICENSE-APACHE", mode = "644" },
+    { source = "../README.md", dest = "/usr/share/doc/camembert/README.md", mode = "644" },
+]
+
+[package.metadata.generate-rpm]
+summary = "Disk usage analyzer: what grew, what is freeable, what is cold"
+# Same reasoning as `deb.depends`: nothing to require, and the runner
+# building these packages has no RPM toolchain for `find-requires` to use.
+auto-req = "no"
+assets = [
+    { source = "target/release/camembert", dest = "/usr/bin/camembert", mode = "755" },
+    { source = "target/packaging/man/camembert.1", dest = "/usr/share/man/man1/camembert.1", mode = "644", doc = true },
+    { source = "target/packaging/man/camembert-diff.1", dest = "/usr/share/man/man1/camembert-diff.1", mode = "644", doc = true },
+    { source = "target/packaging/man/camembert-import.1", dest = "/usr/share/man/man1/camembert-import.1", mode = "644", doc = true },
+    { source = "target/packaging/completions/camembert.bash", dest = "/usr/share/bash-completion/completions/camembert", mode = "644" },
+    # Fedora has no `vendor-completions`; packages drop into `site-functions`.
+    { source = "target/packaging/completions/_camembert", dest = "/usr/share/zsh/site-functions/_camembert", mode = "644" },
+    { source = "target/packaging/completions/camembert.fish", dest = "/usr/share/fish/vendor_completions.d/camembert.fish", mode = "644" },
+    { source = "../LICENSE-MIT", dest = "/usr/share/licenses/camembert/LICENSE-MIT", mode = "644", doc = true },
+    { source = "../LICENSE-APACHE", dest = "/usr/share/licenses/camembert/LICENSE-APACHE", mode = "644", doc = true },
+    { source = "../README.md", dest = "/usr/share/doc/camembert/README.md", mode = "644", doc = true },
+]

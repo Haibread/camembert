@@ -207,8 +207,17 @@ pitch.
   `--filter`/FILTER (strict in --no-ui, exit 2; dumps never filtered).
 - **Releases**: tag-triggered workflow builds static musl binaries
   (x86_64 + aarch64, native runners) with sha256 sums attached to the
-  GitHub Release; `--version` embeds the build commit (build.rs,
-  `-dirty` aware). Release notes come from
+  GitHub Release, plus a `.deb` and an `.rpm` per architecture
+  (`scripts/build-packages.sh`, driven by `cargo-deb` /
+  `cargo-generate-rpm` metadata in `camembert/Cargo.toml`) carrying the
+  binary, the three man pages and bash/zsh/fish completions. The
+  packages wrap the same static musl binary, so they declare no
+  dependencies and install on any glibc vintage — deliberately not
+  distro-archive-policy packages, and there is no APT/DNF repository
+  (that is a separate decision, not an oversight). Verified 2026-07-28
+  by installing both in Debian 12 and Fedora 42 containers: real scan,
+  correct file layout, clean removal. `--version` embeds the build
+  commit (build.rs, `-dirty` aware). Release notes come from
   [CHANGELOG.md](CHANGELOG.md) — the workflow extracts the tag's
   section and passes it as `--notes-file`, failing the job if there is
   none, then appends GitHub's generated notes (label categories in

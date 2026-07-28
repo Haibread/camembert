@@ -108,13 +108,44 @@ auto-selects `light` when nothing else chose a theme — see
 
 ## Install
 
-From source (Rust stable, edition 2024):
+### Debian/Ubuntu and Fedora/RHEL packages
+
+`.deb` and `.rpm` packages for `x86_64` and `aarch64` are attached to every
+[GitHub Release](https://github.com/Haibread/camembert/releases). They
+install the binary, the three man pages, and bash/zsh/fish completions:
+
+```bash
+VERSION=0.3.0 # match the release tag, without the leading "v"
+
+# Debian/Ubuntu (amd64 | arm64)
+curl -LO "https://github.com/Haibread/camembert/releases/download/v${VERSION}/camembert_${VERSION}-1_amd64.deb"
+sudo dpkg -i "camembert_${VERSION}-1_amd64.deb"
+
+# Fedora/RHEL/openSUSE (x86_64 | aarch64)
+curl -LO "https://github.com/Haibread/camembert/releases/download/v${VERSION}/camembert-${VERSION}-1.x86_64.rpm"
+sudo dnf install "./camembert-${VERSION}-1.x86_64.rpm"
+```
+
+The packaged binary is the same static musl build as the tarballs, so the
+packages declare **no dependencies** and install on any glibc vintage —
+Debian 11 and Fedora 42 alike. The flip side: they are deliberately not
+distro-archive-policy packages (an archive would want a dynamically linked
+build against its own libc). They exist so that `dpkg -i` and `dnf install`
+work today, not to enter Debian or Fedora proper. There is no APT/DNF
+repository yet, so upgrades mean downloading the next release.
+
+### From source
+
+Rust stable, edition 2024:
 
 ```bash
 git clone https://github.com/Haibread/camembert
 cd camembert
 cargo install --path camembert
 ```
+
+Note that `cargo install` places only the binary: man pages and completions
+come from the generators described under [Packaging](#packaging).
 
 ### Prebuilt binaries
 
@@ -1273,7 +1304,9 @@ The workspace splits a pure core library
 [HANDOFF.md](HANDOFF.md) for the current project state, and
 [CHANGELOG.md](CHANGELOG.md) for what changed between releases.
 
-Man page generation (for packagers):
+### Packaging
+
+Man page generation:
 
 ```bash
 cargo run --release --package camembert --bin camembert-mangen -- <OUT_DIR>
@@ -1282,6 +1315,33 @@ cargo run --release --package camembert --bin camembert-mangen -- <OUT_DIR>
 writes `<OUT_DIR>/camembert.1` (plus `camembert-diff.1` and
 `camembert-import.1` for the subcommands), creating `OUT_DIR` if it
 doesn't exist. Install the result to `/usr/share/man/man1/`.
+
+Shell completion generation:
+
+```bash
+cargo run --release --package camembert --bin camembert-completions -- <OUT_DIR>
+```
+
+writes `<OUT_DIR>/camembert.bash`, `<OUT_DIR>/_camembert` (zsh) and
+`<OUT_DIR>/camembert.fish`, again creating `OUT_DIR` if needed. Both
+generators derive their output from the same `clap` definitions the binary
+parses with, so neither can document a flag that no longer exists.
+
+To build the `.deb` and `.rpm` themselves:
+
+```bash
+cargo install --locked --root target/packaging-tools cargo-deb cargo-generate-rpm
+scripts/build-packages.sh
+```
+
+`build-packages.sh` builds the release binary, regenerates the man pages and
+completions, and runs both packagers; `--target <triple>` packages a
+cross/static build, and `--deb-only` / `--rpm-only` narrow the output. Both
+packagers are plain Rust binaries, so no `dpkg`, `rpmbuild`, or Docker is
+involved — the packages build on any host, which is also how CI produces
+them. The install layout lives in
+[`camembert/Cargo.toml`](camembert/Cargo.toml) under
+`[package.metadata.deb]` and `[package.metadata.generate-rpm]`.
 
 ## License
 

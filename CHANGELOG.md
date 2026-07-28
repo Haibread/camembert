@@ -24,6 +24,22 @@ one is called out under **Breaking** with the migration to apply.
 
 ### Added
 
+- **Native `.deb` and `.rpm` packages**, built for `x86_64` and `aarch64`
+  and attached to every release. They install the binary, the three man
+  pages, and bash/zsh/fish completions. The packaged binary is the same
+  static musl build as the tarballs, so the packages declare no
+  dependencies and install on any glibc vintage — at the price of not
+  being distro-archive-policy packages. There is no APT/DNF repository
+  yet: upgrading means downloading the next release.
+- **Shell completions** for bash, zsh and fish, generated from the live
+  `clap` definitions by a new `camembert-completions` binary (the same
+  pattern `camembert-mangen` already used for the man pages). Packagers
+  and from-source installers get them with
+  `cargo run --release --package camembert --bin camembert-completions -- <OUT_DIR>`.
+- `scripts/build-packages.sh`, which builds the release binary,
+  regenerates the man pages and completions, and produces both packages.
+  It is what the release workflow runs, so a package can be reproduced
+  locally exactly as CI built it.
 - **A Windows scan backend** (`x86_64-pc-windows-msvc`). `camembert-core`
   builds and its scan engine runs there: real allocated sizes from
   `AllocationSize` (measured compression-aware on NTFS), real hardlink
