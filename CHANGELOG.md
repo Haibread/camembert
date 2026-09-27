@@ -9,6 +9,8 @@ one is called out under **Breaking** with the migration to apply.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-09-27
+
 ### Changed
 
 - **Release archive names drop the target triple's vendor field.**
@@ -251,7 +253,8 @@ and musl builds for x86_64 and aarch64. See the
 [commit history](https://github.com/Haibread/camembert/commits/v0.1.0) for
 the full detail.
 
-[Unreleased]: https://github.com/Haibread/camembert/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/Haibread/camembert/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/Haibread/camembert/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Haibread/camembert/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/Haibread/camembert/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/Haibread/camembert/compare/v0.1.0...v0.2.0
