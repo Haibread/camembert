@@ -159,7 +159,7 @@ a tagged release straight from the repository and puts `camembert` in
 `~/.cargo/bin` (`%USERPROFILE%\.cargo\bin` on Windows):
 
 ```bash
-cargo install --locked --git https://github.com/Haibread/camembert --tag v0.4.1 camembert
+cargo install --locked --git https://github.com/Haibread/camembert --tag v0.4.1 --bin camembert camembert
 ```
 
 The `camembert` crate on crates.io is an unrelated project: `cargo install
@@ -170,7 +170,7 @@ From a local clone instead:
 ```bash
 git clone https://github.com/Haibread/camembert
 cd camembert
-cargo install --locked --path camembert
+cargo install --locked --path camembert --bin camembert
 ```
 
 Note that `cargo install` places only the binary: man pages and completions
