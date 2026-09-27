@@ -1,0 +1,22 @@
+extends: default
+
+rules:
+  # No `---` opening a file: every YAML file here is a single document.
+  document-start:
+    present: false
+  # Block style only; `non-empty` still allows `{}` / `[]`.
+  braces:
+    forbid: non-empty
+  brackets:
+    forbid: non-empty
+  # SHA-pinned action references with their tag comment overrun 80 columns.
+  line-length: disable
+  # `uses: …@<sha> # vX.Y.Z` is the single-space form Dependabot maintains.
+  comments:
+    min-spaces-from-content: 1
+  # GitHub Actions' `on:` key is not a boolean.
+  truthy:
+    check-keys: false
+  # Git stores LF; a Windows checkout with core.autocrlf=true hands CRLF to
+  # the hook, which would fail every file there and none in CI.
+  new-lines: disable
