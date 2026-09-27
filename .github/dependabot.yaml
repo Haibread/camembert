@@ -4,7 +4,26 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 3
+    labels:
+      - dependencies
+    groups:
+      github-actions:
+        update-types:
+          - minor
+          - patch
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 3
+    labels:
+      - dependencies
+    groups:
+      # Patch only: Dependabot reads semver literally, so a 0.x minor bump
+      # (ratatui 0.29 -> 0.30) counts as "minor" although it is breaking.
+      cargo:
+        update-types:
+          - patch
