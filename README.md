@@ -1345,7 +1345,8 @@ trail lives in [`docs/design/`](docs/design/).
 
 ```bash
 cargo test --workspace          # the suite (~587 tests)
-pre-commit install              # fmt + clippy -D warnings + yamllint + hygiene hooks
+pre-commit install              # fmt + clippy -D warnings + yamllint + hygiene hooks,
+                                # and a commit-msg hook rejecting co-author trailers
 ```
 
 The workspace splits a pure core library
