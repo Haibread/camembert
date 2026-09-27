@@ -1,7 +1,7 @@
 //! Captures the git commit at build time for `--version` output.
 //!
 //! Exposes `CAMEMBERT_GIT_SHA` (read back via `env!` in `main.rs`) as the
-//! short commit hash, suffixed `-dirty` when the worktree has uncommitted
+//! short commit hash, suffixed `-dirty` when a tracked file has uncommitted
 //! changes, or `unknown` when `.git` or the `git` binary is unavailable
 //! (crates.io / plain source-tarball builds).
 //!
@@ -43,11 +43,13 @@ fn main() {
     println!("cargo:rustc-env=CAMEMBERT_GIT_SHA={sha}");
 }
 
-/// Returns the short commit hash, `-dirty`-suffixed if the worktree has
+/// Returns the short commit hash, `-dirty`-suffixed if a tracked file has
 /// uncommitted changes, or `None` if git or the repository isn't available.
 fn git_sha(dir: &Path) -> Option<String> {
     let short = run_git(dir, &["rev-parse", "--short", "HEAD"])?;
-    let dirty = !run_git(dir, &["status", "--porcelain"])?.is_empty();
+    // Untracked files are ignored: `cargo install --git` drops a `.cargo-ok`
+    // marker into its checkout, which would stamp every such build `-dirty`.
+    let dirty = !run_git(dir, &["status", "--porcelain", "--untracked-files=no"])?.is_empty();
     Some(if dirty {
         format!("{short}-dirty")
     } else {

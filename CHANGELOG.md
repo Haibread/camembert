@@ -9,6 +9,14 @@ one is called out under **Breaking** with the migration to apply.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`camembert --version` no longer says `-dirty` on a clean
+  `cargo install --git` build.** Cargo drops an untracked `.cargo-ok`
+  marker into its checkout, and the build script counted untracked files
+  as uncommitted changes. Only modified tracked files mark a build dirty
+  now.
+
 ## [0.4.1] - 2026-09-27
 
 ### Changed
