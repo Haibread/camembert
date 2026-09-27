@@ -115,7 +115,7 @@ auto-selects `light` when nothing else chose a theme — see
 install the binary, the three man pages, and bash/zsh/fish completions:
 
 ```bash
-VERSION=0.4.1 # match the release tag, without the leading "v"
+VERSION=0.4.2 # match the release tag, without the leading "v"
 
 # Debian/Ubuntu (amd64 | arm64)
 curl -LO "https://github.com/Haibread/camembert/releases/download/v${VERSION}/camembert_${VERSION}-1_amd64.deb"
@@ -159,7 +159,7 @@ a tagged release straight from the repository and puts `camembert` in
 `~/.cargo/bin` (`%USERPROFILE%\.cargo\bin` on Windows):
 
 ```bash
-cargo install --locked --git https://github.com/Haibread/camembert --tag v0.4.1 --bin camembert camembert
+cargo install --locked --git https://github.com/Haibread/camembert --tag v0.4.2 --bin camembert camembert
 ```
 
 The `camembert` crate on crates.io is an unrelated project: `cargo install
@@ -186,7 +186,7 @@ Static musl binaries for `x86_64` and `aarch64` Linux are attached to every
 ARCH=x86_64-linux-musl
 ARCH=aarch64-linux-musl
 
-VERSION=0.4.1 # match the release tag, without the leading "v"
+VERSION=0.4.2 # match the release tag, without the leading "v"
 curl -LO "https://github.com/Haibread/camembert/releases/download/v${VERSION}/camembert-${VERSION}-${ARCH}.tar.gz"
 curl -LO "https://github.com/Haibread/camembert/releases/download/v${VERSION}/camembert-${VERSION}-${ARCH}.tar.gz.sha256"
 
@@ -222,7 +222,7 @@ attached to every release, holding `camembert.exe` alongside the same
 licences and README:
 
 ```powershell
-$VERSION = "0.4.1" # match the release tag, without the leading "v"
+$VERSION = "0.4.2" # match the release tag, without the leading "v"
 $NAME = "camembert-$VERSION-x86_64-windows-msvc"
 Invoke-WebRequest -OutFile "$NAME.zip" `
   "https://github.com/Haibread/camembert/releases/download/v$VERSION/$NAME.zip"
@@ -238,7 +238,7 @@ release if you have the tool. See [Platform support](#platform-support) for
 what the Windows build does and does not do.
 
 `camembert --version` embeds the exact commit it was built from (e.g.
-`camembert 0.4.1 (abc1234)`), so you can always tell what you're running.
+`camembert 0.4.2 (abc1234)`), so you can always tell what you're running.
 
 ## Platform support
 

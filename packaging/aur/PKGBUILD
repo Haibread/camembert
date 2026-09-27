@@ -14,7 +14,7 @@
 # See README.md in this directory.
 
 pkgname=camembert
-pkgver=0.4.1
+pkgver=0.4.2
 pkgrel=1
 _commit=b36f189
 pkgdesc='Disk usage analyzer that answers the real questions: what grew, what is freeable, what is cold'
