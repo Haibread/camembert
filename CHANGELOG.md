@@ -9,6 +9,18 @@ one is called out under **Breaking** with the migration to apply.
 
 ## [Unreleased]
 
+### Added
+
+- **`r` rescans one directory and grafts it into the tree.** Once the
+  scan is done, `r` on a directory row rescans that directory in the
+  background, then replaces its subtree and moves every ancestor's total
+  by the difference. Hardlinks straddling the directory still count once,
+  as in a full scan. The header shows the rescan while it runs and how
+  many directories were refreshed afterwards, and the selection card says
+  when an entry's directory was refreshed. Works on Linux and Windows,
+  where cleanups happen outside camembert and a full rescan of `C:\`
+  costs minutes ([#35](https://github.com/Haibread/camembert/issues/35)).
+
 ## [0.4.2] - 2026-09-27
 
 ### Fixed

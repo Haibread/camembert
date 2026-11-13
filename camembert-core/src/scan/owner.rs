@@ -118,6 +118,11 @@ pub(crate) struct Owner {
     /// there (`hardlinks.len()` no longer means anything on that path).
     #[cfg(windows)]
     repeat_inodes: u64,
+    /// [`LinkPolicy::FileIdRepeat`] only: `(dev, ino)` of inodes a rescan
+    /// knows to have a link outside this scan, so their first sighting is
+    /// already a repeat (`crate::scan::LinkSeed`). Empty for a plain scan.
+    #[cfg(windows)]
+    link_seed: FxHashSet<(u64, u64)>,
     /// Which registry-admission rule this owner runs.
     policy: LinkPolicy,
     /// Every registered link seen (first and extras): input of the
@@ -164,6 +169,8 @@ impl Owner {
             first_by_ino: FxHashMap::default(),
             #[cfg(windows)]
             repeat_inodes: 0,
+            #[cfg(windows)]
+            link_seed: FxHashSet::default(),
             policy: LinkPolicy::default(),
             hardlink_links: Vec::new(),
             hardlink_extra_links: 0,
@@ -194,6 +201,14 @@ impl Owner {
     #[cfg(windows)]
     pub(crate) fn set_link_policy(&mut self, policy: LinkPolicy) {
         self.policy = policy;
+    }
+
+    /// Seed the [`LinkPolicy::FileIdRepeat`] registry with inodes known to
+    /// have links outside this scan (a rescan, see `crate::scan::LinkSeed`).
+    /// Must run before any batch is integrated.
+    #[cfg(windows)]
+    pub(crate) fn seed_links(&mut self, seed: FxHashSet<(u64, u64)>) {
+        self.link_seed = seed;
     }
 
     /// The live flat accumulator, if enabled (for the publisher's tick).
@@ -488,6 +503,21 @@ impl Owner {
                             // the dossier priced is simply not paid.
                             None => {
                                 self.first_by_ino.insert(entry.ino, node);
+                                if !self.link_seed.is_empty()
+                                    && self.link_seed.contains(&(entry.dev, entry.ino))
+                                {
+                                    // Its other link lives outside this
+                                    // rescan: promote on the spot, exactly
+                                    // like a repeat would.
+                                    self.tree.mark_hardlink_first(node);
+                                    self.repeat_inodes += 1;
+                                    self.hardlink_links.push(HardlinkLink {
+                                        node,
+                                        dev: entry.dev,
+                                        ino: entry.ino,
+                                        nlink: super::hardlink::NLINK_UNDETERMINED,
+                                    });
+                                }
                             }
                             Some(first) => {
                                 // A repeat proves the group. Promote it

@@ -27,6 +27,7 @@ mod hardlink;
 mod linux;
 pub(crate) mod message;
 pub(crate) mod owner;
+mod rescan;
 #[cfg(target_os = "windows")]
 mod windows;
 
@@ -57,6 +58,7 @@ use crate::view::{ViewBus, ViewPublisher};
 pub use backend::path_on_compressed_mount;
 pub use hardlink::{HardlinkGroup, HardlinkLink, NLINK_UNDETERMINED};
 use owner::Owner;
+pub use rescan::{GraftError, GraftReport, LinkSeed};
 
 /// Bound of the worker → owner channel (sections). Backpressure: workers
 /// stall rather than letting integration lag grow unbounded.
@@ -219,6 +221,9 @@ pub struct Scanner {
     /// Flat-view accumulation config (D2), set via [`Scanner::with_flat`].
     /// `None` = no live flat view during the scan.
     flat: Option<FlatConfig>,
+    /// Inodes to treat as already reached, set via
+    /// [`Scanner::with_link_seed`].
+    link_seed: LinkSeed,
 }
 
 impl Scanner {
@@ -227,7 +232,17 @@ impl Scanner {
             options,
             progress: Arc::new(ScanProgress::default()),
             flat: None,
+            link_seed: LinkSeed::default(),
         }
+    }
+
+    /// Scan as part of a rescan whose hardlink registry must join the
+    /// session's (see [`LinkSeed`] and [`ScanOutcome::rescan_link_seed`]).
+    /// A no-op wherever the scan obtains link counts.
+    #[must_use]
+    pub fn with_link_seed(mut self, seed: LinkSeed) -> Self {
+        self.link_seed = seed;
+        self
     }
 
     /// Enable the live flat view + pattern breakdown (D2): the owner
@@ -242,6 +257,11 @@ impl Scanner {
     pub fn with_flat(mut self, config: FlatConfig) -> Self {
         self.flat = Some(config);
         self
+    }
+
+    /// The options this scanner runs with (a rescan reuses them).
+    pub fn options(&self) -> &ScanOptions {
+        &self.options
     }
 
     /// Shared progress handle; poll it from another thread while
@@ -421,6 +441,7 @@ impl Scanner {
         #[cfg(windows)]
         if !link_counts_known {
             owner.set_link_policy(owner::LinkPolicy::FileIdRepeat);
+            owner.seed_links(self.link_seed.inodes.clone());
         }
         if let Some(flat) = self.flat.clone() {
             owner.enable_flat(flat);

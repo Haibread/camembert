@@ -251,7 +251,8 @@ deduplicates hardlinks, and drives almost the whole interactive UI.
 Identical on both: the directory table, the donut wheel, the disk gauge
 (`GetDiskFreeSpaceExW` in place of `statvfs`), navigation, sorting, the `p`
 apparent-size toggle, zen mode, flat view (`t`), the pattern breakdown
-(`b`), `o` reveal-in-file-manager and `y` copy-path (the one bridge to
+(`b`), [`r` rescan](#rescan-a-directory), `o` reveal-in-file-manager and
+`y` copy-path (the one bridge to
 "act on it outside camembert" that Windows needs *more* than Linux does,
 since Windows has no in-app deletion at all — see below), the Ctrl-K/`/`
 palette and the full query grammar, themes, mouse and the `?` cheatsheet —
@@ -615,6 +616,7 @@ has proven itself.
 | `p` | toggle the apparent-size column |
 | `t` `b` | flat top files across the whole scan · pattern breakdown (press again to return to the tree) |
 | `o` `y` | reveal the entry under the cursor in the system file manager · copy its full path to the clipboard via OSC 52 (works over SSH; camembert cannot confirm the terminal actually accepted it, so the toast says "attempted") — tree and flat rows, flat only once the scan completes. Inside the delete-confirmation dialog, `y` instead confirms the deletion (below) |
+| `r` | rescan the directory under the cursor (a flat row's containing directory; the current directory when the view is empty) and graft it into the tree, once the scan is done — see [Rescan a directory](#rescan-a-directory) |
 | `Space` `u` `D` | mark for deletion (tree/flat rows; not breakdown) · clear marks · delete (confirm with `y`) |
 | `v` | review marked entries: a scrollable list, `Space` unmarks a row, `D` deletes from there too |
 | `f` | freeable files: deleted-but-open files still holding disk space (`f`/`Esc` closes) |
@@ -659,6 +661,38 @@ much is freeable by closing files — stacking and auto-dismissing after a
 few seconds; they never cover the delete-confirmation dialog. Ordinary
 keypress feedback (mark refusals, "nothing marked") stays a quick footer
 note instead, right next to the key hints it explains.
+
+## Rescan a directory
+
+Once the scan is done, `r` rescans the directory under the cursor in the
+background and grafts the result into the tree. On a flat-view row it
+rescans the row's containing directory. With nothing under the cursor (an
+empty directory), it rescans the directory you are in, which is also how
+to rescan the root. Nothing else is rescanned, so checking a cleanup done
+in Explorer or a shell costs a scan of that folder, not of the whole disk.
+
+While it runs, the header reads `rescanning <name>` and the old numbers
+stay on screen. You can keep browsing. When it lands, the directory's
+subtree is replaced, every ancestor's total moves by the difference, and a
+toast says what the directory weighed before and after. The header then
+reads `done · N refreshed`, and the selection card of anything at or under
+a rescanned directory says `refreshed 2 min ago`. Everything else still
+shows the original scan's instant.
+
+The numbers stay what a full scan of the same state would report for the
+rescanned directory. That includes hardlinks with one link inside the
+directory and one outside: they count once, at their canonical link, as
+in a full scan. One case is out of reach by construction. A hardlink
+*created after the scan* between the rescanned directory and somewhere
+outside it is invisible, because the outside is not re-observed. A full
+rescan (`r` at the root) sees it.
+
+A directory that no longer exists is removed from the tree. Any other
+failure (access denied, say) leaves the old subtree in place and says why.
+Marks under a rescanned directory are dropped, because the entries they
+pointed at were replaced. Excluded mount points are never rescanned. A
+dump written with `--output` records the original scan and is not
+rewritten.
 
 ## Mouse (interactive mode)
 

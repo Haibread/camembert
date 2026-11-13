@@ -189,7 +189,7 @@ pub(crate) fn reattribute(tree: &mut Tree, links: &[HardlinkLink]) -> u64 {
 }
 
 /// The directory a node's entry line lives in (its parent).
-fn parent_dir(tree: &Tree, node: NodeId) -> DirId {
+pub(super) fn parent_dir(tree: &Tree, node: NodeId) -> DirId {
     let parent = tree.node(node).parent();
     tree.dir_of(parent)
         .expect("a scanned entry's parent is a scanned directory")
@@ -197,7 +197,7 @@ fn parent_dir(tree: &Tree, node: NodeId) -> DirId {
 
 /// Raw-byte, component-wise full-path comparison (spec §4): names up the
 /// parent chain, compared root-first.
-fn cmp_paths(tree: &Tree, a: NodeId, b: NodeId) -> std::cmp::Ordering {
+pub(super) fn cmp_paths(tree: &Tree, a: NodeId, b: NodeId) -> std::cmp::Ordering {
     let components = |node: NodeId| {
         let mut comps: Vec<&[u8]> = Vec::new();
         let mut cur = node;
