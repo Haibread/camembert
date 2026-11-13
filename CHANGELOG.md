@@ -9,6 +9,8 @@ one is called out under **Breaking** with the migration to apply.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-13
+
 ### Added
 
 - **`r` rescans one directory and grafts it into the tree.** Once the
@@ -275,7 +277,8 @@ and musl builds for x86_64 and aarch64. See the
 [commit history](https://github.com/Haibread/camembert/commits/v0.1.0) for
 the full detail.
 
-[Unreleased]: https://github.com/Haibread/camembert/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/Haibread/camembert/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Haibread/camembert/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/Haibread/camembert/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/Haibread/camembert/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Haibread/camembert/compare/v0.3.0...v0.4.0
