@@ -177,6 +177,10 @@ const EXTRA_BEFORE_RECLAIM: &[ExtraKey] = &[
         keys: "y",
         action: "copy the entry's full path to the clipboard (OSC 52) [tree/flat]",
     },
+    ExtraKey {
+        keys: "r",
+        action: "rescan the directory under the cursor and graft it into the tree [tree/flat]",
+    },
 ];
 
 /// The mark/delete/review/freeable block — present only where the reclaim

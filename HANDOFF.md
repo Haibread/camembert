@@ -38,6 +38,10 @@ pitch.
     sweep-ledger shape, root-fs scoping, nlink==0 ground truth, scan-end
     + pre-deletion lifecycle, gauge/panel/toast UI, advisory warning,
     `--no-proc-sweep`, no dump keys, module isolation).
+  - [subtree-rescan-decisions.md](docs/design/subtree-rescan-decisions.md)
+    (D1–D5: graft with cross-boundary hardlink merge, `r` on the cursor
+    row, background rescan swapped in at the end, freshness disclosed,
+    Windows registry seed).
   - [freeable2-decisions.md](docs/design/freeable2-decisions.md) (D1–D6:
     oracle-first Option B, allocated-logical units + "exclusive" wording,
     floor lifecycle + kernel ≥ 6.1 gate + `--no-fiemap`, mark-time oracle
@@ -205,6 +209,21 @@ pitch.
   totals + residual pill, composition with t/b/donut, dir marks
   refused under filter, history in XDG state + read-only `[queries]`,
   `--filter`/FILTER (strict in --no-ui, exit 2; dumps never filtered).
+- **Subtree rescan** (`camembert-core/src/tree/graft.rs`,
+  `camembert-core/src/scan/rescan.rs`, `camembert/src/ui/rescan_rt.rs`):
+  per [subtree-rescan-decisions.md](docs/design/subtree-rescan-decisions.md)
+  D1–D5 (issue #35) — `r` rescans the directory row under the cursor in
+  the background and grafts it: the directory keeps its node and `DirId`,
+  old descendants are tombstoned, fresh ones appended as new runs,
+  ancestors shift by the aggregate difference. Hardlink groups touched by
+  the graft are re-canonicalised over their live links and their `nlink`
+  refreshed; Windows seeds the `FileIdRepeat` registry with the inodes
+  that have a link outside the directory (`Scanner::with_link_seed`). A
+  root rescan swaps the whole outcome. The graft runs inside the deletion
+  envelope (floor cancel, epoch bump, oracle invalidation, floor respawn).
+  Header and selection card disclose freshness. Both platforms. Bench on
+  Windows (owner touched): 209.8 ± 9.4 ms before, 190.5 ± 4.6 ms after,
+  i.e. noise. This is the graft watch mode needs (next steps item 2).
 - **Releases**: tag-triggered workflow builds static musl binaries
   (x86_64 + aarch64, native runners) with sha256 sums attached to the
   GitHub Release, an `x86_64-pc-windows-msvc` `.zip` from its own
@@ -969,7 +988,8 @@ its SBS volume and its IP — both survive server deletion and keep billing.
    phase 2 — reopening needs a new element, and attack-b findings 1-3
    are the standing argument against sort authority).
 2. Wave 4 per the archived handoff: ssh remote scan, HTML export, watch
-   mode (single-mutator design sketched in scan-tree docs), dated cache.
+   mode (single-mutator design sketched in scan-tree docs; the subtree
+   graft it needs exists as `ScanOutcome::graft_rescan`), dated cache.
 3. Per-directory inode counters + an `f_files`-near-limit alert (statvfs)
    — the archived design's "failure mode nobody surfaces".
 4. Apparent/real slack surfacing across small-file masses (`st_blocks`

@@ -30,6 +30,7 @@
 //! message rather than silently corrupting; lifting the name limit is part
 //! of the packed-node follow-up.
 
+mod graft;
 mod interner;
 
 pub use interner::{NameInterner, NameRef};

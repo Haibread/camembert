@@ -495,6 +495,22 @@ pub struct UiState {
     /// different from showing an empty one.
     #[cfg(windows)]
     holder_state: Option<HolderState>,
+    /// What the header and the selection card say about rescans
+    /// (`docs/design/subtree-rescan-decisions.md` D3/D4), refreshed by the
+    /// event loop each frame from `rescan_rt::RescanRuntime`.
+    rescan_status: RescanStatus,
+}
+
+/// The rescan facts a frame displays (see [`UiState::rescan_status`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RescanStatus {
+    /// The directory a background rescan is scanning, by name.
+    pub running: Option<String>,
+    /// Live directories grafted from a rescan this session.
+    pub refreshed: usize,
+    /// Unix seconds of the most recent refresh at or above the selection
+    /// card's row.
+    pub card_refreshed_at: Option<i64>,
 }
 
 impl UiState {
@@ -546,6 +562,7 @@ impl UiState {
             recycle_bin: None,
             #[cfg(windows)]
             holder_state: None,
+            rescan_status: RescanStatus::default(),
         };
         state.ensure_sorted();
         state
@@ -874,6 +891,22 @@ impl UiState {
         }
         self.move_down();
         Ok(())
+    }
+
+    /// Drop the marks `keep` rejects (their nodes were tombstoned by a
+    /// rescan graft) and return their nodes.
+    pub fn drop_marks(&mut self, keep: impl Fn(NodeId) -> bool) -> Vec<NodeId> {
+        let dropped: Vec<NodeId> = self
+            .marks
+            .iter()
+            .map(|mark| mark.node)
+            .filter(|&node| !keep(node))
+            .collect();
+        for node in &dropped {
+            self.marked_set.remove(node);
+        }
+        self.marks.retain(|mark| !dropped.contains(&mark.node));
+        dropped
     }
 
     /// Clear every mark (the `u` key).
@@ -1367,12 +1400,38 @@ impl UiState {
         self.flat_epoch
     }
 
+    pub fn set_rescan_status(&mut self, status: RescanStatus) {
+        self.rescan_status = status;
+    }
+
+    pub fn rescan_status(&self) -> &RescanStatus {
+        &self.rescan_status
+    }
+
+    /// Re-view `dir` after the tree changed under the view (a rescan
+    /// graft), putting the cursor back on `focus` when it is still among
+    /// the rows. `ancestors`, root-first, replaces the descend stack when
+    /// the old one named directories the change removed. Unlike
+    /// [`Self::jump_to_directory`] this is never refused: the arena it was
+    /// asked about no longer matches any request still in flight.
+    pub fn refocus(&mut self, dir: DirId, ancestors: Option<Vec<DirId>>, focus: Option<NodeId>) {
+        if let Some(ancestors) = ancestors {
+            self.stack = ancestors.into_iter().map(|d| (d, 0)).collect();
+        }
+        self.pending_cursor = if dir == self.snapshot.dir {
+            self.cursor
+        } else {
+            0
+        };
+        self.pending_focus_node = focus;
+        self.pending_nav = Some(dir);
+    }
+
     /// Advance the deletion epoch (called once per successful deletion,
     /// regardless of which mode it was performed from) so the very next
     /// render-time check in `ui.rs` recomputes the flat/breakdown summary
     /// before drawing — never showing a just-deleted row as still
     /// occupying space (attack finding 1).
-    #[cfg(unix)]
     pub fn bump_flat_epoch(&mut self) {
         self.flat_epoch += 1;
     }

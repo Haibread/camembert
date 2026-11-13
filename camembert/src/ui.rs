@@ -82,6 +82,7 @@ mod recycle_rt;
 // reclaim subsystem this is cross-platform — Windows gets it too, and
 // needs it more, since Windows has no delete path at all (see the
 // reclaim-subsystem note above).
+mod rescan_rt;
 mod reveal;
 mod state;
 pub mod theme;
@@ -120,7 +121,9 @@ use camembert_core::flat::{self, FlatConfig};
 #[cfg(unix)]
 use camembert_core::freeable::{self, Ledger};
 use camembert_core::query::{self, ApplyOptions, FilterResult, HardlinkIndex, Query};
-use camembert_core::scan::{LiveScan, ScanOutcome, Scanner, path_on_compressed_mount};
+use camembert_core::scan::{
+    LiveScan, ScanError, ScanOptions, ScanOutcome, Scanner, path_on_compressed_mount,
+};
 use camembert_core::size::HumanSize;
 // Only the reclaim subsystem names nodes in production code; the test
 // module builds synthetic snapshots out of them on every platform.
@@ -161,6 +164,13 @@ const SORT_NOT_APPLICABLE: &str = "not available in this view";
 /// Toast for `o`/`y` on a breakdown row: a group is many entries folded
 /// together, never a single path to reveal or copy.
 const BREAKDOWN_NO_SINGLE_PATH: &str = "a breakdown group has no single path to reveal or copy";
+
+/// Flashes for `r` (`docs/design/subtree-rescan-decisions.md` D2/D3).
+const RESCAN_AFTER_SCAN: &str = "rescan is available once the scan completes";
+const RESCAN_RUNNING: &str = "a rescan is already running";
+const RESCAN_NOT_A_DIRECTORY: &str = "r rescans a directory";
+const RESCAN_EXCLUDED: &str = "an excluded mount point is never scanned, so never rescanned";
+const RESCAN_NO_GROUP: &str = "a breakdown group has no single directory to rescan";
 
 /// Frame budget: poll timeout of the render loop (~30 fps, D5) while
 /// something needs a timely redraw without new input — a running scan,
@@ -313,8 +323,8 @@ fn read_outcome(lock: &RwLock<ScanOutcome>) -> std::sync::RwLockReadGuard<'_, Sc
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Acquire the write side (deletion only — see [`Phase::Done`]'s doc).
-#[cfg(unix)]
+/// Acquire the write side (deletion and rescan grafts — see
+/// [`Phase::Done`]'s doc).
 fn write_outcome(lock: &RwLock<ScanOutcome>) -> std::sync::RwLockWriteGuard<'_, ScanOutcome> {
     lock.write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -374,6 +384,7 @@ pub fn run(
     );
     let theme_name = resolve_theme_name(theme_choice);
     let disk = disk_space(path);
+    let scan_options = scanner.options().clone();
     let live = scanner.scan_live(path);
     // ratatui::init enters the alternate screen, enables raw mode, and
     // installs a panic hook that restores the terminal first.
@@ -391,6 +402,7 @@ pub fn run(
     let result = event_loop(
         &mut terminal,
         live,
+        scan_options,
         output,
         &ctx,
         startup_toasts,
@@ -583,9 +595,11 @@ fn finish_scan(outcome: &mut ScanOutcome, output: Option<PathBuf>) -> DumpOutcom
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn event_loop(
     terminal: &mut DefaultTerminal,
     live: LiveScan,
+    scan_options: ScanOptions,
     output: Option<PathBuf>,
     ctx: &RenderCtx,
     startup_toasts: Vec<String>,
@@ -624,6 +638,9 @@ fn event_loop(
     // `PaletteState`/`UiState` the same way `Flash`/`sweep_rx` are kept out
     // of the terminal-free state modules.
     let mut palette_rt = PaletteRuntime::new(saved_queries);
+    // `r`: one background rescan at a time, grafted on completion
+    // (`docs/design/subtree-rescan-decisions.md`).
+    let mut rescan = rescan_rt::RescanRuntime::new(scan_options);
     // D7: `--filter`/`FILTER` pre-applies the instant the scan completes,
     // exactly like a palette query the user typed and committed.
     let mut pending_filter_text = filter_text.filter(|text| !text.trim().is_empty());
@@ -664,6 +681,10 @@ fn event_loop(
         if links.has_pending() || holders.has_pending() || recycle_rx.is_some() {
             deadline = FRAME;
         }
+        // The header's rescan spinner, and the graft the moment it lands.
+        if rescan.is_running() {
+            deadline = FRAME;
+        }
         while event::poll(deadline)? {
             deadline = Duration::ZERO;
             match event::read()? {
@@ -680,8 +701,10 @@ fn event_loop(
                         &mut palette_rt,
                         &ctx.flat_config,
                         &mut reclaim,
+                        &mut rescan,
                     ) {
                         Action::Quit => {
+                            rescan.cancel();
                             if let Phase::Scanning(live) = phase {
                                 info!("quit during scan: cancelling");
                                 live.cancel();
@@ -896,6 +919,19 @@ fn event_loop(
             }
         }
 
+        // 2.58. A rescan finished? Graft it (or account for its root being
+        // gone) inside the deletion envelope.
+        if let Some(landed) = rescan.poll() {
+            apply_rescan(
+                landed,
+                &mut ui,
+                &phase,
+                &mut toasts,
+                &mut reclaim,
+                &mut rescan,
+            );
+        }
+
         // 2.6. Filter fold (D5): debounced trigger, then a non-blocking
         // poll of whatever is currently in flight — same shape as the
         // freeable sweep just above, applied to the query engine instead.
@@ -966,6 +1002,24 @@ fn event_loop(
             };
             ui.set_holder_state(held);
         }
+
+        // 3.8. What the header and the selection card say about rescans.
+        let card_refreshed_at = match &phase {
+            Phase::Done(lock) => {
+                let outcome = read_outcome(lock);
+                let start = ui
+                    .card_row()
+                    .and_then(|row| row.dir)
+                    .unwrap_or(ui.snapshot().dir);
+                rescan.refreshed_at(outcome.tree(), start)
+            }
+            _ => None,
+        };
+        ui.set_rescan_status(state::RescanStatus {
+            running: rescan.running_label().map(str::to_owned),
+            refreshed: rescan.refreshed_count(),
+            card_refreshed_at,
+        });
 
         // 4. Render.
         table_state.select((ui.row_count() > 0).then_some(ui.cursor()));
@@ -1454,6 +1508,7 @@ fn handle_key(
     palette_rt: &mut PaletteRuntime,
     flat_config: &FlatConfig,
     reclaim: &mut Reclaim,
+    rescan: &mut rescan_rt::RescanRuntime,
 ) -> Action {
     // The palette (D6) is the topmost rung: while open, it owns the
     // keyboard except Esc/Enter/arrows/Home/End/Backspace/Delete/Ctrl-C —
@@ -1575,6 +1630,7 @@ fn handle_key(
         // docs).
         KeyCode::Char('o') => try_reveal(ui, phase, toasts),
         KeyCode::Char('y') => try_copy_path(ui, phase, toasts),
+        KeyCode::Char('r') => try_start_rescan(ui, phase, flash, rescan),
         // The five reclaim bindings. Absent where the subsystem is: these
         // keys fall through to `keymap::dispatch_simple`, which does not
         // claim them either, so they are inert rather than erroring — and
@@ -2030,6 +2086,212 @@ fn try_copy_path(ui: &UiState, phase: &Phase, toasts: &mut ToastQueue) {
             Err(err) => toasts.push(format!("could not copy the path: {err}")),
         },
     }
+}
+
+/// `r` (`docs/design/subtree-rescan-decisions.md` D2): rescan, in the
+/// background, the directory row under the cursor — the viewed directory
+/// itself when the view is empty, and a flat row's containing directory.
+fn try_start_rescan(
+    ui: &UiState,
+    phase: &Phase,
+    flash: &mut Flash,
+    rescan: &mut rescan_rt::RescanRuntime,
+) {
+    let Phase::Done(lock) = phase else {
+        flash.set(RESCAN_AFTER_SCAN);
+        return;
+    };
+    if rescan.is_running() {
+        flash.set(RESCAN_RUNNING);
+        return;
+    }
+    let target = match ui.mode() {
+        ViewMode::Tree => match ui.selected() {
+            None => Ok(ui.snapshot().dir),
+            Some(row) => match row.dir {
+                Some(dir) => Ok(dir),
+                None if row.is_dir => Err(RESCAN_EXCLUDED),
+                None => Err(RESCAN_NOT_A_DIRECTORY),
+            },
+        },
+        ViewMode::FlatTop => {
+            let guard = read_outcome(lock);
+            let outcome = &*guard;
+            let rows = flat_display_rows(ui, outcome);
+            let order = flatview::sort_flat_rows(&rows, ui.sort());
+            let Some(&index) = order.get(ui.cursor()) else {
+                return;
+            };
+            let tree = outcome.tree();
+            let parent = tree.node(rows[index].node).parent();
+            Ok(tree
+                .dir_of(parent)
+                .expect("a scanned entry's parent is a scanned directory"))
+        }
+        ViewMode::Breakdown => Err(RESCAN_NO_GROUP),
+    };
+    match target {
+        Ok(dir) => rescan.start(lock, dir),
+        Err(message) => flash.set(message),
+    }
+}
+
+/// A rescan landed (D1/D3): graft it inside the same envelope a deletion
+/// uses — floor cancelled before the write lock, then epoch bump, oracle
+/// invalidation, floor respawn and a re-view. A root that no longer exists
+/// removes the directory from the tree, because that is what the
+/// filesystem now says; any other failure changes nothing.
+#[cfg_attr(
+    not(unix),
+    expect(unused_variables, reason = "reclaim-only parameters")
+)]
+fn apply_rescan(
+    landed: rescan_rt::Landed,
+    ui: &mut UiState,
+    phase: &Phase,
+    toasts: &mut ToastQueue,
+    reclaim: &mut Reclaim,
+    rescan: &mut rescan_rt::RescanRuntime,
+) {
+    let Phase::Done(lock) = phase else {
+        return;
+    };
+    let name = landed.path.display().to_string();
+    let fresh = match landed.result {
+        Ok(fresh) => Some(fresh),
+        Err(ScanError::OpenRoot { source, .. } | ScanError::StatRoot { source, .. })
+            if source.kind() == io::ErrorKind::NotFound =>
+        {
+            None
+        }
+        Err(err) => {
+            toasts.push(format!("rescan failed, nothing changed: {err}"));
+            return;
+        }
+    };
+    #[cfg(unix)]
+    reclaim.floor.cancel_for_deletion();
+    #[cfg(unix)]
+    let prev_floor = ui.floor().map(|(map, _)| Arc::clone(map));
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let (message, changed, replaced_whole) = {
+        let mut guard = write_outcome(lock);
+        let outcome = &mut *guard;
+        match fresh {
+            Some(fresh) => match outcome.graft_rescan(landed.dir, fresh) {
+                Ok(report) => {
+                    let refreshed = if report.replaced_whole {
+                        rescan.reset();
+                        outcome.root()
+                    } else {
+                        landed.dir
+                    };
+                    rescan.record(outcome.tree(), refreshed, now);
+                    (
+                        format!(
+                            "rescanned {name}: {} → {}",
+                            HumanSize(report.before.real),
+                            HumanSize(report.after.real)
+                        ),
+                        true,
+                        report.replaced_whole,
+                    )
+                }
+                Err(err) => (format!("rescan of {name} not applied: {err}"), false, false),
+            },
+            None => {
+                let node = outcome.dir(landed.dir).node;
+                match outcome.apply_removal(node) {
+                    Ok(_) => (
+                        format!("{name} no longer exists — removed from the tree"),
+                        true,
+                        false,
+                    ),
+                    Err(err) => (format!("{name} no longer exists: {err}"), false, false),
+                }
+            }
+        }
+    };
+    info!(%message, "rescan landed");
+    if changed {
+        ui.bump_flat_epoch();
+        #[cfg(unix)]
+        {
+            reclaim.oracle.on_deletion();
+            ui.clear_floor();
+            let dropped = if replaced_whole {
+                let count = ui.marks().len();
+                ui.unmark_all();
+                reclaim.oracle.clear_marks();
+                count
+            } else {
+                let guard = read_outcome(lock);
+                let tree = guard.tree();
+                let dropped = ui.drop_marks(|node| !tree.is_removed(node));
+                for &node in &dropped {
+                    reclaim.oracle.mark_removed(node);
+                }
+                dropped.len()
+            };
+            if dropped > 0 {
+                toasts.push(format!(
+                    "{dropped} mark{} under the rescanned directory dropped",
+                    if dropped == 1 { "" } else { "s" }
+                ));
+            }
+        }
+        refocus_after_change(ui, lock, replaced_whole);
+    }
+    // The deletion interlock's second half: always respawn after the
+    // cancel above. A graft added nodes no previous map knows about, so
+    // only an unchanged tree may reuse the old one.
+    #[cfg(unix)]
+    reclaim
+        .floor
+        .respawn_after_deletion(Arc::clone(lock), if changed { None } else { prev_floor });
+    toasts.push(message);
+}
+
+/// Point the view back at something live after a graft or a removal: the
+/// nearest surviving directory, with the descend stack rebuilt from the
+/// arena when the change removed part of it, and the cursor kept on its
+/// row when that row survived.
+fn refocus_after_change(ui: &mut UiState, lock: &RwLock<ScanOutcome>, replaced_whole: bool) {
+    let guard = read_outcome(lock);
+    let outcome = &*guard;
+    let tree = outcome.tree();
+    if replaced_whole {
+        ui.refocus(outcome.root(), Some(Vec::new()), None);
+        return;
+    }
+    let mut dir = ui.snapshot().dir;
+    let stale = ui
+        .stack_dirs()
+        .chain(std::iter::once(dir))
+        .any(|d| tree.is_removed(tree.dir(d).node));
+    while tree.is_removed(tree.dir(dir).node) {
+        dir = tree
+            .dir(dir)
+            .parent
+            .expect("the scan root is never removed");
+    }
+    let ancestors = stale.then(|| {
+        let mut chain = Vec::new();
+        let mut cur = tree.dir(dir).parent;
+        while let Some(d) = cur {
+            chain.push(d);
+            cur = tree.dir(d).parent;
+        }
+        chain.reverse();
+        chain
+    });
+    let focus = ui
+        .selected()
+        .map(|row| row.node)
+        .filter(|&node| !tree.is_removed(node));
+    ui.refocus(dir, ancestors, focus);
 }
 
 /// Sort keypress (`d`/`a`/`n`/`m`/`c`/`e`, D3): refused with a flash when
@@ -2996,10 +3258,15 @@ fn draw_header(
     let snapshot = ui.snapshot();
     let theme = &ctx.theme;
     let signature = if ctx.ascii() { "camembert" } else { SIGNATURE };
-    let status: Span<'_> = if snapshot.stats.root_complete {
-        Span::from("done").fg(theme.color(theme::GOOD))
-    } else {
+    let rescan = ui.rescan_status();
+    let status: Span<'_> = if !snapshot.stats.root_complete {
         Span::from(format!("{spinner} scanning")).fg(theme.color(theme::ACCENT))
+    } else if let Some(label) = &rescan.running {
+        Span::from(format!("{spinner} rescanning {label}")).fg(theme.color(theme::ACCENT))
+    } else if rescan.refreshed > 0 {
+        Span::from(format!("done · {} refreshed", rescan.refreshed)).fg(theme.color(theme::GOOD))
+    } else {
+        Span::from("done").fg(theme.color(theme::GOOD))
     };
     let path = snapshot.path.display().to_string();
     let mut spans = vec![
@@ -3906,7 +4173,7 @@ fn draw_selection_card(
     // trades the mtime/items line for a severity-aware errno note: the
     // errno, its human label, and the consequence (an unreadable directory's
     // subtree is unknown, so its size is only a floor).
-    let line2 = if let Some(errno) = row.error_reason {
+    let mut line2 = if let Some(errno) = row.error_reason {
         let slot = severity_slot(errno::severity(errno));
         let glyph = if ctx.ascii() { "! " } else { "⚠ " };
         vec![
@@ -3932,6 +4199,13 @@ fn draw_selection_card(
         }
         line2
     };
+    if let Some(at) = ui.rescan_status().card_refreshed_at {
+        line2.push(sep.clone());
+        line2.push(
+            Span::from(format!("refreshed {}", fmt::humanize_age(now, at)))
+                .fg(theme.color(theme::INFO)),
+        );
+    }
     let mut lines = vec![
         Line::from(vec![
             Span::from(format!("{:>9}", HumanSize(row.disk).to_string())).bold(),
@@ -4664,6 +4938,8 @@ fn draw_confirm_modal(
     lines.push(Line::from(
         "press y to confirm — any other key cancels".bold(),
     ));
+    lines.push(Line::default());
+    lines.push(Line::from("? or Esc closes".italic().dim()));
 
     let area = frame.area();
     let width = (lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 4)
@@ -4990,8 +5266,6 @@ fn draw_cheatsheet_modal(frame: &mut Frame<'_>, ctx: &RenderCtx) {
     for key in keymap::MOUSE {
         lines.push(key_line(key.keys, key.action));
     }
-    lines.push(Line::default());
-    lines.push(Line::from("? or Esc closes".italic().dim()));
 
     let area = frame.area();
     let width = (lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 4)
@@ -6986,7 +7260,7 @@ mod tests {
         // One representative row from each of the three tables.
         assert!(content.contains("move down"), "SIMPLE entry present");
         assert!(content.contains("delete the marked"), "EXTRA entry present");
-        assert!(content.contains("scroll the cursor"), "MOUSE entry present");
+        assert!(content.contains("click a row"), "MOUSE entry present");
 
         for (width, height) in [(120, 35), (40, 10), (10, 5), (3, 2), (1, 1)] {
             let ctx = ctx(GlyphLevel::HalfBlock, ColorLevel::Truecolor);
@@ -7077,6 +7351,7 @@ mod tests {
         let mut palette_rt = PaletteRuntime::new(Vec::new());
         let flat_config = FlatConfig::default();
         let mut reclaim = Reclaim::new(true);
+        let mut rescan = rescan_rt::RescanRuntime::new(ScanOptions::default());
         handle_key(
             code,
             KeyModifiers::NONE,
@@ -7089,6 +7364,7 @@ mod tests {
             &mut palette_rt,
             &flat_config,
             &mut reclaim,
+            &mut rescan,
         )
     }
 
@@ -7536,6 +7812,160 @@ mod tests {
         );
         assert_eq!(ui.sort(), before, "mtime sort did not apply in breakdown");
         assert_eq!(flash.current(), Some(SORT_NOT_APPLICABLE));
+    }
+
+    // ---- `r`: rescan a directory and graft it ----------------------------
+
+    /// A `Phase::Done` UI over `tmp`'s current contents, at the root.
+    fn done_ui_at(path: &Path) -> (UiState, Phase) {
+        let outcome = scan_dir(path);
+        let stats = view::scan_stats(outcome.tree(), outcome.root(), outcome.elapsed);
+        let snapshot = view::build_snapshot(
+            outcome.tree(),
+            outcome.root(),
+            1,
+            stats,
+            outcome.hardlink_inodes,
+            false,
+        );
+        let ui = UiState::new(Arc::new(snapshot));
+        (ui, Phase::Done(Arc::new(RwLock::new(outcome))))
+    }
+
+    /// Wait for the background rescan, graft it, and serve the re-view the
+    /// way the event loop's steps 2.58 and 3 do.
+    fn land_rescan(
+        rescan: &mut rescan_rt::RescanRuntime,
+        ui: &mut UiState,
+        phase: &Phase,
+        toasts: &mut ToastQueue,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let landed = loop {
+            if let Some(landed) = rescan.poll() {
+                break landed;
+            }
+            assert!(Instant::now() < deadline, "rescan never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let mut reclaim = Reclaim::new(true);
+        apply_rescan(landed, ui, phase, toasts, &mut reclaim, rescan);
+        let mut generation = 10;
+        if let Some(dir) = ui.pending_nav() {
+            serve_local(phase, dir, &mut generation, ui);
+        }
+    }
+
+    fn toast_texts(toasts: &mut ToastQueue) -> Vec<String> {
+        toasts
+            .active()
+            .iter()
+            .map(|toast| toast.message.clone())
+            .collect()
+    }
+
+    #[test]
+    fn r_before_the_scan_completes_flashes_instead_of_rescanning() {
+        let mut ui = UiState::new(sample_snapshot());
+        let mut phase = Phase::Transitioning;
+        let (mut generation, mut flash, mut toasts) = (1u64, Flash::new(), ToastQueue::new());
+        press(
+            KeyCode::Char('r'),
+            &mut ui,
+            &mut phase,
+            &mut generation,
+            &mut flash,
+            &mut toasts,
+        );
+        assert_eq!(flash.current(), Some(RESCAN_AFTER_SCAN));
+    }
+
+    #[test]
+    fn r_on_a_file_row_flashes_instead_of_rescanning() {
+        let (mut ui, mut phase) = done_ui_with_one_file();
+        let (mut generation, mut flash, mut toasts) = (1u64, Flash::new(), ToastQueue::new());
+        press(
+            KeyCode::Char('r'),
+            &mut ui,
+            &mut phase,
+            &mut generation,
+            &mut flash,
+            &mut toasts,
+        );
+        assert_eq!(flash.current(), Some(RESCAN_NOT_A_DIRECTORY));
+    }
+
+    #[test]
+    fn a_rescan_grafts_the_new_contents_and_records_the_refresh() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(tmp.path().join("sub")).expect("mkdir");
+        std::fs::write(tmp.path().join("sub/old"), vec![0u8; 100]).expect("write");
+        let (mut ui, phase) = done_ui_at(tmp.path());
+        let before = ui.selected().expect("the sub row").disk;
+
+        std::fs::write(tmp.path().join("sub/new"), vec![0u8; 1 << 20]).expect("write");
+        let mut rescan = rescan_rt::RescanRuntime::new(ScanOptions::default());
+        let mut flash = Flash::new();
+        let mut toasts = ToastQueue::new();
+        try_start_rescan(&ui, &phase, &mut flash, &mut rescan);
+        assert!(rescan.is_running(), "flash: {:?}", flash.current());
+        assert_eq!(rescan.running_label(), Some("sub"));
+        land_rescan(&mut rescan, &mut ui, &phase, &mut toasts);
+
+        let row = ui.selected().expect("the cursor stays on the sub row");
+        assert_eq!(&*row.name, b"sub");
+        assert!(row.disk >= before + (1 << 20), "{} → {}", before, row.disk);
+        assert_eq!(rescan.refreshed_count(), 1);
+        let Phase::Done(lock) = &phase else {
+            unreachable!()
+        };
+        let outcome = read_outcome(lock);
+        let sub = row.dir.expect("sub is a directory");
+        assert!(rescan.refreshed_at(outcome.tree(), sub).is_some());
+        assert!(
+            rescan
+                .refreshed_at(outcome.tree(), outcome.root())
+                .is_none(),
+            "the root itself was not refreshed"
+        );
+        assert!(
+            toast_texts(&mut toasts)
+                .iter()
+                .any(|t| t.starts_with("rescanned ")),
+            "{:?}",
+            toast_texts(&mut toasts)
+        );
+    }
+
+    #[test]
+    fn a_rescan_of_a_vanished_directory_removes_it_from_the_tree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir(tmp.path().join("gone")).expect("mkdir");
+        std::fs::write(tmp.path().join("gone/f"), vec![0u8; 100]).expect("write");
+        std::fs::write(tmp.path().join("stays"), vec![0u8; 10]).expect("write");
+        let (mut ui, phase) = done_ui_at(tmp.path());
+        while ui.selected().is_some_and(|row| &*row.name != b"gone") {
+            ui.move_down();
+        }
+
+        let mut rescan = rescan_rt::RescanRuntime::new(ScanOptions::default());
+        let mut flash = Flash::new();
+        let mut toasts = ToastQueue::new();
+        std::fs::remove_dir_all(tmp.path().join("gone")).expect("remove");
+        try_start_rescan(&ui, &phase, &mut flash, &mut rescan);
+        land_rescan(&mut rescan, &mut ui, &phase, &mut toasts);
+
+        assert!(
+            ui.snapshot().rows.iter().all(|row| &*row.name != b"gone"),
+            "the vanished directory left the view"
+        );
+        assert!(
+            toast_texts(&mut toasts)
+                .iter()
+                .any(|t| t.contains("no longer exists")),
+            "{:?}",
+            toast_texts(&mut toasts)
+        );
     }
 
     #[cfg(unix)]

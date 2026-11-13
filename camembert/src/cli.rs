@@ -581,7 +581,8 @@ Dump:
   attributed to their canonical (smallest-path) link before writing.
   '-' streams the dump to stdout (summary mode only; the summary text is
   then suppressed). In interactive mode the dump is written when the
-  scan completes; quitting mid-scan cancels the scan and skips it.
+  scan completes; quitting mid-scan cancels the scan and skips it. A
+  later rescan (r) does not rewrite it: the dump records the scan.
 
 Keys (interactive mode):
   Down/j, Up/k     move the cursor
@@ -607,6 +608,11 @@ Keys (interactive mode):
                    below); press t again to return to the tree
   b                pattern breakdown (see Flat view below); press b again
                    to return to the tree
+  r                rescan the directory under the cursor in the
+                   background and graft it into the tree, once the scan
+                   is done (flat mode: the row's containing directory;
+                   an empty view: the current directory, which is how to
+                   rescan the root) -- see Rescan below
   Space            mark/unmark the row under the cursor for deletion,
                    then move down (a marked directory implies its whole
                    subtree; marks persist across navigation; works in
@@ -642,6 +648,22 @@ Keys (interactive mode):
   review list, freeable panel, cheatsheet) is open, every key belongs to
   it alone; precedence is palette > confirmation > review list > freeable
   panel > cheatsheet, though in practice only one is ever open at a time.
+
+Rescan (r, docs/design/subtree-rescan-decisions.md):
+  Once the scan is done, r rescans one directory in the background, then
+  replaces its subtree and moves every ancestor's total by the
+  difference; nothing else is rescanned. The header reads \"rescanning
+  NAME\" meanwhile, and \"done · N refreshed\" afterwards; the selection
+  card of anything at or under a rescanned directory says \"refreshed
+  2 min ago\". Totals match what a full scan of the same state reports
+  for that directory, hardlinks with links inside and outside it
+  included (counted once, at their canonical link). A hardlink created
+  after the scan between the directory and the outside is invisible,
+  because the outside is not re-observed; r at the root sees it. A
+  directory that no longer exists is removed from the tree; any other
+  failure keeps the old subtree and says why. Marks under a rescanned
+  directory are dropped. Excluded mount points are never rescanned. One
+  rescan runs at a time; q cancels it with the session.
 
 Filtering (Ctrl-K/`/`, docs/design/query-decisions.md):
   Ctrl-K opens a floating palette over the tree: typed text with no
