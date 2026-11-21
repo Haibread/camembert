@@ -69,7 +69,10 @@ truecolor with a full fallback ladder (256 → 16 → mono/ASCII) and
 at truecolor — no console there sets `TERM` or `COLORTERM`, so those
 variables say nothing about the terminal rather than saying it is a poor
 one — with sextants under Windows Terminal and half-blocks on a legacy
-console, whose font may not cover them.
+console, whose font may not cover them. The Linux virtual console
+(`TERM=linux`) keeps its 16 colors but drops to ASCII glyphs — no wheel,
+`#` bars, `|/-\` spinner — since its built-in font has no half-block or
+braille coverage.
 
 Everything you see is also clickable: table rows, wheel slices, the
 breadcrumb, the errors card (see [Mouse](#mouse-interactive-mode) below)
