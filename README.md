@@ -1401,6 +1401,9 @@ The workspace splits a pure core library
 [HANDOFF.md](HANDOFF.md) for the current project state, and
 [CHANGELOG.md](CHANGELOG.md) for what changed between releases.
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full contributor workflow and
+[SECURITY.md](SECURITY.md) for reporting a vulnerability.
+
 ### Packaging
 
 Man page generation:
