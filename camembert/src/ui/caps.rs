@@ -21,8 +21,10 @@
 //!   (kitty, WezTerm, foot, alacritty, ghostty via `TERM`/`TERM_PROGRAM`)
 //!   — font coverage for U+1FB00.. is unreliable elsewhere;
 //! - half-blocks (`▀▄`, 1×2 subpixels) everywhere else with color;
-//! - ASCII (`#` bars, no wheel) when mono or `TERM=dumb`: a donut whose
-//!   slices cannot be told apart by color is decoration, not data.
+//! - ASCII (`#` bars, no wheel, `|/-\` spinner) when mono, `TERM=dumb` or
+//!   `TERM=linux`: a donut whose slices cannot be told apart by color is
+//!   decoration, not data, and the kernel console has no font file to
+//!   cover half-blocks or braille — they render as tofu.
 //!
 //! # Why an absent `TERM` means the opposite thing on Windows
 //!
@@ -178,7 +180,7 @@ fn detect_glyphs(env: &TermEnv, color: ColorLevel) -> GlyphLevel {
     if color == ColorLevel::Mono {
         return GlyphLevel::Ascii;
     }
-    if matches!(&env.term, Some(term) if term == "dumb") {
+    if matches!(&env.term, Some(term) if term == "dumb" || term == "linux") {
         return GlyphLevel::Ascii;
     }
     if color == ColorLevel::Truecolor && is_modern_terminal(env) {
@@ -301,7 +303,7 @@ mod tests {
     fn glyph_ladder_matrix() {
         use ColorMode::*;
         use GlyphLevel::*;
-        let cases: [(TermEnv, ColorMode, GlyphLevel); 8] = [
+        let cases: [(TermEnv, ColorMode, GlyphLevel); 10] = [
             // Modern truecolor terminals get sextants (TERM or TERM_PROGRAM).
             (
                 env(Some("xterm-kitty"), Some("truecolor"), None, None),
@@ -343,6 +345,14 @@ mod tests {
                 Ascii,
             ),
             (env(Some("dumb"), None, None, None), Always, Ascii),
+            // The kernel VT keeps its 16 colors but has no glyph coverage
+            // for half-blocks or braille, whatever COLORTERM claims.
+            (env(Some("linux"), None, None, None), Auto, Ascii),
+            (
+                env(Some("linux"), Some("truecolor"), None, None),
+                Auto,
+                Ascii,
+            ),
         ];
         for (env, mode, expected) in cases {
             assert_eq!(
