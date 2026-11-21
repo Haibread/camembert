@@ -215,10 +215,10 @@ impl<R: Read> DumpReader<R> {
         }
         let at = |msg: String| ReadError::Malformed { line: 1, msg };
         let header = Header {
-            minor: u64_field(&value, "minor").map_err(&at)?.unwrap_or(0),
-            ts: u64_field(&value, "ts").map_err(&at)?.unwrap_or(0),
+            minor: u64_field(&value, "minor").map_err(at)?.unwrap_or(0),
+            ts: u64_field(&value, "ts").map_err(at)?.unwrap_or(0),
             root: decode_name(str_field(&value, "root").unwrap_or("")),
-            dev: u64_field(&value, "dev").map_err(&at)?.unwrap_or(0),
+            dev: u64_field(&value, "dev").map_err(at)?.unwrap_or(0),
             sem: str_field(&value, "sem").unwrap_or("blocks").to_owned(),
             ext: bool_field(&value, "ext"),
             ordered: bool_field(&value, "ordered"),
