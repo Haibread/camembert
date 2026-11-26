@@ -45,7 +45,7 @@ jobs:
       # `cargo-deb` is on install-action's curated list; `cargo-generate-rpm`
       # is not, so that one comes through the cargo-binstall fallback.
       - name: install the packaging tools
-        uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-deb,cargo-generate-rpm
       # Builds and strips the binary, regenerates the man pages and shell
